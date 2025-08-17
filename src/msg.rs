@@ -1,7 +1,7 @@
-use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Coin, Uint128};
 #[allow(unused_imports)]
 use crate::state::Config;
+use cosmwasm_schema::{cw_serde, QueryResponses};
+use cosmwasm_std::{Addr, Coin, Uint128};
 
 // This `external` module now represents the messages we will CONSTRUCT.
 // It also includes the QueryMsg for the external router.
@@ -12,7 +12,7 @@ pub mod external {
 
     #[cw_serde]
     pub enum ChoiceSwapOperation {
-        Choice { 
+        Choice {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
@@ -20,7 +20,7 @@ pub mod external {
 
     #[cw_serde]
     pub enum DojoSwapOperation {
-        DojoSwap { 
+        DojoSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
@@ -28,7 +28,7 @@ pub mod external {
 
     #[cw_serde]
     pub enum TerraSwapOperation {
-        TerraSwap { 
+        TerraSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
@@ -36,7 +36,7 @@ pub mod external {
 
     #[cw_serde]
     pub enum AstroSwapOperation {
-        AstroSwap { 
+        AstroSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
@@ -53,7 +53,7 @@ pub mod external {
         SimulateSwapOperations {
             offer_amount: Uint128,
             operations: Binary,
-        }
+        },
     }
 
     #[cw_serde]
@@ -86,7 +86,6 @@ pub mod orderbook {
         pub expected_fees: Vec<FPCoin>,
         pub result_quantity: FPDecimal,
     }
-
 }
 
 #[cw_serde]
@@ -109,10 +108,7 @@ pub enum ExecuteMsg {
 #[derive(QueryResponses)]
 pub enum QueryMsg {
     #[returns(SimulateRouteResponse)]
-    SimulateRoute {
-        route: Route,
-        amount_in: Coin,
-    },
+    SimulateRoute { route: Route, amount_in: Coin },
     #[returns(Config)]
     Config {},
 }

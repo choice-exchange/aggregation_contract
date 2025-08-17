@@ -1,6 +1,6 @@
+use crate::error::ContractError;
 use cosmwasm_std::{DepsMut, Env, Reply, Response, StdError, SubMsgResult};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
-use crate::error::ContractError;
 
 const SWAP_REPLY_ID: u64 = 1;
 
@@ -21,6 +21,6 @@ fn handle_swap_reply(
     _result: SubMsgResult,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     // ... implementation logic ...
-    
+
     Err(ContractError::Std(StdError::generic_err("Not implemented"))) // Reverted to generic_err
 }

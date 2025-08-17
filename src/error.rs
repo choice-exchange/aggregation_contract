@@ -11,7 +11,7 @@ pub enum ContractError {
 
     #[error("Route cannot be empty")]
     EmptyRoute {},
-    
+
     #[error("Invalid reply ID: {id}")]
     InvalidReplyId { id: u64 },
 

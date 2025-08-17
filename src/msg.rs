@@ -6,11 +6,37 @@ use crate::state::Config;
 // This `external` module now represents the messages we will CONSTRUCT.
 // It also includes the QueryMsg for the external router.
 pub mod external {
+    use cosmwasm_std::Binary;
+
     use super::*;
 
     #[cw_serde]
-    pub enum SwapOperation {
-        Choice { // We'll use Choice as the example AMM type
+    pub enum ChoiceSwapOperation {
+        Choice { 
+            offer_asset_info: AssetInfo,
+            ask_asset_info: AssetInfo,
+        },
+    }
+
+    #[cw_serde]
+    pub enum DojoSwapOperation {
+        DojoSwap { 
+            offer_asset_info: AssetInfo,
+            ask_asset_info: AssetInfo,
+        },
+    }
+
+    #[cw_serde]
+    pub enum TerraSwapOperation {
+        TerraSwap { 
+            offer_asset_info: AssetInfo,
+            ask_asset_info: AssetInfo,
+        },
+    }
+
+    #[cw_serde]
+    pub enum AstroSwapOperation {
+        AstroSwap { 
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
@@ -22,16 +48,14 @@ pub mod external {
         NativeToken { denom: String },
     }
 
-    // Query messages for an external AMM router contract
     #[cw_serde]
     pub enum QueryMsg {
         SimulateSwapOperations {
             offer_amount: Uint128,
-            operations: Vec<SwapOperation>,
+            operations: Binary,
         }
     }
 
-    // The response from an external AMM router's simulation query
     #[cw_serde]
     pub struct SimulateSwapOperationsResponse {
         pub amount: Uint128,
@@ -43,6 +67,12 @@ pub mod orderbook {
     use injective_math::FPDecimal;
 
     #[cw_serde]
+    pub struct FPCoin {
+        pub amount: FPDecimal,
+        pub denom: String,
+    }
+
+    #[cw_serde]
     pub enum QueryMsg {
         GetOutputQuantity {
             from_quantity: FPDecimal,
@@ -52,9 +82,11 @@ pub mod orderbook {
     }
 
     #[cw_serde]
-    pub struct GetOutputQuantityResponse {
-        pub return_amount: Uint128,
+    pub struct SwapEstimationResult {
+        pub expected_fees: Vec<FPCoin>,
+        pub result_quantity: FPDecimal,
     }
+
 }
 
 #[cw_serde]
@@ -102,7 +134,9 @@ pub enum AssetType {
 #[cw_serde]
 pub enum AmmProtocol {
     Choice,
-    // Add other protocols like DojoSwap here
+    DojoSwap,
+    AstroSwap,
+    TerraSwap,
 }
 
 // This is a DESCRIPTION of the action, not the action itself.

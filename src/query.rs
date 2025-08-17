@@ -73,24 +73,53 @@ fn simulate_step_recursive(
 
     // --- 1. Simulate the current step's swap to find its output ---
     let current_step_output_amount = match &step.description {
-        ActionDescription::AmmSwap { protocol, offer_asset_info, ask_asset_info } => {
-            let operations = match protocol {
-                AmmProtocol::Choice => vec![external::SwapOperation::Choice {
-                    offer_asset_info: offer_asset_info.clone(),
-                    ask_asset_info: ask_asset_info.clone(),
-                }],
+        ActionDescription::AmmSwap {
+            protocol,
+            offer_asset_info,
+            ask_asset_info,
+        } => {
+            let operations_binary: Binary = match protocol {
+                AmmProtocol::Choice => {
+                    let ops = vec![external::ChoiceSwapOperation::Choice {
+                        offer_asset_info: offer_asset_info.clone(),
+                        ask_asset_info: ask_asset_info.clone(),
+                    }];
+                    to_json_binary(&ops)?
+                }
+                AmmProtocol::DojoSwap => {
+                    let ops = vec![external::DojoSwapOperation::DojoSwap {
+                        offer_asset_info: offer_asset_info.clone(),
+                        ask_asset_info: ask_asset_info.clone(),
+                    }];
+                    to_json_binary(&ops)?
+                }
+                AmmProtocol::TerraSwap => {
+                    let ops = vec![external::TerraSwapOperation::TerraSwap {
+                        offer_asset_info: offer_asset_info.clone(),
+                        ask_asset_info: ask_asset_info.clone(),
+                    }];
+                    to_json_binary(&ops)?
+                }
+                AmmProtocol::AstroSwap => {
+                    let ops = vec![external::AstroSwapOperation::AstroSwap {
+                        offer_asset_info: offer_asset_info.clone(),
+                        ask_asset_info: ask_asset_info.clone(),
+                    }];
+                    to_json_binary(&ops)?
+                }
             };
 
             let amm_query = external::QueryMsg::SimulateSwapOperations {
                 offer_amount: input_amount,
-                operations,
+                operations: operations_binary,
             };
 
-            let sim_response: external::SimulateSwapOperationsResponse = querier.query(&WasmQuery::Smart {
-                contract_addr: step.protocol_address.to_string(),
-                msg: to_json_binary(&amm_query)?,
-            }.into())?;
-
+            let sim_response: external::SimulateSwapOperationsResponse =
+                querier.query(&WasmQuery::Smart {
+                    contract_addr: step.protocol_address.to_string(),
+                    msg: to_json_binary(&amm_query)?,
+                }.into())?;
+            
             sim_response.amount
         }
         ActionDescription::OrderbookSwap { source_denom, target_denom } => {
@@ -100,12 +129,12 @@ fn simulate_step_recursive(
                 target_denom: target_denom.clone(),
             };
 
-            let sim_response: orderbook::GetOutputQuantityResponse = querier.query(&WasmQuery::Smart {
+            let sim_response: orderbook::SwapEstimationResult = querier.query(&WasmQuery::Smart {
                 contract_addr: step.protocol_address.to_string(),
                 msg: to_json_binary(&orderbook_query)?,
             }.into())?;
             
-            sim_response.return_amount
+            sim_response.result_quantity.into()
         }
     };
 
@@ -158,8 +187,8 @@ mod tests {
     use cosmwasm_std::testing::{mock_dependencies, mock_env, MockQuerier};
     use cosmwasm_std::{from_json, ContractResult, SystemResult, Addr};
     use external::{AssetInfo, SimulateSwapOperationsResponse};
+    use injective_math::FPDecimal;
 
-    const FAKE_AMM_ROUTER: &str = "inj1ammrouteraddress";
     const FAKE_AMM_ROUTER_A: &str = "inj1ammrouter_a";
     const FAKE_AMM_ROUTER_B: &str = "inj1ammrouter_b";
     const FAKE_ORDERBOOK: &str = "inj1orderbook";
@@ -177,7 +206,7 @@ mod tests {
         querier.update_wasm(move |query: &WasmQuery| -> SystemResult<ContractResult<Binary>> {
             match query {
                 WasmQuery::Smart { contract_addr, msg: _ } => {
-                    if contract_addr == FAKE_AMM_ROUTER {
+                    if contract_addr == FAKE_AMM_ROUTER_A {
                         SystemResult::Ok(ContractResult::Ok(mock_response_binary.clone()))
                     } else {
                         panic!("Unexpected contract call to {}", contract_addr);
@@ -194,7 +223,7 @@ mod tests {
         // --- 3. Construct the Test Route ---
         let route = Route {
             steps: vec![Step {
-                protocol_address: Addr::unchecked(FAKE_AMM_ROUTER),
+                protocol_address: Addr::unchecked(FAKE_AMM_ROUTER_A),
                 description: ActionDescription::AmmSwap {
                     protocol: AmmProtocol::Choice,
                     offer_asset_info: AssetInfo::NativeToken { denom: "inj".to_string() },
@@ -311,7 +340,11 @@ mod tests {
         let mut querier = MockQuerier::new(&[]);
 
         // Define canned responses for each contract
-        let orderbook_response = orderbook::GetOutputQuantityResponse { return_amount: Uint128::new(200_000) }; // 100 USDT -> 200 INJ
+        let orderbook_response = orderbook::SwapEstimationResult {
+            // The fees field is a Vec<FPCoin>. For a simple test, it can be empty.
+            expected_fees: vec![], 
+            result_quantity: FPDecimal::from(200_000u128), // The amount is an FPDecimal
+        };
         let orderbook_response_bin = to_json_binary(&orderbook_response).unwrap();
 
         let amm_a_response = external::SimulateSwapOperationsResponse { amount: Uint128::new(50_000) }; // 43% split -> 50k final tokens
@@ -401,6 +434,113 @@ mod tests {
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
 
         // The final output should be the SUM of the outputs from the two leaf nodes
+        assert_eq!(result.output_amount, Uint128::new(50_000 + 70_000));
+    }
+
+    #[test]
+    fn test_simulate_multi_step_split_route_with_different_protocols() {
+
+        const FINAL_TOKEN: &str = "inj1final_token_contract";
+
+        let mut querier = MockQuerier::new(&[]);
+
+        // Define canned responses for each contract
+        // Response for Step 0: 100 USDT -> 200,000 INJ
+        let orderbook_response = orderbook::SwapEstimationResult {
+            expected_fees: vec![],
+            result_quantity: FPDecimal::from(200_000u128),
+        };
+        let orderbook_response_bin = to_json_binary(&orderbook_response).unwrap();
+
+        // Response for Step 1 (Path A): Takes 43% of INJ, outputs 50,000 final tokens
+        let amm_a_response = external::SimulateSwapOperationsResponse { amount: Uint128::new(50_000) };
+        let amm_a_response_bin = to_json_binary(&amm_a_response).unwrap();
+
+        // Response for Step 2 (Path B): Takes 57% of INJ, outputs 70,000 final tokens
+        let amm_b_response = external::SimulateSwapOperationsResponse { amount: Uint128::new(70_000) };
+        let amm_b_response_bin = to_json_binary(&amm_b_response).unwrap();
+
+        // Teach the querier how to handle calls to all three distinct contract addresses
+        querier.update_wasm(move |query: &WasmQuery| -> SystemResult<ContractResult<Binary>> {
+            match query {
+                WasmQuery::Smart { contract_addr, msg } => {
+                    if contract_addr == FAKE_ORDERBOOK {
+                        // This is the first step, just return the canned response
+                        SystemResult::Ok(ContractResult::Ok(orderbook_response_bin.clone()))
+                    } else if contract_addr == FAKE_AMM_ROUTER_A {
+                        // This is Step 1. Assert it received the correct 43% of the order book's output.
+                        // 200,000 * 0.43 = 86,000
+                        let decoded_query: external::QueryMsg = from_json(msg).unwrap();
+                        let external::QueryMsg::SimulateSwapOperations { offer_amount, .. } = decoded_query;
+                        assert_eq!(offer_amount, Uint128::new(86_000));
+                        SystemResult::Ok(ContractResult::Ok(amm_a_response_bin.clone()))
+                    } else if contract_addr == FAKE_AMM_ROUTER_B {
+                        // This is Step 2. Assert it received the correct 57% of the order book's output.
+                        // 200,000 * 0.57 = 114,000
+                        let decoded_query: external::QueryMsg = from_json(msg).unwrap();
+                        let external::QueryMsg::SimulateSwapOperations { offer_amount, .. } = decoded_query;
+                        assert_eq!(offer_amount, Uint128::new(114_000));
+                        SystemResult::Ok(ContractResult::Ok(amm_b_response_bin.clone()))
+                    } else {
+                        panic!("Unexpected contract query to {}", contract_addr)
+                    }
+                }
+                _ => panic!("Unsupported query type"),
+            }
+        });
+
+        let mut deps = mock_dependencies();
+        deps.querier = querier;
+
+        let route = Route {
+            steps: vec![
+                // Step 0: USDT -> INJ via Order Book, then splits to steps 1 and 2
+                Step {
+                    protocol_address: Addr::unchecked(FAKE_ORDERBOOK),
+                    description: ActionDescription::OrderbookSwap {
+                        source_denom: "peggy0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string(),
+                        target_denom: "inj".to_string(),
+                    },
+                    amount_in_percentage: 100,
+                    next_steps: vec![1, 2], // Points to the next two steps
+                },
+                // Step 1: First AMM path (43% of INJ from step 0)
+                Step {
+                    protocol_address: Addr::unchecked(FAKE_AMM_ROUTER_A),
+                    description: ActionDescription::AmmSwap {
+                        protocol: AmmProtocol::Choice,
+                        offer_asset_info: AssetInfo::NativeToken { denom: "inj".to_string() },
+                        ask_asset_info: AssetInfo::Token { contract_addr: Addr::unchecked(FINAL_TOKEN).to_string() },
+                    },
+                    amount_in_percentage: 43,
+                    next_steps: vec![], // This is a leaf node
+                },
+                // Step 2: Second AMM path (57% of INJ from step 0)
+                Step {
+                    protocol_address: Addr::unchecked(FAKE_AMM_ROUTER_B),
+                    description: ActionDescription::AmmSwap {
+                        protocol: AmmProtocol::DojoSwap,
+                        offer_asset_info: AssetInfo::NativeToken { denom: "inj".to_string() },
+                        ask_asset_info: AssetInfo::Token { contract_addr: Addr::unchecked(FINAL_TOKEN).to_string() },
+                    },
+                    amount_in_percentage: 57,
+                    next_steps: vec![], // This is a leaf node
+                },
+            ],
+        };
+
+        // --- 5. Call the Function Under Test ---
+        let result_binary = simulate_route(
+            deps.as_ref(),
+            mock_env(),
+            route,
+            Coin::new(100u128, "peggy0xdAC17F958D2ee523a2206206994597C13D831ec7"),
+        ).unwrap();
+
+        // --- 6. Assert the Final Result ---
+        let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
+
+        // The final output should be the SUM of the outputs from the two leaf nodes (Step 1 and Step 2)
         assert_eq!(result.output_amount, Uint128::new(50_000 + 70_000));
     }
 }

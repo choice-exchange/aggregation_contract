@@ -18,7 +18,7 @@ pub fn instantiate(
     msg: InstantiateMsg,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
-    
+
     let admin_addr = deps.api.addr_validate(&msg.admin)?;
     let config = Config { admin: admin_addr };
     CONFIG.save(deps.storage, &config)?;
@@ -34,9 +34,10 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     match msg {
-        ExecuteMsg::ExecuteRoute { route, minimum_receive } => {
-            crate::execute::execute_route(deps, env, info, route, minimum_receive)
-        },
+        ExecuteMsg::ExecuteRoute {
+            route,
+            minimum_receive,
+        } => crate::execute::execute_route(deps, env, info, route, minimum_receive),
         ExecuteMsg::UpdateAdmin { new_admin } => {
             crate::execute::update_admin(deps, info, new_admin)
         }
@@ -44,11 +45,11 @@ pub fn execute(
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(deps: Deps<InjectiveQueryWrapper>, env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         QueryMsg::SimulateRoute { route, amount_in } => {
             crate::query::simulate_route(deps, env, route, amount_in)
-        },
+        }
         QueryMsg::Config {} => crate::query::query_config(deps),
     }
 }

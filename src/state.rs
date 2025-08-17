@@ -1,8 +1,8 @@
+use crate::msg::Route;
 use cosmwasm_std::Addr;
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use crate::msg::Route;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Config {

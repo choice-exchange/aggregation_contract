@@ -12,7 +12,7 @@ pub fn execute_route(
     _minimum_receive: Option<Uint128>,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     // ... implementation logic ...
-    
+
     Err(ContractError::Std(StdError::generic_err("Not implemented"))) // Reverted to generic_err
 }
 

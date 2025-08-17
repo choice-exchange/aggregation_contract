@@ -49,7 +49,7 @@ The test suite uses `injective-test-tube`, which provides a high-fidelity testin
 
 ```bash
 # 1. Build the Wasm binary first
-cargo build --release --target wasm32-unknown-unknown
+./build-release.sh
 
 # 2. Run the tests
 cargo test

@@ -1,7 +1,6 @@
 #![cfg(test)]
 
 mod tests {
-    // Removed the unused `Addr` import
     use cosmwasm_std::Coin;
     use injective_test_tube::{Account, InjectiveTestApp, Module, Wasm};
 
@@ -10,8 +9,8 @@ mod tests {
     use crate::state::Config;
 
     /// Helper function to load the wasm bytecode from the file system.
-    fn get_wasm_byte_code() -> &'static [u8] {
-        include_bytes!("../artifacts/dex_aggregator.wasm")
+    fn get_wasm_byte_code() -> Vec<u8> {
+        std::fs::read("./artifacts/dex_aggregator.wasm").unwrap()
     }
 
     #[test]
@@ -32,11 +31,7 @@ mod tests {
 
         // Store the contract code
         let code_id = wasm
-            .store_code(
-                get_wasm_byte_code(),
-                None,
-                admin,
-            )
+            .store_code(&get_wasm_byte_code(), None, admin)
             .unwrap()
             .data
             .code_id;
@@ -86,7 +81,8 @@ mod tests {
         let wasm = Wasm::new(&app);
 
         // Store and instantiate the contract
-        let code_id = wasm.store_code(get_wasm_byte_code(), None, admin).unwrap().data.code_id;
+        let code_id = wasm.store_code(&get_wasm_byte_code(), None, admin).unwrap().data.code_id;
+        
         let contract_addr = wasm
             .instantiate(code_id, &InstantiateMsg { admin: admin.address() }, Some(&admin.address()), Some("dex-aggregator"), &[], admin)
             .unwrap()

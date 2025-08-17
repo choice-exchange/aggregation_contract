@@ -38,6 +38,25 @@ pub mod external {
     }
 }
 
+pub mod orderbook {
+    use super::*;
+    use injective_math::FPDecimal;
+
+    #[cw_serde]
+    pub enum QueryMsg {
+        GetOutputQuantity {
+            from_quantity: FPDecimal,
+            source_denom: String,
+            target_denom: String,
+        },
+    }
+
+    #[cw_serde]
+    pub struct GetOutputQuantityResponse {
+        pub return_amount: Uint128,
+    }
+}
+
 #[cw_serde]
 pub struct InstantiateMsg {
     pub admin: String,
@@ -94,7 +113,10 @@ pub enum ActionDescription {
         offer_asset_info: external::AssetInfo,
         ask_asset_info: external::AssetInfo,
     },
-    // Future descriptions for OrderbookSwap, etc., would go here
+    OrderbookSwap {
+        source_denom: String,
+        target_denom: String,
+    },
 }
 
 #[cw_serde]
@@ -104,7 +126,7 @@ pub struct Step {
     // The description of what should happen at that address
     pub description: ActionDescription,
     pub amount_in_percentage: u8,
-    pub next_steps: Vec<u32>,
+    pub next_steps: Vec<usize>,
 }
 
 #[cw_serde]

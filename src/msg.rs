@@ -6,36 +6,23 @@ use cosmwasm_std::{Addr, Coin, Uint128};
 // This `external` module now represents the messages we will CONSTRUCT.
 // It also includes the QueryMsg for the external router.
 pub mod external {
-    use cosmwasm_std::Binary;
 
     use super::*;
 
     #[cw_serde]
-    pub enum ChoiceSwapOperation {
+    pub enum SwapOperation {
         Choice {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
-    }
-
-    #[cw_serde]
-    pub enum DojoSwapOperation {
         DojoSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
-    }
-
-    #[cw_serde]
-    pub enum TerraSwapOperation {
         TerraSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
         },
-    }
-
-    #[cw_serde]
-    pub enum AstroSwapOperation {
         AstroSwap {
             offer_asset_info: AssetInfo,
             ask_asset_info: AssetInfo,
@@ -52,7 +39,7 @@ pub mod external {
     pub enum QueryMsg {
         SimulateSwapOperations {
             offer_amount: Uint128,
-            operations: Binary,
+            operations: Vec<SwapOperation>,
         },
     }
 

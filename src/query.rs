@@ -81,40 +81,36 @@ fn simulate_step_recursive(
             offer_asset_info,
             ask_asset_info,
         } => {
-            let operations_binary: Binary = match protocol {
+            let operations: Vec<external::SwapOperation> = match protocol {
                 AmmProtocol::Choice => {
-                    let ops = vec![external::ChoiceSwapOperation::Choice {
+                    vec![external::SwapOperation::Choice {
                         offer_asset_info: offer_asset_info.clone(),
                         ask_asset_info: ask_asset_info.clone(),
-                    }];
-                    to_json_binary(&ops)?
+                    }]
                 }
                 AmmProtocol::DojoSwap => {
-                    let ops = vec![external::DojoSwapOperation::DojoSwap {
+                    vec![external::SwapOperation::DojoSwap {
                         offer_asset_info: offer_asset_info.clone(),
                         ask_asset_info: ask_asset_info.clone(),
-                    }];
-                    to_json_binary(&ops)?
+                    }]
                 }
                 AmmProtocol::TerraSwap => {
-                    let ops = vec![external::TerraSwapOperation::TerraSwap {
+                    vec![external::SwapOperation::TerraSwap {
                         offer_asset_info: offer_asset_info.clone(),
                         ask_asset_info: ask_asset_info.clone(),
-                    }];
-                    to_json_binary(&ops)?
+                    }]
                 }
                 AmmProtocol::AstroSwap => {
-                    let ops = vec![external::AstroSwapOperation::AstroSwap {
+                    vec![external::SwapOperation::AstroSwap {
                         offer_asset_info: offer_asset_info.clone(),
                         ask_asset_info: ask_asset_info.clone(),
-                    }];
-                    to_json_binary(&ops)?
+                    }]
                 }
             };
 
             let amm_query = external::QueryMsg::SimulateSwapOperations {
                 offer_amount: input_amount,
-                operations: operations_binary,
+                operations: operations,
             };
 
             let sim_response: external::SimulateSwapOperationsResponse = querier.query(
@@ -132,7 +128,7 @@ fn simulate_step_recursive(
             target_denom,
         } => {
             let orderbook_query = orderbook::QueryMsg::GetOutputQuantity {
-                from_quantity: input_amount.into(), // Convert Uint128 to FPDecimal for the query
+                from_quantity: input_amount.into(), 
                 source_denom: source_denom.clone(),
                 target_denom: target_denom.clone(),
             };

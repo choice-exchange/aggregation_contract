@@ -2,9 +2,8 @@
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Coin, Uint128};
+use cw20::Cw20ReceiveMsg; 
 
-// This `external` module now represents the messages we will CONSTRUCT.
-// It also includes the QueryMsg for the external router.
 pub mod external {
 
     use super::*;
@@ -36,18 +35,31 @@ pub mod external {
     }
 
     #[cw_serde]
-    pub enum QueryMsg {
-        SimulateSwapOperations {
-            offer_amount: Uint128,
-            operations: Vec<SwapOperation>,
-        },
-    }
-
-    #[cw_serde]
     pub struct SimulateSwapOperationsResponse {
         pub amount: Uint128,
     }
+
+    #[cw_serde]
+    pub struct Asset {
+        pub info: AssetInfo,
+        pub amount: Uint128,
+    }
+
+    #[cw_serde]
+    pub enum QueryMsg {
+        Simulation { offer_asset: Asset },
+        // ReverseSimulation { ask_asset: Asset }, 
+    }
+
+    #[cw_serde]
+    pub struct SimulationResponse {
+        pub return_amount: Uint128,
+        pub spread_amount: Uint128,
+        pub commission_amount: Uint128,
+    }
 }
+
+
 
 pub mod orderbook {
     use super::*;
@@ -76,12 +88,59 @@ pub mod orderbook {
 }
 
 #[cw_serde]
+pub struct AmmSwapOp {
+    pub pool_address: String,
+    pub ask_asset_info: external::AssetInfo,
+    pub min_output: String,
+}
+
+#[cw_serde]
+pub struct OrderbookSwapOp {
+    pub swap_contract: String,
+    pub ask_asset_info: external::AssetInfo,
+    pub min_output: String,
+}
+
+#[cw_serde]
+pub enum Operation {
+    AmmSwap(AmmSwapOp),
+    OrderbookSwap(OrderbookSwapOp),
+}
+
+#[cw_serde]
+pub struct Split {
+    pub operation: Operation,
+    pub percent: u8,
+}
+
+#[cw_serde]
+pub struct Stage {
+    pub splits: Vec<Split>,
+}
+
+
+// --- Message embedded in Cw20ReceiveMsg ---
+#[cw_serde]
+pub enum Cw20HookMsg {
+    AggregateSwaps {
+        stages: Vec<Stage>,
+        minimum_receive: Option<String>,
+    },
+}
+
+
+#[cw_serde]
 pub struct InstantiateMsg {
     pub admin: String,
 }
 
 #[cw_serde]
 pub enum ExecuteMsg {
+    AggregateSwaps {
+        stages: Vec<Stage>,
+        minimum_receive: Option<String>,
+    },
+    Receive(Cw20ReceiveMsg),
     ExecuteRoute {
         route: Route,
         minimum_receive: Option<Uint128>,

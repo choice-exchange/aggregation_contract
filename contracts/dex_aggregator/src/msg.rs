@@ -1,8 +1,9 @@
 #[allow(unused_imports)]
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Coin, Uint128};
-use cw20::Cw20ReceiveMsg; 
+use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
+use cw20::Cw20ReceiveMsg;
+use injective_math::FPDecimal; 
 
 pub mod external {
 
@@ -210,4 +211,25 @@ pub struct Route {
     pub steps: Vec<Step>,
     // Note: The `asset_in` on the route is descriptive, but the actual
     // asset type for a given step comes from its `ActionDescription`.
+}
+
+
+#[cosmwasm_schema::cw_serde]
+pub enum AmmPairExecuteMsg {
+    Swap {
+        offer_asset: external::Asset,
+        belief_price: Option<Decimal>,
+        max_spread: Option<Decimal>,
+        to: Option<String>,
+        deadline: Option<u64>,
+    },
+}
+
+/// The ExecuteMsg format for the Orderbook swap contract.
+#[cosmwasm_schema::cw_serde]
+pub enum OrderbookExecuteMsg {
+    SwapMinOutput {
+        target_denom: String,
+        min_output_quantity: FPDecimal,
+    },
 }

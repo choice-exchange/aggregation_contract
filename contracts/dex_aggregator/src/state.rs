@@ -20,12 +20,23 @@ pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
 
 #[cw_serde]
 pub struct ReplyState {
+    // --- Unchanged Fields ---
     pub sender: Addr,
     pub minimum_receive: Uint128,
-    // How many submessages we expect to reply
-    pub expected_replies: u64,
-    // The total output from all swaps so far
-    pub accumulated_amount: Uint128,
+
+    // --- NEW & ENHANCED FIELDS ---
+
+    /// The entire multi-stage plan for this execution.
+    pub stages: Vec<crate::msg::Stage>,
+
+    /// The index of the stage we are currently executing.
+    pub current_stage_index: u64,
+
+    /// The number of submessages we are waiting for from the CURRENT stage.
+    pub replies_expected_for_current_stage: u64,
+
+    /// The total output from the JUST-COMPLETED stage. This becomes the input for the next stage.
+    pub accumulated_amount_for_current_stage: Uint128,
 }
 
 // A map from a unique reply ID to its state

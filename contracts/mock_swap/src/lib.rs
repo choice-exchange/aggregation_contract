@@ -1,5 +1,5 @@
 use cosmwasm_std::{
-    entry_point, Binary, Decimal, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult, Uint128
+    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult, Uint128
 };
 use injective_math::FPDecimal;
 use schemars::JsonSchema;
@@ -54,26 +54,48 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
-    // The logic is now much simpler and more correct.
-    let return_amount = match msg {
-        // AMM swaps are differentiated by the funds sent.
-        ExecuteMsg::Swap { .. } => {
-            let sent_amount = info.funds[0].amount;
-            if sent_amount == Uint128::from(33_000_000_000_000_000_000u128) {
-                 Uint128::from(5_200_000_000_000_000_000_000_000u128)
-            } else if sent_amount == Uint128::from(42_000_000_000_000_000_000u128) {
-                 Uint128::from(6_600_000_000_000_000_000_000_000u128)
+    let recipient = info.sender.to_string(); 
+    
+    let (return_amount, output_denom): (Uint128, String) = match msg {
+        ExecuteMsg::Swap { offer_asset, .. } => {
+            let output_denom = "usdt".to_string(); // In AMM swaps, we mock a final token
+            let amount = if let AssetInfo::NativeToken { denom } = &offer_asset.info {
+                if denom == "inj" {
+                    let sent_amount = offer_asset.amount;
+                    if sent_amount == Uint128::from(33_000_000_000_000_000_000u128) {
+                        Uint128::from(5_200_000_000_000_000_000_000_000u128)
+                    } else if sent_amount == Uint128::from(42_000_000_000_000_000_000u128) {
+                        Uint128::from(6_600_000_000_000_000_000_000_000u128)
+                    } else if sent_amount == Uint128::from(362181137508213706u128) {
+                        Uint128::from(63174284362280640946506u128)
+                    } else if sent_amount == Uint128::from(376964041059569368u128) {
+                        Uint128::from(65736109058836791911471u128)
+                    } else {
+                        Uint128::zero()
+                    }
+                } else {
+                    Uint128::zero()
+                }
             } else {
-                // This case should not be hit by the 3-way split test,
-                // but it's good practice to have a default.
                 Uint128::zero()
-            }
+            };
+            (amount, output_denom) // Return the tuple
         }
-        // Orderbook swap now correctly parses the min_output from its own message type.
-        ExecuteMsg::SwapMinOutput { target_denom: _, min_output_quantity } => {
-            FPDecimal::from_str(&min_output_quantity)
-                .map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?
-                .into()
+        ExecuteMsg::SwapMinOutput { target_denom, min_output_quantity, .. } => {
+            let output_denom = target_denom; // Use the denom passed in the message
+            let amount = {
+                let sent_denom = &info.funds[0].denom;
+                if sent_denom == "usdt" {
+                    Uint128::from(739145178567783074u128)
+                } else if sent_denom == "inj" {
+                    FPDecimal::from_str(&min_output_quantity)
+                        .map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?
+                        .into()
+                } else {
+                    Uint128::zero()
+                }
+            };
+            (amount, output_denom) // Return the tuple
         }
     };
 
@@ -81,7 +103,17 @@ pub fn execute(
         .add_attribute("action", "swap")
         .add_attribute("return_amount", return_amount.to_string());
 
-    Ok(Response::new().add_event(event))
+    let bank_send_msg = CosmosMsg::Bank(BankMsg::Send {
+        to_address: recipient,
+        amount: vec![Coin {
+            denom: output_denom,
+            amount: return_amount,
+        }],
+    });
+
+    Ok(Response::new()
+        .add_message(bank_send_msg)
+        .add_event(event))
 }
 
 #[entry_point]

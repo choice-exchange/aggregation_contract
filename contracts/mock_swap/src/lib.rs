@@ -66,11 +66,12 @@ pub fn execute(
                         Uint128::from(5_200_000_000_000_000_000_000_000u128)
                     } else if sent_amount == Uint128::from(42_000_000_000_000_000_000u128) {
                         Uint128::from(6_600_000_000_000_000_000_000_000u128)
-                    } else if sent_amount == Uint128::from(362181137508213706u128) {
+                    } else if sent_amount == Uint128::from(362181137498213706u128) {
                         Uint128::from(63174284362280640946506u128)
-                    } else if sent_amount == Uint128::from(376964041059569368u128) {
+                    } else if sent_amount == Uint128::from(376964041069569367u128) {
                         Uint128::from(65736109058836791911471u128)
-                    } else {
+                    } 
+                    else {
                         Uint128::zero()
                     }
                 } else {

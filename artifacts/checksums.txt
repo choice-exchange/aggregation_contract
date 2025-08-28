@@ -1,2 +1,2 @@
 ad6023bd152d54dfc059d448c715208fd0d6dff35ad88a14744579c3badb56cf  dex_aggregator.wasm
-84470cd0383378c358e94d13b74eb72917f10bfb286b535fc4ee1c267f2778e3  mock_swap.wasm
+a93f3b9cf6e33f498e2776fbb9096e1c3a22c1fdce7fb6383c4b1cfaf34effe1  mock_swap.wasm

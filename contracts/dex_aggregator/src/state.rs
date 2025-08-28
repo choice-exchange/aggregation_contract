@@ -1,9 +1,9 @@
 use crate::msg::Route;
+use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Uint128};
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use cosmwasm_schema::cw_serde;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Config {
@@ -17,7 +17,6 @@ pub const CONFIG: Item<Config> = Item::new("config");
 // This is crucial for the reply mechanism to continue a multi-step route.
 pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
 
-
 #[cw_serde]
 pub struct ReplyState {
     // --- Unchanged Fields ---
@@ -25,7 +24,6 @@ pub struct ReplyState {
     pub minimum_receive: Uint128,
 
     // --- NEW & ENHANCED FIELDS ---
-
     /// The entire multi-stage plan for this execution.
     pub stages: Vec<crate::msg::Stage>,
 

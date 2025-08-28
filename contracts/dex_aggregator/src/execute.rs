@@ -1,4 +1,7 @@
-use cosmwasm_std::{to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, SubMsg, Uint128, WasmMsg};
+use cosmwasm_std::{
+    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, SubMsg,
+    Uint128, WasmMsg,
+};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 use injective_math::FPDecimal;
 use std::str::FromStr;
@@ -6,8 +9,6 @@ use std::str::FromStr;
 use crate::error::ContractError;
 use crate::msg::{external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Route, Stage};
 use crate::state::{ReplyState, REPLY_ID_COUNTER, REPLY_STATES};
-
-
 
 pub fn execute_route(
     _deps: DepsMut<InjectiveQueryWrapper>,
@@ -44,7 +45,7 @@ pub fn execute_aggregate_swaps_internal(
         return Err(ContractError::ZeroAmount {});
     }
 
-    let first_stage = stages.get(0).ok_or(ContractError::NoStages {})?;
+    let first_stage = stages.first().ok_or(ContractError::NoStages {})?;
 
     let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
     if total_percentage != 100 {
@@ -72,10 +73,11 @@ pub fn execute_aggregate_swaps_internal(
     };
     REPLY_STATES.save(deps.storage, reply_id, &initial_state)?;
 
-
     for split in &first_stage.splits {
-        let split_amount = offer_asset.amount.multiply_ratio(split.percent as u128, 100u128);
-        
+        let split_amount = offer_asset
+            .amount
+            .multiply_ratio(split.percent as u128, 100u128);
+
         // This helper function creates the CosmosMsg for a given operation and input asset
         let msg = create_swap_cosmos_msg(
             &split.operation,
@@ -84,9 +86,9 @@ pub fn execute_aggregate_swaps_internal(
             &initiator,
             &env,
             &stages,
-            0, 
+            0,
         )?;
-        
+
         submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
 
@@ -97,19 +99,18 @@ pub fn execute_aggregate_swaps_internal(
         .add_attribute("reply_id", reply_id.to_string()))
 }
 
-
 pub fn create_swap_cosmos_msg(
     operation: &Operation,
     offer_asset_info: &external::AssetInfo,
     amount: Uint128,
     initiator: &Addr,
-    env: &Env, // <-- Add env
-    stages: &[Stage], // <-- Add stages
+    env: &Env,                  // <-- Add env
+    stages: &[Stage],           // <-- Add stages
     current_stage_index: usize, // <-- Add stage index
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
     // The match statement now produces a result which we will return
     let is_last_stage = current_stage_index == stages.len() - 1;
-    
+
     // If it's the last stage, send to the user. Otherwise, send to ourself (the aggregator).
     let recipient = if is_last_stage {
         initiator.to_string()
@@ -132,10 +133,13 @@ pub fn create_swap_cosmos_msg(
                 to: Some(recipient),
                 deadline: None,
             };
-            
+
             // Funds are only sent if the offer asset is a native token
             let funds = if let external::AssetInfo::NativeToken { denom } = offer_asset_info {
-                vec![Coin { denom: denom.clone(), amount }]
+                vec![Coin {
+                    denom: denom.clone(),
+                    amount,
+                }]
             } else {
                 vec![]
             };
@@ -165,7 +169,10 @@ pub fn create_swap_cosmos_msg(
 
             // Use the function parameters: `offer_asset_info` and `amount`
             let funds = if let external::AssetInfo::NativeToken { denom } = offer_asset_info {
-                vec![Coin { denom: denom.clone(), amount }]
+                vec![Coin {
+                    denom: denom.clone(),
+                    amount,
+                }]
             } else {
                 vec![]
             };

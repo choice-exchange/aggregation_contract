@@ -1,16 +1,15 @@
 use crate::error::ContractError;
+use crate::execute::create_swap_cosmos_msg;
+use crate::msg::Operation;
+use crate::state::REPLY_STATES;
 use cosmwasm_std::{DepsMut, Env, Reply, Response, SubMsg, Uint128};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
-use crate::{state::{REPLY_STATES}};
-use crate::msg::{Operation};
-use crate::execute::{create_swap_cosmos_msg};
 
 pub fn handle_reply(
     deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
     msg: Reply,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-
     let event = match msg.result.clone().into_result() {
         Ok(result) => result.events.into_iter().find(|e| e.ty.starts_with("wasm")),
         Err(_) => None,
@@ -18,10 +17,13 @@ pub fn handle_reply(
 
     if event.is_none() {
         return Err(ContractError::Std(cosmwasm_std::StdError::generic_err(
-            format!("DEBUG: Failed to find wasm event in reply. Full Reply dump: {:?}", msg)
+            format!(
+                "DEBUG: Failed to find wasm event in reply. Full Reply dump: {:?}",
+                msg
+            ),
         )));
     }
-    let master_reply_id = msg.id; 
+    let master_reply_id = msg.id;
     // Load the state for this reply ID
     let mut state = REPLY_STATES.load(deps.storage, msg.id)?;
 
@@ -43,7 +45,7 @@ pub fn handle_reply(
 
     let amount_returned: Uint128 = amount_str.parse()?;
 
-     // --- Accumulate amount for the CURRENT stage ---
+    // --- Accumulate amount for the CURRENT stage ---
     state.accumulated_amount_for_current_stage += amount_returned;
     state.replies_expected_for_current_stage -= 1;
 
@@ -55,12 +57,11 @@ pub fn handle_reply(
     }
 
     // YES: The current stage is complete.
-    
+
     // --- DECISION POINT: Is this the LAST stage? ---
     let is_last_stage = state.current_stage_index as usize == state.stages.len() - 1;
 
     if is_last_stage {
-
         let final_amount = state.accumulated_amount_for_current_stage;
 
         if final_amount < state.minimum_receive {
@@ -68,18 +69,17 @@ pub fn handle_reply(
         }
 
         REPLY_STATES.remove(deps.storage, master_reply_id);
-        return Ok(Response::new()
+        Ok(Response::new()
             .add_attribute("action", "aggregate_swap_complete")
             .add_attribute("sender", state.sender)
-            .add_attribute("final_received", final_amount.to_string()));
-
+            .add_attribute("final_received", final_amount.to_string()))
     } else {
         // NO: This was an intermediate stage. We must trigger the NEXT stage.
 
         // 1. Prepare for the next stage.
         let input_for_next_stage = state.accumulated_amount_for_current_stage;
         state.current_stage_index += 1;
-        
+
         // We need to know the asset type of the intermediate amount.
         // KEY ASSUMPTION: All splits in a stage produce the SAME output asset.
         let current_stage = &state.stages[state.current_stage_index as usize - 1];
@@ -102,7 +102,7 @@ pub fn handle_reply(
                 &intermediate_asset_info,
                 split_amount,
                 &state.sender,
-                &env, 
+                &env,
                 &state.stages,
                 state.current_stage_index as usize,
             )?;
@@ -111,9 +111,9 @@ pub fn handle_reply(
 
         // 4. Save the updated state and dispatch the new messages.
         REPLY_STATES.save(deps.storage, msg.id, &state)?;
-        return Ok(Response::new()
+        Ok(Response::new()
             .add_submessages(submessages)
             .add_attribute("action", "executing_next_stage")
-            .add_attribute("stage_index", state.current_stage_index.to_string()));
+            .add_attribute("stage_index", state.current_stage_index.to_string()))
     }
 }

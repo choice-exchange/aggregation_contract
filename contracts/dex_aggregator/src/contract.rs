@@ -45,11 +45,21 @@ pub fn execute(
                 return Err(ContractError::InvalidFunds {});
             }
             let offer_asset = external::Asset {
-                info: external::AssetInfo::NativeToken { denom: info.funds[0].denom.clone() },
+                info: external::AssetInfo::NativeToken {
+                    denom: info.funds[0].denom.clone(),
+                },
                 amount: info.funds[0].amount,
             };
-            execute::execute_aggregate_swaps_internal(deps, env, info.clone(), stages, minimum_receive, offer_asset, info.sender)
-        },
+            execute::execute_aggregate_swaps_internal(
+                deps,
+                env,
+                info.clone(),
+                stages,
+                minimum_receive,
+                offer_asset,
+                info.sender,
+            )
+        }
         ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender,
             amount,
@@ -58,17 +68,30 @@ pub fn execute(
             // This is the entry point for CW20 token swaps
             let hook_msg: Cw20HookMsg = cosmwasm_std::from_json(&msg)?;
             match hook_msg {
-                Cw20HookMsg::AggregateSwaps { stages, minimum_receive } => {
+                Cw20HookMsg::AggregateSwaps {
+                    stages,
+                    minimum_receive,
+                } => {
                     let offer_asset = external::Asset {
-                        info: external::AssetInfo::Token { contract_addr: info.sender.to_string() },
+                        info: external::AssetInfo::Token {
+                            contract_addr: info.sender.to_string(),
+                        },
                         amount,
                     };
                     // The "sender" of the swap is the one who initiated the Cw20 send.
                     let initiator = deps.api.addr_validate(&sender)?;
-                    execute::execute_aggregate_swaps_internal(deps, env, info, stages, minimum_receive, offer_asset, initiator)
+                    execute::execute_aggregate_swaps_internal(
+                        deps,
+                        env,
+                        info,
+                        stages,
+                        minimum_receive,
+                        offer_asset,
+                        initiator,
+                    )
                 }
             }
-        },
+        }
         ExecuteMsg::ExecuteRoute {
             route,
             minimum_receive,

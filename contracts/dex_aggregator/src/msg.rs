@@ -3,7 +3,7 @@ use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
 use cw20::Cw20ReceiveMsg;
-use injective_math::FPDecimal; 
+use injective_math::FPDecimal;
 
 pub mod external {
 
@@ -49,7 +49,7 @@ pub mod external {
     #[cw_serde]
     pub enum QueryMsg {
         Simulation { offer_asset: Asset },
-        // ReverseSimulation { ask_asset: Asset }, 
+        // ReverseSimulation { ask_asset: Asset },
     }
 
     #[cw_serde]
@@ -59,8 +59,6 @@ pub mod external {
         pub commission_amount: Uint128,
     }
 }
-
-
 
 pub mod orderbook {
     use super::*;
@@ -119,7 +117,6 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
-
 // --- Message embedded in Cw20ReceiveMsg ---
 #[cw_serde]
 pub enum Cw20HookMsg {
@@ -128,7 +125,6 @@ pub enum Cw20HookMsg {
         minimum_receive: Option<String>,
     },
 }
-
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -212,7 +208,6 @@ pub struct Route {
     // Note: The `asset_in` on the route is descriptive, but the actual
     // asset type for a given step comes from its `ActionDescription`.
 }
-
 
 #[cosmwasm_schema::cw_serde]
 pub enum AmmPairExecuteMsg {

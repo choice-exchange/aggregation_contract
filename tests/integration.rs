@@ -1,12 +1,14 @@
 #![cfg(test)]
 
 use cosmwasm_std::{Coin, Uint128};
-use injective_test_tube::{injective_std::types::cosmos::{bank::v1beta1::MsgSend, base::v1beta1::Coin as ProtoCoin}, Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm};
 use dex_aggregator::msg::{
-    ExecuteMsg, InstantiateMsg, Operation, Split, Stage, AmmSwapOp, OrderbookSwapOp, external
+    external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp, Split, Stage,
+};
+use injective_test_tube::{
+    injective_std::types::cosmos::{bank::v1beta1::MsgSend, base::v1beta1::Coin as ProtoCoin},
+    Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm,
 };
 use mock_swap::InstantiateMsg as MockInstantiateMsg;
-
 
 fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
     match filename {
@@ -15,7 +17,6 @@ fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
         _ => panic!("Unknown wasm file"),
     }
 }
-
 
 // ... The rest of the test setup and test cases from the previous answer go here ...
 // Setup function and test cases remain the same.
@@ -33,7 +34,6 @@ pub struct TestEnv {
 fn setup() -> TestEnv {
     let app = InjectiveTestApp::new();
 
-
     let admin_initial_coins = &[
         Coin::new(1_000_000_000_000_000_000_000_000_000_000u128, "inj"),
         Coin::new(1_000_000_000_000_000_000_000_000_000_000u128, "usdt"),
@@ -43,14 +43,16 @@ fn setup() -> TestEnv {
         6,  // usdt
     ];
 
+    let admin = app
+        .init_account_decimals(admin_initial_coins, admin_initial_decimals)
+        .unwrap();
 
-    let admin = app.init_account_decimals(admin_initial_coins, admin_initial_decimals).unwrap();
-
-    let user = app.init_account(&[
-        Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
-        Coin::new(1_000_000_000_000_000_000_000_000u128, "usdt"),
-    ]).unwrap();
-
+    let user = app
+        .init_account(&[
+            Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+            Coin::new(1_000_000_000_000_000_000_000_000u128, "usdt"),
+        ])
+        .unwrap();
 
     let wasm = Wasm::new(&app);
 
@@ -70,7 +72,9 @@ fn setup() -> TestEnv {
     let aggregator_addr = wasm
         .instantiate(
             aggregator_code_id,
-            &InstantiateMsg { admin: admin.address() },
+            &InstantiateMsg {
+                admin: admin.address(),
+            },
             Some(&admin.address()),
             Some("dex-aggregator"),
             &[],
@@ -81,22 +85,55 @@ fn setup() -> TestEnv {
         .address;
 
     // Instantiate mock contracts
-    let mock_amm_1_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {}, Some(&admin.address()), Some("mock-amm-1"), &[], &admin).unwrap().data.address;
-    let mock_amm_2_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {}, Some(&admin.address()), Some("mock-amm-2"), &[], &admin).unwrap().data.address;
-    let mock_ob_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {}, Some(&admin.address()), Some("mock-ob"), &[], &admin).unwrap().data.address;
+    let mock_amm_1_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {},
+            Some(&admin.address()),
+            Some("mock-amm-1"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let mock_amm_2_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {},
+            Some(&admin.address()),
+            Some("mock-amm-2"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let mock_ob_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {},
+            Some(&admin.address()),
+            Some("mock-ob"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
     let bank = Bank::new(&app);
     let funds_to_send = vec![
         ProtoCoin {
             denom: "inj".to_string(),
-            amount: "1000000000000000000000000000".to_string(), 
+            amount: "1000000000000000000000000000".to_string(),
         },
         ProtoCoin {
             denom: "usdt".to_string(),
             amount: "1000000000000000000000000000".to_string(),
         },
     ];
-    
+
     // Fund all three mock contracts from the admin account.
     for addr in [&mock_amm_1_addr, &mock_amm_2_addr, &mock_ob_addr] {
         bank.send(
@@ -106,7 +143,8 @@ fn setup() -> TestEnv {
                 amount: funds_to_send.clone(),
             },
             &admin,
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     TestEnv {
@@ -132,7 +170,9 @@ fn test_aggregate_swap_success() {
                     percent: 33,
                     operation: Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: external::AssetInfo::Token { contract_addr: "usdt".to_string() },
+                        ask_asset_info: external::AssetInfo::Token {
+                            contract_addr: "usdt".to_string(),
+                        },
                         min_output: "5147352144459891590000000".to_string(), // 5.14e24
                     }),
                 },
@@ -140,7 +180,9 @@ fn test_aggregate_swap_success() {
                     percent: 42,
                     operation: Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: external::AssetInfo::Token { contract_addr: "usdt".to_string() },
+                        ask_asset_info: external::AssetInfo::Token {
+                            contract_addr: "usdt".to_string(),
+                        },
                         min_output: "6558961275218033430000000".to_string(), // 6.55e24
                     }),
                 },
@@ -148,7 +190,9 @@ fn test_aggregate_swap_success() {
                     percent: 25,
                     operation: Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: env.mock_ob_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken { denom: "usdt".to_string() },
+                        ask_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
                         min_output: "3752098724165681000000000".to_string(), // 3.75e24
                     }),
                 },
@@ -167,18 +211,29 @@ fn test_aggregate_swap_success() {
     );
 
     assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
-    
+
     let response = res.unwrap();
 
     // Check for the final success event from our reply handler
     let success_event = response.events.iter().find(|e| {
-        e.ty == "wasm" && e.attributes.iter().any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        e.ty == "wasm"
+            && e.attributes
+                .iter()
+                .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
     });
 
-    assert!(success_event.is_some(), "Did not find success event in reply");
+    assert!(
+        success_event.is_some(),
+        "Did not find success event in reply"
+    );
 
-    let total_received_attr = success_event.unwrap().attributes.iter().find(|a| a.key == "final_received").unwrap();
-    
+    let total_received_attr = success_event
+        .unwrap()
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
     // 5.2e24 + 6.6e24 + 3.75e24 = 1.555e25
     assert_eq!(total_received_attr.value, "15552098724165681000000000");
 }
@@ -211,7 +266,9 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 49,
                         operation: Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_1_addr.clone(),
-                            ask_asset_info: external::AssetInfo::NativeToken { denom: "usdt".to_string() },
+                            ask_asset_info: external::AssetInfo::NativeToken {
+                                denom: "usdt".to_string(),
+                            },
                             min_output: "63174284362280640946506".to_string(), // 6.31e22
                         }),
                     },
@@ -219,7 +276,9 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 51,
                         operation: Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_2_addr.clone(),
-                            ask_asset_info: external::AssetInfo::NativeToken { denom: "usdt".to_string() },
+                            ask_asset_info: external::AssetInfo::NativeToken {
+                                denom: "usdt".to_string(),
+                            },
                             min_output: "65736109058836791911471".to_string(), // 6.57e22
                         }),
                     },
@@ -234,27 +293,34 @@ fn test_multi_stage_aggregate_swap_success() {
     // The amount doesn't matter for the mock, but the denom does.
     let initial_funds = Coin::new(1_000_000u128, "usdt");
 
-    let res = wasm.execute(
-        &env.aggregator_addr,
-        &msg,
-        &[initial_funds],
-        &env.user,
-    );
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[initial_funds], &env.user);
 
-    assert!(res.is_ok(), "Multi-stage execution failed: {:?}", res.unwrap_err());
+    assert!(
+        res.is_ok(),
+        "Multi-stage execution failed: {:?}",
+        res.unwrap_err()
+    );
     let response = res.unwrap();
 
     // Check for the FINAL success event from our reply handler.
     let success_event = response.events.iter().find(|e| {
         e.ty.starts_with("wasm")
-            && e.attributes.iter().any(
-                |a| a.key == "action" && a.value == "aggregate_swap_complete",
-            )
+            && e.attributes
+                .iter()
+                .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
     });
-    assert!(success_event.is_some(), "Did not find final aggregate_swap_complete event");
+    assert!(
+        success_event.is_some(),
+        "Did not find final aggregate_swap_complete event"
+    );
 
     // Check that the final received amount is the sum of the two Stage 2 AMM swaps.
-    let final_received_attr = success_event.unwrap().attributes.iter().find(|a| a.key == "final_received").unwrap();
+    let final_received_attr = success_event
+        .unwrap()
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
 
     let expected_final_amount =
         Uint128::from(63174284362280640946506u128) + Uint128::from(65736109058836791911471u128);

@@ -1,10 +1,11 @@
+use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
-    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult, Uint128
+    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo,
+    Response, StdResult, Uint128,
 };
 use injective_math::FPDecimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use cosmwasm_schema::cw_serde;
 use std::str::FromStr;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -31,8 +32,8 @@ pub enum ExecuteMsg {
         deadline: Option<u64>,
     },
     SwapMinOutput {
-        target_denom: String, 
-        min_output_quantity: String 
+        target_denom: String,
+        min_output_quantity: String,
     },
 }
 
@@ -42,8 +43,13 @@ pub struct InstantiateMsg {}
 #[cw_serde]
 pub enum QueryMsg {}
 
-#[entry_point] 
-pub fn instantiate(_deps: DepsMut, _env: Env, _info: MessageInfo, _msg: InstantiateMsg) -> StdResult<Response> {
+#[entry_point]
+pub fn instantiate(
+    _deps: DepsMut,
+    _env: Env,
+    _info: MessageInfo,
+    _msg: InstantiateMsg,
+) -> StdResult<Response> {
     Ok(Response::new())
 }
 
@@ -54,8 +60,8 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
-    let recipient = info.sender.to_string(); 
-    
+    let recipient = info.sender.to_string();
+
     let (return_amount, output_denom): (Uint128, String) = match msg {
         ExecuteMsg::Swap { offer_asset, .. } => {
             let output_denom = "usdt".to_string(); // In AMM swaps, we mock a final token
@@ -70,8 +76,7 @@ pub fn execute(
                         Uint128::from(63174284362280640946506u128)
                     } else if sent_amount == Uint128::from(376964041069569367u128) {
                         Uint128::from(65736109058836791911471u128)
-                    } 
-                    else {
+                    } else {
                         Uint128::zero()
                     }
                 } else {
@@ -82,7 +87,11 @@ pub fn execute(
             };
             (amount, output_denom) // Return the tuple
         }
-        ExecuteMsg::SwapMinOutput { target_denom, min_output_quantity, .. } => {
+        ExecuteMsg::SwapMinOutput {
+            target_denom,
+            min_output_quantity,
+            ..
+        } => {
             let output_denom = target_denom; // Use the denom passed in the message
             let amount = {
                 let sent_denom = &info.funds[0].denom;
@@ -112,13 +121,10 @@ pub fn execute(
         }],
     });
 
-    Ok(Response::new()
-        .add_message(bank_send_msg)
-        .add_event(event))
+    Ok(Response::new().add_message(bank_send_msg).add_event(event))
 }
 
 #[entry_point]
 pub fn query(_deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
-
     match msg {}
 }

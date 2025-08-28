@@ -1,6 +1,4 @@
-use crate::msg::{
-    external, orderbook, ActionDescription, Route, SimulateRouteResponse, Step,
-};
+use crate::msg::{external, orderbook, ActionDescription, Route, SimulateRouteResponse, Step};
 use crate::state::Config;
 use cosmwasm_std::{
     to_json_binary, Binary, Coin, Deps, Env, QuerierWrapper, StdResult, Uint128, WasmQuery,
@@ -33,7 +31,7 @@ pub fn simulate_route(deps: Deps, _env: Env, route: Route, amount_in: Coin) -> S
             "Route has a cycle or is invalid; no root nodes found",
         ));
     }
-    
+
     let mut to_process: Vec<usize> = root_node_indices;
 
     'main_loop: while let Some(step_index) = to_process.pop() {
@@ -48,17 +46,20 @@ pub fn simulate_route(deps: Deps, _env: Env, route: Route, amount_in: Coin) -> S
             for (parent_index, parent_step) in route.steps.iter().enumerate() {
                 if parent_step.next_steps.contains(&step_index) {
                     if let Some(parent_output) = step_outputs.get(&parent_index) {
-                        total_input += parent_output.multiply_ratio(step.amount_in_percentage as u128, 100u128);
+                        total_input += parent_output
+                            .multiply_ratio(step.amount_in_percentage as u128, 100u128);
                     } else {
                         to_process.push(step_index);
                         to_process.push(parent_index);
-                        continue 'main_loop; 
+                        continue 'main_loop;
                     }
                 }
             }
             total_input
         } else {
-            amount_in.amount.multiply_ratio(step.amount_in_percentage as u128, 100u128)
+            amount_in
+                .amount
+                .multiply_ratio(step.amount_in_percentage as u128, 100u128)
         };
 
         let current_step_output_amount =
@@ -93,7 +94,6 @@ pub fn simulate_route(deps: Deps, _env: Env, route: Route, amount_in: Coin) -> S
     to_json_binary(&response)
 }
 
-
 fn simulate_single_step(
     querier: &QuerierWrapper,
     step: &Step,
@@ -101,7 +101,7 @@ fn simulate_single_step(
 ) -> StdResult<Uint128> {
     match &step.description {
         ActionDescription::AmmSwap {
-            protocol: _, 
+            protocol: _,
             offer_asset_info,
             .. // ask_asset_info is not needed for the simulation query
         } => {
@@ -172,7 +172,7 @@ mod tests {
         // Mock the response from a PAIR contract's `Simulation` query.
         let mock_response = external::SimulationResponse {
             return_amount: Uint128::new(50000),
-            spread_amount: Uint128::new(100), // Dummy data
+            spread_amount: Uint128::new(100),    // Dummy data
             commission_amount: Uint128::new(50), // Dummy data
         };
         let mock_response_binary = to_json_binary(&mock_response).unwrap();
@@ -194,7 +194,7 @@ mod tests {
                 }
             },
         );
-        
+
         let mut deps = mock_dependencies();
         deps.querier = querier;
 
@@ -224,19 +224,20 @@ mod tests {
 
     #[test]
     fn test_simulate_split_route_direct_to_pair() {
-
         let mut querier = MockQuerier::new(&[]);
 
         // Mock responses for PAIR A and PAIR B
         let mock_response_a = external::SimulationResponse {
             return_amount: Uint128::new(30000),
-            spread_amount: Uint128::zero(), commission_amount: Uint128::zero(),
+            spread_amount: Uint128::zero(),
+            commission_amount: Uint128::zero(),
         };
         let mock_response_a_binary = to_json_binary(&mock_response_a).unwrap();
 
         let mock_response_b = external::SimulationResponse {
             return_amount: Uint128::new(45000),
-            spread_amount: Uint128::zero(), commission_amount: Uint128::zero(),
+            spread_amount: Uint128::zero(),
+            commission_amount: Uint128::zero(),
         };
         let mock_response_b_binary = to_json_binary(&mock_response_b).unwrap();
 
@@ -298,7 +299,7 @@ mod tests {
                 },
             ],
         };
-        
+
         let result_binary =
             simulate_route(deps.as_ref(), mock_env(), route, Coin::new(1000u128, "inj")).unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
@@ -321,7 +322,7 @@ mod tests {
         // 2. Pair A Response (Step 1): Takes its share of INJ, outputs 50,000 final tokens
         let amm_a_response = external::SimulationResponse {
             return_amount: Uint128::new(50_000),
-            spread_amount: Uint128::zero(), // Dummy data
+            spread_amount: Uint128::zero(),     // Dummy data
             commission_amount: Uint128::zero(), // Dummy data
         };
         let amm_a_response_bin = to_json_binary(&amm_a_response).unwrap();
@@ -355,7 +356,7 @@ mod tests {
                             // Assert it received the correct 57% of the order book's output.
                             // 200,000 * 0.57 = 114,000
                             let decoded_query: external::QueryMsg = from_json(msg).unwrap();
-                             let external::QueryMsg::Simulation { offer_asset } = decoded_query;
+                            let external::QueryMsg::Simulation { offer_asset } = decoded_query;
                             assert_eq!(offer_asset.amount, Uint128::new(114_000));
                             SystemResult::Ok(ContractResult::Ok(amm_b_response_bin.clone()))
                         } else {
@@ -391,7 +392,8 @@ mod tests {
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: AssetInfo::Token { // Not used in query, but good for route description
+                        ask_asset_info: AssetInfo::Token {
+                            // Not used in query, but good for route description
                             contract_addr: Addr::unchecked(FINAL_TOKEN).to_string(),
                         },
                     },

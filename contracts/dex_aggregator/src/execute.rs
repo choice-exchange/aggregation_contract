@@ -2,6 +2,7 @@ use cosmwasm_std::{
     to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, SubMsg,
     Uint128, WasmMsg,
 };
+use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 use injective_math::FPDecimal;
 use std::str::FromStr;
@@ -39,7 +40,7 @@ pub fn execute_aggregate_swaps_internal(
     stages: Vec<Stage>,
     minimum_receive_str: Option<String>,
     offer_asset: external::Asset,
-    initiator: Addr, // The actual user who started the swap
+    initiator: Addr,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if offer_asset.amount.is_zero() {
         return Err(ContractError::ZeroAmount {});
@@ -104,14 +105,12 @@ pub fn create_swap_cosmos_msg(
     offer_asset_info: &external::AssetInfo,
     amount: Uint128,
     initiator: &Addr,
-    env: &Env,                  // <-- Add env
-    stages: &[Stage],           // <-- Add stages
-    current_stage_index: usize, // <-- Add stage index
+    env: &Env,
+    stages: &[Stage],
+    current_stage_index: usize,
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
-    // The match statement now produces a result which we will return
     let is_last_stage = current_stage_index == stages.len() - 1;
 
-    // If it's the last stage, send to the user. Otherwise, send to ourself (the aggregator).
     let recipient = if is_last_stage {
         initiator.to_string()
     } else {
@@ -120,35 +119,42 @@ pub fn create_swap_cosmos_msg(
 
     let cosmos_msg = match operation {
         Operation::AmmSwap(amm_op) => {
-            // Use the function parameters: `offer_asset_info` and `amount`
-            let offer_asset_for_split = external::Asset {
-                info: offer_asset_info.clone(),
-                amount,
-            };
-
-            let swap_msg = AmmPairExecuteMsg::Swap {
-                offer_asset: offer_asset_for_split,
+            let amm_swap_msg = AmmPairExecuteMsg::Swap {
+                offer_asset: external::Asset {
+                    info: offer_asset_info.clone(),
+                    amount,
+                },
                 belief_price: None,
                 max_spread: None,
                 to: Some(recipient),
                 deadline: None,
             };
 
-            // Funds are only sent if the offer asset is a native token
-            let funds = if let external::AssetInfo::NativeToken { denom } = offer_asset_info {
-                vec![Coin {
-                    denom: denom.clone(),
-                    amount,
-                }]
-            } else {
-                vec![]
-            };
+            match offer_asset_info {
+                external::AssetInfo::NativeToken { denom } => {
+                    CosmosMsg::Wasm(WasmMsg::Execute {
+                        contract_addr: amm_op.pool_address.clone(),
+                        msg: to_json_binary(&amm_swap_msg)?,
+                        funds: vec![Coin {
+                            denom: denom.clone(),
+                            amount,
+                        }],
+                    })
+                }
+                external::AssetInfo::Token { contract_addr } => {
+                    let cw20_send_msg = Cw20ExecuteMsg::Send {
+                        contract: amm_op.pool_address.clone(),
+                        amount,
+                        msg: to_json_binary(&amm_swap_msg)?,
+                    };
 
-            CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: amm_op.pool_address.clone(),
-                msg: to_json_binary(&swap_msg)?,
-                funds,
-            })
+                    CosmosMsg::Wasm(WasmMsg::Execute {
+                        contract_addr: contract_addr.clone(), 
+                        msg: to_json_binary(&cw20_send_msg)?,
+                        funds: vec![], 
+                    })
+                }
+            }
         }
         Operation::OrderbookSwap(ob_op) => {
             let target_denom = match &ob_op.ask_asset_info {
@@ -167,7 +173,6 @@ pub fn create_swap_cosmos_msg(
                 min_output_quantity,
             };
 
-            // Use the function parameters: `offer_asset_info` and `amount`
             let funds = if let external::AssetInfo::NativeToken { denom } = offer_asset_info {
                 vec![Coin {
                     denom: denom.clone(),
@@ -185,6 +190,5 @@ pub fn create_swap_cosmos_msg(
         }
     };
 
-    // Return the successfully created message
     Ok(cosmos_msg)
 }

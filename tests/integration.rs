@@ -259,7 +259,7 @@ fn test_multi_stage_aggregate_swap_success() {
                     }),
                 }],
             },
-            // Stage 2: The resulting INJ is split 49/51 across two AMMs to get the final CW20 token.
+            // Stage 2: The resulting INJ is split 49/51 across two AMMs to get the final token.
             Stage {
                 splits: vec![
                     Split {

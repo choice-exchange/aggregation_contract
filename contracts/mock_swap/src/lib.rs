@@ -1,12 +1,12 @@
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
-    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo,
-    Response, StdResult, Uint128,
+    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult, Uint128
 };
 use injective_math::FPDecimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+use cw_storage_plus::Item;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -37,81 +37,84 @@ pub enum ExecuteMsg {
     },
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
-pub struct InstantiateMsg {}
+#[cw_serde]
+pub enum ProtocolType {
+    Amm,
+    Orderbook,
+}
+
+#[cw_serde]
+pub struct SwapConfig {
+    pub input_denom: String,
+    pub output_denom: String,
+    pub rate: String,
+    pub protocol_type: ProtocolType, // New field to determine event type
+}
+
+#[cw_serde]
+pub struct InstantiateMsg {
+    pub config: SwapConfig,
+}
 
 #[cw_serde]
 pub enum QueryMsg {}
 
+pub const CONFIG: Item<SwapConfig> = Item::new("config");
+
+
 #[entry_point]
 pub fn instantiate(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
     _info: MessageInfo,
-    _msg: InstantiateMsg,
+    msg: InstantiateMsg,
 ) -> StdResult<Response> {
+    CONFIG.save(deps.storage, &msg.config)?;
     Ok(Response::new())
 }
 
 #[entry_point]
 pub fn execute(
-    _deps: DepsMut,
+    deps: DepsMut,
     _env: Env,
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
     let recipient = info.sender.to_string();
+    let config = CONFIG.load(deps.storage)?;
 
-    let (return_amount, output_denom): (Uint128, String) = match msg {
+    let (return_amount, output_denom, input_amount, input_denom) = match msg {
         ExecuteMsg::Swap { offer_asset, .. } => {
-            let output_denom = "usdt".to_string(); // In AMM swaps, we mock a final token
-            let amount = if let AssetInfo::NativeToken { denom } = &offer_asset.info {
-                if denom == "inj" {
-                    let sent_amount = offer_asset.amount;
-                    if sent_amount == Uint128::from(33_000_000_000_000_000_000u128) {
-                        Uint128::from(5_200_000_000_000_000_000_000_000u128)
-                    } else if sent_amount == Uint128::from(42_000_000_000_000_000_000u128) {
-                        Uint128::from(6_600_000_000_000_000_000_000_000u128)
-                    } else if sent_amount == Uint128::from(362181137498213706u128) {
-                        Uint128::from(63174284362280640946506u128)
-                    } else if sent_amount == Uint128::from(376964041069569367u128) {
-                        Uint128::from(65736109058836791911471u128)
-                    } else {
-                        Uint128::zero()
-                    }
-                } else {
-                    Uint128::zero()
-                }
-            } else {
-                Uint128::zero()
+            let sent_amount = offer_asset.amount;
+            let sent_denom = match offer_asset.info {
+                AssetInfo::NativeToken { denom } => denom,
+                AssetInfo::Token { contract_addr } => contract_addr,
             };
-            (amount, output_denom) // Return the tuple
+            let rate = FPDecimal::from_str(&config.rate).map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?;
+            let return_amount = if sent_denom == config.input_denom { (FPDecimal::from(sent_amount.u128()) * rate).into() } else { Uint128::zero() };
+            (return_amount, config.output_denom, sent_amount, sent_denom)
         }
-        ExecuteMsg::SwapMinOutput {
-            target_denom,
-            min_output_quantity,
-            ..
-        } => {
-            let output_denom = target_denom; // Use the denom passed in the message
-            let amount = {
-                let sent_denom = &info.funds[0].denom;
-                if sent_denom == "usdt" {
-                    Uint128::from(739145178567783074u128)
-                } else if sent_denom == "inj" {
-                    FPDecimal::from_str(&min_output_quantity)
-                        .map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?
-                        .into()
-                } else {
-                    Uint128::zero()
-                }
-            };
-            (amount, output_denom) // Return the tuple
+        ExecuteMsg::SwapMinOutput { .. } => {
+            let sent_coin = &info.funds[0];
+            let rate = FPDecimal::from_str(&config.rate).map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?;
+            let return_amount = if sent_coin.denom == config.input_denom { (FPDecimal::from(sent_coin.amount.u128()) * rate).into() } else { Uint128::zero() };
+            (return_amount, config.output_denom, sent_coin.amount, sent_coin.denom.clone())
         }
     };
 
-    let event = Event::new("wasm")
-        .add_attribute("action", "swap")
-        .add_attribute("return_amount", return_amount.to_string());
+    let event = match config.protocol_type {
+        ProtocolType::Amm => Event::new("wasm")
+            .add_attribute("action", "swap")
+            .add_attribute("return_amount", return_amount.to_string()),
+        ProtocolType::Orderbook => {
+            Event::new("atomic_swap_execution")
+                .add_attribute("swap_input_amount", input_amount)
+                .add_attribute("swap_input_denom", input_denom)
+                .add_attribute("refund_amount", "0")
+                .add_attribute("swap_final_amount", return_amount)
+                .add_attribute("swap_final_denom", output_denom.clone())
+        }
+    };
 
     let bank_send_msg = CosmosMsg::Bank(BankMsg::Send {
         to_address: recipient,

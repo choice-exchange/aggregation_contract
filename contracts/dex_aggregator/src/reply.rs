@@ -33,15 +33,27 @@ pub fn handle_reply(
         .map_err(|_| ContractError::ReplyParseError {})?
         .events
         .into_iter()
-        .find(|e| e.ty.starts_with("wasm")) // Use starts_with for robustness
+        .find(|e| e.ty.starts_with("wasm"))
         .ok_or(ContractError::ReplyParseError {})?;
 
-    let amount_str = event
-        .attributes
-        .into_iter()
-        .find(|attr| attr.key == "return_amount")
-        .map(|attr| attr.value)
-        .ok_or(ContractError::ReplyParseError {})?;
+    // Check event type and find the correct attribute for the return amount
+    let amount_str = if event.ty == "wasm-atomic_swap_execution" {
+        // This is an Orderbook swap
+        event
+            .attributes
+            .into_iter()
+            .find(|attr| attr.key == "swap_final_amount")
+            .map(|attr| attr.value)
+            .ok_or(ContractError::ReplyParseError {})?
+    } else {
+        // This is an AMM swap (event.ty == "wasm")
+        event
+            .attributes
+            .into_iter()
+            .find(|attr| attr.key == "return_amount")
+            .map(|attr| attr.value)
+            .ok_or(ContractError::ReplyParseError {})?
+    };
 
     let amount_returned: Uint128 = amount_str.parse()?;
 

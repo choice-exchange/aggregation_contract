@@ -1,4 +1,4 @@
-use crate::msg::Route;
+use crate::msg::{external, Route};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -11,6 +11,14 @@ pub struct Config {
     pub cw20_adapter_address: Addr,
 }
 
+#[cw_serde]
+pub enum Awaiting {
+    /// Waiting for replies from DEX swaps (AMMs or Orderbooks).
+    Swaps,
+    /// Waiting for replies from the CW20 Adapter after dispatching conversion messages.
+    Conversions,
+}
+
 // Stores the contract's configuration
 pub const CONFIG: Item<Config> = Item::new("config");
 
@@ -20,22 +28,27 @@ pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
 
 #[cw_serde]
 pub struct ReplyState {
-    // --- Unchanged Fields ---
     pub sender: Addr,
+    /// The minimum final amount the user must receive.
     pub minimum_receive: Uint128,
-
-    // --- NEW & ENHANCED FIELDS ---
-    /// The entire multi-stage plan for this execution.
+    /// The entire, pre-defined plan of swaps.
     pub stages: Vec<crate::msg::Stage>,
 
-    /// The index of the stage we are currently executing.
+    // --- State Machine Fields (Dynamic) ---
+    /// What kind of reply are we currently waiting for?
+    pub awaiting: Awaiting,
+    /// The index of the swap stage we are currently processing.
     pub current_stage_index: u64,
+    /// The number of submessage replies we are waiting for in the current state.
+    pub replies_expected: u64,
 
-    /// The number of submessages we are waiting for from the CURRENT stage.
-    pub replies_expected_for_current_stage: u64,
-
-    /// The total output from the JUST-COMPLETED stage. This becomes the input for the next stage.
-    pub accumulated_amount_for_current_stage: Uint128,
+    // --- Data Accumulators (Dynamic) ---
+    /// Assets collected from a completed swap stage. This is a temporary holding area
+    /// before the "Normalization Phase" unifies them.
+    pub accumulated_assets: Vec<external::Asset>,
+    /// The total balance that has been unified into the correct asset type and is
+    /// ready to be used as input for the next swap stage.
+    pub ready_for_next_stage_amount: Uint128,
 }
 
 // A map from a unique reply ID to its state

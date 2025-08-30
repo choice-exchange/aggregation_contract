@@ -1,14 +1,18 @@
 #![cfg(test)]
 
-use cosmwasm_std::{Coin};
+use std::str::FromStr;
+
+use cosmwasm_std::{to_json_binary, Addr, Coin, Uint128};
+use cw20::{BalanceResponse, Cw20QueryMsg};
+use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    cw20_adapter, external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp, Split, Stage
+    cw20_adapter, external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp,
+    Split, Stage,
 };
 use injective_test_tube::{
-    injective_std::types::cosmos::{bank::v1beta1::MsgSend, base::v1beta1::Coin as ProtoCoin},
-    Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm,
+    injective_std::types::cosmos::{bank::v1beta1::{MsgSend, QueryBalanceRequest}, base::v1beta1::Coin as ProtoCoin}, Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm
 };
-use mock_swap::{InstantiateMsg as MockInstantiateMsg, ProtocolType, SwapConfig};
+use mock_swap::{AssetInfo, InstantiateMsg as MockInstantiateMsg, ProtocolType, SwapConfig};
 
 fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
     match filename {
@@ -20,8 +24,6 @@ fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
     }
 }
 
-// ... The rest of the test setup and test cases from the previous answer go here ...
-// Setup function and test cases remain the same.
 pub struct TestEnv {
     pub app: InjectiveTestApp,
     pub admin: SigningAccount,
@@ -29,8 +31,8 @@ pub struct TestEnv {
     pub aggregator_addr: String,
     pub mock_amm_1_addr: String,
     pub mock_amm_2_addr: String,
-    pub mock_ob_inj_usdt_addr: String, 
-    pub mock_ob_usdt_inj_addr: String, 
+    pub mock_ob_inj_usdt_addr: String,
+    pub mock_ob_usdt_inj_addr: String,
 }
 
 /// Sets up the test environment, deploying the aggregator and three mock swap contracts.
@@ -39,7 +41,7 @@ fn setup() -> TestEnv {
 
     let admin_initial_coins = &[
         Coin::new(1_000_000_000_000_000_000_000_000_000_000u128, "inj"),
-        Coin::new(1_000_000_000_000_000_000_000_000_000_000u128, "usdt"),
+        Coin::new(1_000_000_000_000_000_000u128, "usdt"),
     ];
     let admin_initial_decimals = &[
         18, // inj
@@ -53,7 +55,7 @@ fn setup() -> TestEnv {
     let user = app
         .init_account(&[
             Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
-            Coin::new(1_000_000_000_000_000_000_000_000u128, "usdt"),
+            Coin::new(1_000_000_000_000u128, "usdt"),
         ])
         .unwrap();
 
@@ -82,8 +84,18 @@ fn setup() -> TestEnv {
         .data
         .code_id;
 
-    let adapter_addr = wasm.instantiate(cw20_adapter_code_id, &cw20_adapter::InstantiateMsg {}, Some(&admin.address()), Some("cw20-adapter"), &[], &admin).unwrap().data.address;
-
+    let adapter_addr = wasm
+        .instantiate(
+            cw20_adapter_code_id,
+            &cw20_adapter::InstantiateMsg {},
+            Some(&admin.address()),
+            Some("cw20-adapter"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
     // Instantiate mock contracts
     let aggregator_addr = wasm
@@ -91,7 +103,7 @@ fn setup() -> TestEnv {
             aggregator_code_id,
             &InstantiateMsg {
                 admin: admin.address(),
-                cw20_adapter_address: adapter_addr
+                cw20_adapter_address: adapter_addr,
             },
             Some(&admin.address()),
             Some("dex-aggregator"),
@@ -103,33 +115,109 @@ fn setup() -> TestEnv {
         .address;
 
     // Instantiate mock contracts with our simple, clear rates
-    let mock_amm_1_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {
-        config: SwapConfig {
-            input_denom: "inj".to_string(), output_denom: "usdt".to_string(), rate: "10.0".to_string(),
-            protocol_type: ProtocolType::Amm, // This is an AMM
-        },
-    }, Some(&admin.address()), Some("mock-amm-1"), &[], &admin).unwrap().data.address;
+    let mock_amm_1_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "10.0".to_string(),
+                    protocol_type: ProtocolType::Amm, // This is an AMM
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("mock-amm-1"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
-    let mock_amm_2_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {
-        config: SwapConfig {
-            input_denom: "inj".to_string(), output_denom: "usdt".to_string(), rate: "20.0".to_string(),
-            protocol_type: ProtocolType::Amm, // This is an AMM
-        },
-    }, Some(&admin.address()), Some("mock-amm-2"), &[], &admin).unwrap().data.address;
+    let mock_amm_2_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "20.0".to_string(),
+                    protocol_type: ProtocolType::Amm, // This is an AMM
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("mock-amm-2"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
-    let mock_ob_inj_usdt_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {
-        config: SwapConfig {
-            input_denom: "inj".to_string(), output_denom: "usdt".to_string(), rate: "30.0".to_string(),
-            protocol_type: ProtocolType::Orderbook, // This is an Orderbook
-        },
-    }, Some(&admin.address()), Some("mock-ob-inj-usdt"), &[], &admin).unwrap().data.address;
+    let mock_ob_inj_usdt_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "30.0".to_string(),
+                    protocol_type: ProtocolType::Orderbook, // This is an Orderbook
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("mock-ob-inj-usdt"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
-    let mock_ob_usdt_inj_addr = wasm.instantiate(mock_swap_code_id, &MockInstantiateMsg {
-        config: SwapConfig {
-            input_denom: "usdt".to_string(), output_denom: "inj".to_string(), rate: "0.1".to_string(),
-            protocol_type: ProtocolType::Orderbook, // This is an Orderbook
-        },
-    }, Some(&admin.address()), Some("mock-ob-usdt-inj"), &[], &admin).unwrap().data.address;
+    let mock_ob_usdt_inj_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    rate: "0.1".to_string(),
+                    protocol_type: ProtocolType::Orderbook, // This is an Orderbook
+                    input_decimals: 6,
+                    output_decimals: 18,
+                },
+            },
+            Some(&admin.address()),
+            Some("mock-ob-usdt-inj"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
 
     let bank = Bank::new(&app);
     let funds_to_send = vec![
@@ -139,12 +227,17 @@ fn setup() -> TestEnv {
         },
         ProtoCoin {
             denom: "usdt".to_string(),
-            amount: "1000000000000000000000000000".to_string(),
+            amount: "1000000000000000".to_string(),
         },
     ];
 
     // Fund all three mock contracts from the admin account.
-    for addr in [&mock_amm_1_addr, &mock_amm_2_addr, &mock_ob_inj_usdt_addr, &mock_ob_usdt_inj_addr] {
+    for addr in [
+        &mock_amm_1_addr,
+        &mock_amm_2_addr,
+        &mock_ob_inj_usdt_addr,
+        &mock_ob_usdt_inj_addr,
+    ] {
         bank.send(
             MsgSend {
                 from_address: admin.address(),
@@ -164,7 +257,7 @@ fn setup() -> TestEnv {
         mock_amm_1_addr,
         mock_amm_2_addr,
         mock_ob_inj_usdt_addr,
-        mock_ob_usdt_inj_addr
+        mock_ob_usdt_inj_addr,
     }
 }
 
@@ -172,6 +265,8 @@ fn setup() -> TestEnv {
 fn test_aggregate_swap_success() {
     let env = setup();
     let wasm = Wasm::new(&env.app);
+
+    let bank = Bank::new(&env.app);
 
     // Input: 100 INJ
     // Split 1 (33%): 33 INJ -> AMM1 @ 10.0 = 330 USDT
@@ -216,12 +311,12 @@ fn test_aggregate_swap_success() {
                         offer_asset_info: external::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        min_output: "740000000000000000000".to_string(), // 740 USDT
+                        min_output: "740000000".to_string(), // 740 USDT
                     }),
                 },
             ],
         }],
-        minimum_receive: Some("1910000000000000000000".to_string()), // Min 1910 USDT
+        minimum_receive: Some("1910000000".to_string()), // Min 1910 USDT
     };
 
     let res = wasm.execute(
@@ -235,12 +330,16 @@ fn test_aggregate_swap_success() {
     assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
 
     let response = res.unwrap();
-    let success_event = response.events.iter().find(|e| {
-        e.ty == "wasm"
-            && e.attributes
-                .iter()
-                .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
-    }).expect("Did not find success event in reply");
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event in reply");
 
     let total_received_attr = success_event
         .attributes
@@ -249,7 +348,28 @@ fn test_aggregate_swap_success() {
         .unwrap();
 
     // Assert the total expected output is 1920 USDT
-    assert_eq!(total_received_attr.value, "1920000000000000000000");
+    assert_eq!(total_received_attr.value, "1920000000");
+    
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // The user's final balance should be their initial balance + the swap output.
+    // Initial: 1_000_000_000_000 (from setup)
+    // Swap Output: 1_920_000_000 (1920 USDT)
+    // Expected Final: 1_001_920_000_000
+    let expected_final_balance = Uint128::new(1_001_920_000_000u128);
+
+    // Extract the amount from the query response
+    let final_balance = balance_response.balance.unwrap();
+    let final_amount = Uint128::from_str(&final_balance.amount).unwrap();
+
+    // Assert the final balance is correct
+    assert_eq!(final_amount, expected_final_balance);
+    assert_eq!(final_balance.denom, "usdt");
 }
 
 #[test]
@@ -312,11 +432,11 @@ fn test_multi_stage_aggregate_swap_success() {
             },
         ],
         // The minimum we expect from summing the Stage 2 outputs.
-        minimum_receive: Some("1500000000000000000000000".to_string()), // 1,500,000 USDT
+        minimum_receive: Some("1500000000000".to_string()), // 1,500,000 USDT
     };
 
     // The initial funds for this route are 1,000,000 USDT
-    let initial_funds = Coin::new(1_000_000_000_000_000_000_000_000u128, "usdt");
+    let initial_funds = Coin::new(1_000_000_000_000u128, "usdt");
 
     let res = wasm.execute(&env.aggregator_addr, &msg, &[initial_funds], &env.user);
 
@@ -327,12 +447,16 @@ fn test_multi_stage_aggregate_swap_success() {
     );
     let response = res.unwrap();
 
-    let success_event = response.events.iter().find(|e| {
-        e.ty.starts_with("wasm")
-            && e.attributes
-                .iter()
-                .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
-    }).expect("Did not find final aggregate_swap_complete event");
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
 
     let final_received_attr = success_event
         .attributes
@@ -341,6 +465,367 @@ fn test_multi_stage_aggregate_swap_success() {
         .unwrap();
 
     // Expected final amount is 1,510,000 USDT
-    let expected_final_amount = "1510000000000000000000000";
+    let expected_final_amount = "1510000000000";
     assert_eq!(final_received_attr.value, expected_final_amount);
+}
+
+pub struct ConversionTestSetup {
+    pub env: TestEnv,
+    pub shroom_cw20_addr: String,
+    pub sai_cw20_addr: String,
+    pub adapter_addr: String,
+    pub mock_inj_to_native_shroom_ob: String,
+    pub mock_inj_to_cw20_shroom_amm: String,
+    pub mock_cw20_shroom_to_cw20_sai_amm: String,
+}
+
+fn setup_for_conversion_test() -> ConversionTestSetup {
+    let app = InjectiveTestApp::new();
+    let admin = app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let user = app
+        .init_account(&[
+            Coin::new(100_000_000_000_000_000_000u128, "inj"), // 100 INJ
+        ])
+        .unwrap();
+    let wasm = Wasm::new(&app);
+
+    // 1. Store all contract codes
+    let aggregator_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let mock_swap_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let cw20_code_id = wasm
+        .store_code(get_wasm_byte_code("cw20_base.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let adapter_code_id = wasm
+        .store_code(get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+
+    // 2. Deploy core infrastructure
+    let adapter_addr = wasm
+        .instantiate(
+            adapter_code_id,
+            &cw20_adapter::InstantiateMsg {},
+            Some(&admin.address()),
+            Some("adapter"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let aggregator_addr = wasm
+        .instantiate(
+            aggregator_code_id,
+            &InstantiateMsg {
+                admin: admin.address(),
+                cw20_adapter_address: adapter_addr.clone(),
+            },
+            Some(&admin.address()),
+            Some("aggregator"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // 3. Deploy Token Contracts (SHROOM and SAI)
+    let shroom_cw20_addr = wasm
+        .instantiate(
+            cw20_code_id,
+            &Cw20InstantiateMsg {
+                name: "Shroom".to_string(),
+                symbol: "SHROOM".to_string(),
+                decimals: 6,
+                initial_balances: vec![],
+                mint: Some(cw20::MinterResponse {
+                    minter: admin.address(),
+                    cap: None,
+                }),
+                marketing: None,
+            },
+            Some(&admin.address()),
+            Some("shroom"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let sai_cw20_addr = wasm
+        .instantiate(
+            cw20_code_id,
+            &Cw20InstantiateMsg {
+                name: "Sai".to_string(),
+                symbol: "SAI".to_string(),
+                decimals: 6,
+                initial_balances: vec![],
+                mint: Some(cw20::MinterResponse {
+                    minter: admin.address(),
+                    cap: None,
+                }),
+                marketing: None,
+            },
+            Some(&admin.address()),
+            Some("sai"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let total_fee = Coin::new(10_000_000_000_000_000_000u128, "inj");
+
+    // 4. Register tokens with the adapter
+    wasm.execute(
+        &adapter_addr,
+        &cw20_adapter::ExecuteMsg::RegisterCw20Contract {
+            addr: Addr::unchecked(shroom_cw20_addr.clone()),
+        },
+        &[total_fee.clone()],
+        &admin,
+    )
+    .unwrap();
+    wasm.execute(
+        &adapter_addr,
+        &cw20_adapter::ExecuteMsg::RegisterCw20Contract {
+            addr: Addr::unchecked(sai_cw20_addr.clone()),
+        },
+        &[total_fee.clone()],
+        &admin,
+    )
+    .unwrap();
+    // 5. Deploy and Fund Mock DEXs
+    let native_shroom_denom = format!("factory/{}/{}", adapter_addr, shroom_cw20_addr);
+
+    // DEX 1: INJ -> SHROOM (native)
+    let mock_inj_to_native_shroom_ob = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: native_shroom_denom.clone(),
+                    },
+                    rate: "100.0".to_string(),
+                    protocol_type: ProtocolType::Orderbook,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("ob-inj-shroom"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // DEX 2: INJ -> SHROOM (cw20)
+    let mock_inj_to_cw20_shroom_amm = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::Token {
+                        contract_addr: shroom_cw20_addr.clone(),
+                    },
+                    rate: "100.0".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-inj-shroom"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // DEX 3: SHROOM (cw20) -> SAI (cw20)
+    let mock_cw20_shroom_to_cw20_sai_amm = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::Token {
+                        contract_addr: shroom_cw20_addr.clone(),
+                    },
+                    output_asset_info: AssetInfo::Token {
+                        contract_addr: sai_cw20_addr.clone(),
+                    },
+                    rate: "0.1".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-shroom-sai"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: mock_inj_to_cw20_shroom_amm.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
+    wasm.execute(&sai_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: mock_cw20_shroom_to_cw20_sai_amm.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
+    
+    // 2. Fund the ADAPTER with a liquidity pool of CW20 SHROOM for conversions.
+    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: adapter_addr.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
+
+    // 3. Fund the DEX that pays out in NATIVE SHROOM.
+    // To do this, the admin first needs to create some native shroom.
+    let native_shroom_to_create = Uint128::new(1_000_000_000_000); // 100k
+    // Mint cw20 to admin
+    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: admin.address(), amount: native_shroom_to_create }, &[], &admin).unwrap();
+    // Admin sends cw20 to adapter, which mints native shroom and sends it back to the admin.
+    wasm.execute(&shroom_cw20_addr, &cw20::Cw20ExecuteMsg::Send { contract: adapter_addr.clone(), amount: native_shroom_to_create, msg: to_json_binary(&"{}").unwrap() }, &[], &admin).unwrap();
+    
+    // Now admin has native shroom and can fund the DEX.
+    let bank = Bank::new(&app);
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: mock_inj_to_native_shroom_ob.clone(),
+            amount: vec![ProtoCoin {
+                denom: native_shroom_denom,
+                amount: native_shroom_to_create.to_string(),
+            }],
+        },
+        &admin,
+    ).unwrap();
+    
+    ConversionTestSetup {
+        env: TestEnv {
+            app,
+            admin,
+            user,
+            aggregator_addr,
+            mock_amm_1_addr: "".to_string(),
+            mock_amm_2_addr: "".to_string(),
+            mock_ob_inj_usdt_addr: "".to_string(),
+            mock_ob_usdt_inj_addr: "".to_string(),
+        },
+        shroom_cw20_addr,
+        sai_cw20_addr,
+        adapter_addr,
+        mock_inj_to_native_shroom_ob,
+        mock_inj_to_cw20_shroom_amm,
+        mock_cw20_shroom_to_cw20_sai_amm,
+    }
+}
+
+#[test]
+fn test_full_normalization_route() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+
+    // ROUTE: 10 INJ -> 50% to native SHROOM, 50% to cw20 SHROOM -> unified to cw20 SHROOM -> final swap to cw20 SAI
+    // 10 INJ -> 1000 SHROOM total (500 native + 500 cw20)
+    // 1000 SHROOM -> 100 SAI (rate of 0.1)
+
+    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![
+            // Stage 1: INJ -> SHROOM (mixed native/cw20 output)
+            Stage {
+                splits: vec![
+                    Split {
+                        percent: 50,
+                        operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                            swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: external::AssetInfo::NativeToken {
+                                denom: native_shroom_denom.clone(),
+                            },
+                            min_output: "490000000".to_string(),
+                        }),
+                    },
+                    Split {
+                        percent: 50,
+                        operation: Operation::AmmSwap(AmmSwapOp {
+                            pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: external::AssetInfo::Token {
+                                contract_addr: setup.shroom_cw20_addr.clone(),
+                            },
+                        }),
+                    },
+                ],
+            },
+            // Stage 2: SHROOM (cw20) -> SAI (cw20)
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    operation: Operation::AmmSwap(AmmSwapOp {
+                        pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
+                        offer_asset_info: external::AssetInfo::Token {
+                            contract_addr: setup.shroom_cw20_addr.clone(),
+                        },
+                        ask_asset_info: external::AssetInfo::Token {
+                            contract_addr: setup.sai_cw20_addr.clone(),
+                        },
+                    }),
+                }],
+            },
+        ],
+        minimum_receive: Some("97000000".to_string()), // 97 SAI
+    };
+
+    // Execute the swap
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // Assert the final outcome
+    // The final SAI tokens are sent directly from the last DEX to the user.
+    // So, we query the user's SAI balance.
+    let balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+
+    // 10 INJ * 100 rate = 1000 SHROOM. 1000 SHROOM * 0.1 rate = 100 SAI.
+    // Tokens have 6 decimals.
+    assert_eq!(balance.balance, Uint128::new(100_000_000));
 }

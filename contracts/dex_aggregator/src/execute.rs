@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use crate::error::ContractError;
 use crate::msg::{external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Route, Stage};
-use crate::state::{ReplyState, REPLY_ID_COUNTER, REPLY_STATES};
+use crate::state::{Awaiting, ReplyState, REPLY_ID_COUNTER, REPLY_STATES};
 
 pub fn execute_route(
     _deps: DepsMut<InjectiveQueryWrapper>,
@@ -45,17 +45,12 @@ pub fn execute_aggregate_swaps_internal(
     if offer_asset.amount.is_zero() {
         return Err(ContractError::ZeroAmount {});
     }
-
     let first_stage = stages.first().ok_or(ContractError::NoStages {})?;
-
     let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
     if total_percentage != 100 {
         return Err(ContractError::InvalidPercentageSum {});
     }
 
-    let mut submessages: Vec<SubMsg<InjectiveMsgWrapper>> = vec![];
-
-    // --- Setup for Reply Handling ---
     let reply_id = REPLY_ID_COUNTER.may_load(deps.storage)?.unwrap_or(0) + 1;
     REPLY_ID_COUNTER.save(deps.storage, &reply_id)?;
 
@@ -67,19 +62,23 @@ pub fn execute_aggregate_swaps_internal(
     let initial_state = ReplyState {
         sender: initiator.clone(),
         minimum_receive,
-        stages: stages.clone(), // Store the whole plan
+        stages: stages.clone(),
+        // Initialize the state machine
+        awaiting: Awaiting::Swaps,
         current_stage_index: 0,
-        replies_expected_for_current_stage: first_stage.splits.len() as u64,
-        accumulated_amount_for_current_stage: Uint128::zero(),
+        replies_expected: first_stage.splits.len() as u64,
+        // Initialize accumulators
+        accumulated_assets: vec![],
+        ready_for_next_stage_amount: Uint128::zero(),
     };
     REPLY_STATES.save(deps.storage, reply_id, &initial_state)?;
 
+    let mut submessages: Vec<SubMsg<InjectiveMsgWrapper>> = vec![];
     for split in &first_stage.splits {
         let split_amount = offer_asset
             .amount
             .multiply_ratio(split.percent as u128, 100u128);
 
-        // This helper function creates the CosmosMsg for a given operation and input asset
         let msg = create_swap_cosmos_msg(
             &split.operation,
             &offer_asset.info,
@@ -89,7 +88,6 @@ pub fn execute_aggregate_swaps_internal(
             &stages,
             0,
         )?;
-
         submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
 
@@ -131,16 +129,14 @@ pub fn create_swap_cosmos_msg(
             };
 
             match offer_asset_info {
-                external::AssetInfo::NativeToken { denom } => {
-                    CosmosMsg::Wasm(WasmMsg::Execute {
-                        contract_addr: amm_op.pool_address.clone(),
-                        msg: to_json_binary(&amm_swap_msg)?,
-                        funds: vec![Coin {
-                            denom: denom.clone(),
-                            amount,
-                        }],
-                    })
-                }
+                external::AssetInfo::NativeToken { denom } => CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: amm_op.pool_address.clone(),
+                    msg: to_json_binary(&amm_swap_msg)?,
+                    funds: vec![Coin {
+                        denom: denom.clone(),
+                        amount,
+                    }],
+                }),
                 external::AssetInfo::Token { contract_addr } => {
                     let cw20_send_msg = Cw20ExecuteMsg::Send {
                         contract: amm_op.pool_address.clone(),
@@ -149,9 +145,9 @@ pub fn create_swap_cosmos_msg(
                     };
 
                     CosmosMsg::Wasm(WasmMsg::Execute {
-                        contract_addr: contract_addr.clone(), 
+                        contract_addr: contract_addr.clone(),
                         msg: to_json_binary(&cw20_send_msg)?,
-                        funds: vec![], 
+                        funds: vec![],
                     })
                 }
             }

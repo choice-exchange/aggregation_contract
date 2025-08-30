@@ -1,12 +1,15 @@
+// In mock_swap.rs / lib.rs
+
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
-    entry_point, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult, Uint128
+    entry_point, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps,
+    DepsMut, Env, Event, MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
-use injective_math::FPDecimal;
+use cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
+use cw_storage_plus::Item;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use cw_storage_plus::Item;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +38,7 @@ pub enum ExecuteMsg {
         target_denom: String,
         min_output_quantity: String,
     },
+    Receive(Cw20ReceiveMsg),
 }
 
 #[cw_serde]
@@ -45,10 +49,12 @@ pub enum ProtocolType {
 
 #[cw_serde]
 pub struct SwapConfig {
-    pub input_denom: String,
-    pub output_denom: String,
+    pub input_asset_info: AssetInfo,
+    pub output_asset_info: AssetInfo,
     pub rate: String,
-    pub protocol_type: ProtocolType, // New field to determine event type
+    pub protocol_type: ProtocolType,
+    pub input_decimals: u8,
+    pub output_decimals: u8,
 }
 
 #[cw_serde]
@@ -57,10 +63,24 @@ pub struct InstantiateMsg {
 }
 
 #[cw_serde]
+pub struct MockSwapHookMsg {
+    pub swap: MockSwapHookSwapField,
+}
+
+#[cw_serde]
+pub struct MockSwapHookSwapField {
+    pub offer_asset: Option<Asset>,
+    pub belief_price: Option<Decimal>,
+    pub max_spread: Option<Decimal>,
+    pub to: Option<String>,
+    pub deadline: Option<u64>,
+}
+
+#[cw_serde]
 pub enum QueryMsg {}
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
-
+const DECIMAL_PRECISION: u32 = 18;
 
 #[entry_point]
 pub fn instantiate(
@@ -80,51 +100,100 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
-    let recipient = info.sender.to_string();
     let config = CONFIG.load(deps.storage)?;
+    let mut recipient = info.sender.to_string();
 
-    let (return_amount, output_denom, input_amount, input_denom) = match msg {
-        ExecuteMsg::Swap { offer_asset, .. } => {
-            let sent_amount = offer_asset.amount;
-            let sent_denom = match offer_asset.info {
-                AssetInfo::NativeToken { denom } => denom,
-                AssetInfo::Token { contract_addr } => contract_addr,
-            };
-            let rate = FPDecimal::from_str(&config.rate).map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?;
-            let return_amount = if sent_denom == config.input_denom { (FPDecimal::from(sent_amount.u128()) * rate).into() } else { Uint128::zero() };
-            (return_amount, config.output_denom, sent_amount, sent_denom)
+    let (offer_amount, offer_info) = match msg {
+        ExecuteMsg::Swap { offer_asset, to, .. } => {
+            if let Some(to_addr) = to {
+                recipient = to_addr;
+            }
+            (offer_asset.amount, offer_asset.info)
         }
-        ExecuteMsg::SwapMinOutput { .. } => {
-            let sent_coin = &info.funds[0];
-            let rate = FPDecimal::from_str(&config.rate).map_err(|e| cosmwasm_std::StdError::generic_err(e.to_string()))?;
-            let return_amount = if sent_coin.denom == config.input_denom { (FPDecimal::from(sent_coin.amount.u128()) * rate).into() } else { Uint128::zero() };
-            (return_amount, config.output_denom, sent_coin.amount, sent_coin.denom.clone())
+        ExecuteMsg::SwapMinOutput { .. } => (
+            info.funds[0].amount,
+            AssetInfo::NativeToken {
+                denom: info.funds[0].denom.clone(),
+            },
+        ),
+        ExecuteMsg::Receive(Cw20ReceiveMsg { sender, amount, msg }) => {
+            if let Ok(hook) = from_json::<MockSwapHookMsg>(&msg) {
+                recipient = hook.swap.to.unwrap_or(sender);
+            } else {
+                recipient = sender;
+            }
+            (
+                amount,
+                AssetInfo::Token {
+                    contract_addr: info.sender.to_string(),
+                },
+            )
         }
     };
+
+    let final_return_amount = if offer_info == config.input_asset_info {
+        let offer_decimal = Decimal::from_atomics(offer_amount, config.input_decimals as u32)
+            .map_err(|_| StdError::generic_err("Failed to create decimal from offer amount"))?;
+
+        let rate_decimal = Decimal::from_str(&config.rate)?;
+        let return_decimal = offer_decimal * rate_decimal;
+        let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.output_decimals as u32);
+        let scaling_factor = Uint128::from(10u128.pow(decimal_diff));
+
+        return_decimal
+            .atomics()
+            .checked_div(scaling_factor)
+            .unwrap_or_default()
+    } else {
+        Uint128::zero()
+    };
+
+    if final_return_amount.is_zero() {
+        return Ok(Response::new().add_attribute("action", "swap_skipped_or_zero_amount"));
+    }
+
+    let send_msg: CosmosMsg = match &config.output_asset_info {
+        AssetInfo::Token { contract_addr } => CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: contract_addr.clone(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                recipient: recipient.clone(),
+                amount: final_return_amount,
+            })?,
+            funds: vec![],
+        }),
+        AssetInfo::NativeToken { denom } => CosmosMsg::Bank(BankMsg::Send {
+            to_address: recipient,
+            amount: vec![Coin {
+                denom: denom.clone(),
+                amount: final_return_amount,
+            }],
+        }),
+    };
+
+    let (input_denom_str, _) = get_denom_and_addr(&config.input_asset_info);
+    let (output_denom_str, _) = get_denom_and_addr(&config.output_asset_info);
 
     let event = match config.protocol_type {
         ProtocolType::Amm => Event::new("wasm")
             .add_attribute("action", "swap")
-            .add_attribute("return_amount", return_amount.to_string()),
-        ProtocolType::Orderbook => {
-            Event::new("atomic_swap_execution")
-                .add_attribute("swap_input_amount", input_amount)
-                .add_attribute("swap_input_denom", input_denom)
-                .add_attribute("refund_amount", "0")
-                .add_attribute("swap_final_amount", return_amount)
-                .add_attribute("swap_final_denom", output_denom.clone())
-        }
+            .add_attribute("return_amount", final_return_amount.to_string()),
+        ProtocolType::Orderbook => Event::new("atomic_swap_execution")
+            .add_attribute("sender", info.sender.to_string())
+            .add_attribute("swap_input_amount", offer_amount)
+            .add_attribute("swap_input_denom", input_denom_str)
+            .add_attribute("refund_amount", "0")
+            .add_attribute("swap_final_amount", final_return_amount)
+            .add_attribute("swap_final_denom", output_denom_str),
     };
 
-    let bank_send_msg = CosmosMsg::Bank(BankMsg::Send {
-        to_address: recipient,
-        amount: vec![Coin {
-            denom: output_denom,
-            amount: return_amount,
-        }],
-    });
+    Ok(Response::new().add_message(send_msg).add_event(event))
+}
 
-    Ok(Response::new().add_message(bank_send_msg).add_event(event))
+fn get_denom_and_addr(asset_info: &AssetInfo) -> (String, String) {
+    match asset_info {
+        AssetInfo::NativeToken { denom } => (denom.clone(), "".to_string()),
+        AssetInfo::Token { contract_addr } => (contract_addr.clone(), contract_addr.clone()),
+    }
 }
 
 #[entry_point]

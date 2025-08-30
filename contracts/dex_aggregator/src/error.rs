@@ -44,4 +44,16 @@ pub enum ContractError {
 
     #[error("AggregateSwaps requires exactly one type of coin to be sent")]
     InvalidFunds {},
+
+    #[error("Failed to parse reply: could not find a wasm event")]
+    NoWasmEventInReply {},
+
+    #[error("Failed to parse reply: wasm event did not contain a _contract_address")]
+    NoContractAddressInReply {},
+
+    #[error("Failed to parse reply: wasm event did not contain a return amount")]
+    NoAmountInReply {},
+
+    #[error("Failed to parse reply: could not find a valid conversion event (transfer or wasm)")]
+    NoConversionEventInReply {},
 }

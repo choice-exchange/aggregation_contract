@@ -10,7 +10,11 @@ use dex_aggregator::msg::{
     Split, Stage,
 };
 use injective_test_tube::{
-    injective_std::types::cosmos::{bank::v1beta1::{MsgSend, QueryBalanceRequest}, base::v1beta1::Coin as ProtoCoin}, Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm
+    injective_std::types::cosmos::{
+        bank::v1beta1::{MsgSend, QueryBalanceRequest},
+        base::v1beta1::Coin as ProtoCoin,
+    },
+    Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm,
 };
 use mock_swap::{AssetInfo, InstantiateMsg as MockInstantiateMsg, ProtocolType, SwapConfig};
 
@@ -349,7 +353,7 @@ fn test_aggregate_swap_success() {
 
     // Assert the total expected output is 1920 USDT
     assert_eq!(total_received_attr.value, "1920000000");
-    
+
     let balance_response = bank
         .query_balance(&QueryBalanceRequest {
             address: env.user.address(),
@@ -376,6 +380,7 @@ fn test_aggregate_swap_success() {
 fn test_multi_stage_aggregate_swap_success() {
     let env = setup();
     let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
 
     // Stage 1: 1,000,000 USDT -> OB @ 0.1 = 100,000 INJ
     // Stage 2:
@@ -438,7 +443,12 @@ fn test_multi_stage_aggregate_swap_success() {
     // The initial funds for this route are 1,000,000 USDT
     let initial_funds = Coin::new(1_000_000_000_000u128, "usdt");
 
-    let res = wasm.execute(&env.aggregator_addr, &msg, &[initial_funds], &env.user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[initial_funds.clone()],
+        &env.user,
+    );
 
     assert!(
         res.is_ok(),
@@ -467,6 +477,31 @@ fn test_multi_stage_aggregate_swap_success() {
     // Expected final amount is 1,510,000 USDT
     let expected_final_amount = "1510000000000";
     assert_eq!(final_received_attr.value, expected_final_amount);
+
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // The user's final balance should be their initial balance minus the input amount, plus the swap output.
+    // Initial: 1_000_000_000_000 (from setup)
+    // Input:   1_000_000_000_000
+    // Output:  1_510_000_000_000
+    // Expected Final: 1_000_000_000_000 - 1_000_000_000_000 + 1_510_000_000_000 = 1_510_000_000_000
+    let initial_user_balance = 1_000_000_000_000u128; // Assuming this is the initial balance from setup()
+    let expected_final_balance = Uint128::new(initial_user_balance)
+        - Uint128::new(initial_funds.amount.u128())
+        + Uint128::from_str(expected_final_amount).unwrap();
+
+    // Extract the amount from the query response
+    let final_balance = balance_response.balance.unwrap();
+    let final_amount = Uint128::from_str(&final_balance.amount).unwrap();
+
+    // Assert the final balance is correct
+    assert_eq!(final_amount, expected_final_balance);
+    assert_eq!(final_balance.denom, "usdt");
 }
 
 pub struct ConversionTestSetup {
@@ -693,20 +728,66 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
-    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: mock_inj_to_cw20_shroom_amm.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
-    wasm.execute(&sai_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: mock_cw20_shroom_to_cw20_sai_amm.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
-    
+    wasm.execute(
+        &shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: mock_inj_to_cw20_shroom_amm.clone(),
+            amount: Uint128::new(100_000_000_000),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+    wasm.execute(
+        &sai_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: mock_cw20_shroom_to_cw20_sai_amm.clone(),
+            amount: Uint128::new(100_000_000_000),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+
     // 2. Fund the ADAPTER with a liquidity pool of CW20 SHROOM for conversions.
-    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: adapter_addr.clone(), amount: Uint128::new(100_000_000_000) }, &[], &admin).unwrap();
+    wasm.execute(
+        &shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: adapter_addr.clone(),
+            amount: Uint128::new(100_000_000_000),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
 
     // 3. Fund the DEX that pays out in NATIVE SHROOM.
     // To do this, the admin first needs to create some native shroom.
     let native_shroom_to_create = Uint128::new(1_000_000_000_000); // 100k
-    // Mint cw20 to admin
-    wasm.execute(&shroom_cw20_addr, &cw20_base::msg::ExecuteMsg::Mint { recipient: admin.address(), amount: native_shroom_to_create }, &[], &admin).unwrap();
+                                                                   // Mint cw20 to admin
+    wasm.execute(
+        &shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: admin.address(),
+            amount: native_shroom_to_create,
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
     // Admin sends cw20 to adapter, which mints native shroom and sends it back to the admin.
-    wasm.execute(&shroom_cw20_addr, &cw20::Cw20ExecuteMsg::Send { contract: adapter_addr.clone(), amount: native_shroom_to_create, msg: to_json_binary(&"{}").unwrap() }, &[], &admin).unwrap();
-    
+    wasm.execute(
+        &shroom_cw20_addr,
+        &cw20::Cw20ExecuteMsg::Send {
+            contract: adapter_addr.clone(),
+            amount: native_shroom_to_create,
+            msg: to_json_binary(&"{}").unwrap(),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+
     // Now admin has native shroom and can fund the DEX.
     let bank = Bank::new(&app);
     bank.send(
@@ -719,8 +800,9 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             }],
         },
         &admin,
-    ).unwrap();
-    
+    )
+    .unwrap();
+
     ConversionTestSetup {
         env: TestEnv {
             app,

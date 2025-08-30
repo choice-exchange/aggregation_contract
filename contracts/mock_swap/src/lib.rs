@@ -104,7 +104,9 @@ pub fn execute(
     let mut recipient = info.sender.to_string();
 
     let (offer_amount, offer_info) = match msg {
-        ExecuteMsg::Swap { offer_asset, to, .. } => {
+        ExecuteMsg::Swap {
+            offer_asset, to, ..
+        } => {
             if let Some(to_addr) = to {
                 recipient = to_addr;
             }
@@ -116,7 +118,11 @@ pub fn execute(
                 denom: info.funds[0].denom.clone(),
             },
         ),
-        ExecuteMsg::Receive(Cw20ReceiveMsg { sender, amount, msg }) => {
+        ExecuteMsg::Receive(Cw20ReceiveMsg {
+            sender,
+            amount,
+            msg,
+        }) => {
             if let Ok(hook) = from_json::<MockSwapHookMsg>(&msg) {
                 recipient = hook.swap.to.unwrap_or(sender);
             } else {

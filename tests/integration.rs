@@ -2,7 +2,7 @@
 
 use cosmwasm_std::{Coin};
 use dex_aggregator::msg::{
-    external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp, Split, Stage,
+    cw20_adapter, external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp, Split, Stage
 };
 use injective_test_tube::{
     injective_std::types::cosmos::{bank::v1beta1::MsgSend, base::v1beta1::Coin as ProtoCoin},
@@ -76,27 +76,14 @@ fn setup() -> TestEnv {
         .unwrap()
         .data
         .code_id;
-    let _cw20_adapter_code_id = wasm
+    let cw20_adapter_code_id = wasm
         .store_code(&get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
         .unwrap()
         .data
         .code_id;
 
-    // Instantiate aggregator
-    let _aggregator_addr = wasm
-        .instantiate(
-            aggregator_code_id,
-            &InstantiateMsg {
-                admin: admin.address(),
-            },
-            Some(&admin.address()),
-            Some("dex-aggregator"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
+    let adapter_addr = wasm.instantiate(cw20_adapter_code_id, &cw20_adapter::InstantiateMsg {}, Some(&admin.address()), Some("cw20-adapter"), &[], &admin).unwrap().data.address;
+
 
     // Instantiate mock contracts
     let aggregator_addr = wasm
@@ -104,6 +91,7 @@ fn setup() -> TestEnv {
             aggregator_code_id,
             &InstantiateMsg {
                 admin: admin.address(),
+                cw20_adapter_address: adapter_addr
             },
             Some(&admin.address()),
             Some("dex-aggregator"),
@@ -201,7 +189,9 @@ fn test_aggregate_swap_success() {
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        min_output: "320000000000000000000".to_string(), // 320 USDT
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
                     }),
                 },
                 Split {
@@ -211,7 +201,9 @@ fn test_aggregate_swap_success() {
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        min_output: "830000000000000000000".to_string(), // 830 USDT
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
                     }),
                 },
                 Split {
@@ -220,6 +212,9 @@ fn test_aggregate_swap_success() {
                         swap_contract: env.mock_ob_inj_usdt_addr.clone(),
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
+                        },
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
                         },
                         min_output: "740000000000000000000".to_string(), // 740 USDT
                     }),
@@ -279,6 +274,9 @@ fn test_multi_stage_aggregate_swap_success() {
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
                         min_output: "99000000000000000000000".to_string(), // 99,000 INJ
                     }),
                 }],
@@ -293,7 +291,9 @@ fn test_multi_stage_aggregate_swap_success() {
                             ask_asset_info: external::AssetInfo::NativeToken {
                                 denom: "usdt".to_string(),
                             },
-                            min_output: "480000000000000000000000".to_string(), // 480,000 USDT
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
                         }),
                     },
                     Split {
@@ -303,7 +303,9 @@ fn test_multi_stage_aggregate_swap_success() {
                             ask_asset_info: external::AssetInfo::NativeToken {
                                 denom: "usdt".to_string(),
                             },
-                            min_output: "1010000000000000000000000".to_string(), // 1,010,000 USDT
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
                         }),
                     },
                 ],

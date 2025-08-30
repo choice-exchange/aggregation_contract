@@ -22,7 +22,13 @@ pub fn instantiate(
     cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     let admin_addr = deps.api.addr_validate(&msg.admin)?;
-    let config = Config { admin: admin_addr };
+    let adapter_addr = deps.api.addr_validate(&msg.cw20_adapter_address)?;
+    
+    // Save the full config
+    let config = Config { 
+        admin: admin_addr,
+        cw20_adapter_address: adapter_addr,
+    };
     CONFIG.save(deps.storage, &config)?;
 
     Ok(Response::new().add_attribute("method", "instantiate"))

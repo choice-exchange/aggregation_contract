@@ -12,23 +12,11 @@ pub enum ContractError {
     #[error("Minimum receive amount not met")]
     MinimumReceiveNotMet {},
 
-    #[error("Invalid Cw20 Hook message")]
-    InvalidCw20HookMsg {},
-
     #[error("Route cannot be empty")]
     EmptyRoute {},
 
-    #[error("Invalid reply ID: {id}")]
-    InvalidReplyId { id: u64 },
-
-    #[error("Unrecognized reply ID")]
-    UnrecognizedReplyId {},
-
     #[error("Execution state not found for sender")]
     ExecutionStateNotFound {},
-
-    #[error("The provided funds do not match the first step of the route")]
-    MismatchedInitialFunds {},
 
     #[error("Input amount must be greater than zero")]
     ZeroAmount {},
@@ -39,8 +27,17 @@ pub enum ContractError {
     #[error("No stages provided for the swap")]
     NoStages {},
 
-    #[error("Failed to parse reply from submessage")]
-    ReplyParseError {},
+    #[error("Failed to parse submessage reply result: {error}")]
+    SubmessageResultError { error: String },
+
+    #[error("Failed to parse reply: wasm event did not contain a return amount attribute")]
+    NoAmountInReply {},
+
+    #[error("Failed to parse reply: amount attribute has a malformed value '{value}'")]
+    MalformedAmountInReply { value: String },
+
+    #[error("Failed to parse conversion reply: could not find a valid 'transfer' or 'wasm' event")]
+    NoConversionEventInReply {},
 
     #[error("AggregateSwaps requires exactly one type of coin to be sent")]
     InvalidFunds {},

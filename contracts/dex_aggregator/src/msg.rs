@@ -5,6 +5,46 @@ use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
 use cw20::Cw20ReceiveMsg;
 use injective_math::FPDecimal;
 
+pub mod cw20_adapter {
+    use cosmwasm_std::Binary;
+
+    use super::*;
+
+    #[cw_serde]
+    pub struct InstantiateMsg {}
+
+    #[cw_serde]
+    pub struct ReceiveSubmsg {
+        pub(crate) recipient: String,
+    }
+
+    #[cw_serde]
+    pub enum ExecuteMsg {
+        /// Registers a new CW-20 contract that will be handled by the adapter
+        RegisterCw20Contract { addr: Addr },
+        ///  Impl of Receiver CW-20 interface. Should be called by CW-20 contract only!! (never directly). Msg is ignored
+        Receive {
+            sender: String,
+            amount: Uint128,
+            msg: Binary,
+        },
+        /// Called to redeem TF tokens. Will send CW-20 tokens to "recipient" address (or sender if not provided). Will use transfer method
+        RedeemAndTransfer { recipient: Option<String> },
+        /// Called to redeem TF tokens. Will call Send method of CW:20 to send CW-20 tokens to "recipient" address. Submessage will be passed to send method (can be empty)
+        RedeemAndSend { recipient: String, submsg: Binary },
+        /// Updates stored metadata
+        UpdateMetadata { addr: Addr },
+    }
+
+    #[cw_serde]
+    pub enum QueryMsg {
+        /// Return a list of registered CW-20 contracts
+        RegisteredContracts {},
+        /// Returns a fee required to register a new token-factory denom
+        NewDenomFee {},
+    }
+}
+
 pub mod external {
 
     use super::*;
@@ -89,15 +129,15 @@ pub mod orderbook {
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
+    pub offer_asset_info: external::AssetInfo,
     pub ask_asset_info: external::AssetInfo,
-    pub min_output: String,
 }
 
 #[cw_serde]
 pub struct OrderbookSwapOp {
     pub swap_contract: String,
+    pub offer_asset_info: external::AssetInfo,
     pub ask_asset_info: external::AssetInfo,
-    pub min_output: String,
 }
 
 #[cw_serde]
@@ -117,7 +157,6 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
-// --- Message embedded in Cw20ReceiveMsg ---
 #[cw_serde]
 pub enum Cw20HookMsg {
     AggregateSwaps {
@@ -129,6 +168,7 @@ pub enum Cw20HookMsg {
 #[cw_serde]
 pub struct InstantiateMsg {
     pub admin: String,
+    pub cw20_adapter_address: String,
 }
 
 #[cw_serde]
@@ -160,8 +200,6 @@ pub enum QueryMsg {
 pub struct SimulateRouteResponse {
     pub output_amount: Uint128,
 }
-
-// --- NEW DESCRIPTIVE DATA STRUCTURES ---
 
 #[cw_serde]
 pub enum AssetType {

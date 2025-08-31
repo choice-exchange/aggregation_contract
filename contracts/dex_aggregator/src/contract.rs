@@ -1,5 +1,5 @@
 use cosmwasm_std::{
-    entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdResult,
+    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdResult,
 };
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
@@ -22,7 +22,13 @@ pub fn instantiate(
     cw2::set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
 
     let admin_addr = deps.api.addr_validate(&msg.admin)?;
-    let config = Config { admin: admin_addr };
+    let adapter_addr = deps.api.addr_validate(&msg.cw20_adapter_address)?;
+
+    // Save the full config
+    let config = Config {
+        admin: admin_addr,
+        cw20_adapter_address: adapter_addr,
+    };
     CONFIG.save(deps.storage, &config)?;
 
     Ok(Response::new().add_attribute("method", "instantiate"))
@@ -65,31 +71,40 @@ pub fn execute(
             amount,
             msg,
         }) => {
-            // This is the entry point for CW20 token swaps
-            let hook_msg: Cw20HookMsg = cosmwasm_std::from_json(&msg)?;
-            match hook_msg {
-                Cw20HookMsg::AggregateSwaps {
-                    stages,
-                    minimum_receive,
-                } => {
-                    let offer_asset = external::Asset {
-                        info: external::AssetInfo::Token {
-                            contract_addr: info.sender.to_string(),
-                        },
-                        amount,
-                    };
-                    // The "sender" of the swap is the one who initiated the Cw20 send.
-                    let initiator = deps.api.addr_validate(&sender)?;
-                    execute::execute_aggregate_swaps_internal(
-                        deps,
-                        env,
-                        info,
+            if let Ok(hook_msg) = cosmwasm_std::from_json::<Cw20HookMsg>(&msg) {
+                // This is a user-initiated swap starting with a CW20 token.
+                match hook_msg {
+                    Cw20HookMsg::AggregateSwaps {
                         stages,
                         minimum_receive,
-                        offer_asset,
-                        initiator,
-                    )
+                    } => {
+                        let offer_asset = external::Asset {
+                            info: external::AssetInfo::Token {
+                                contract_addr: info.sender.to_string(),
+                            },
+                            amount,
+                        };
+                        let initiator = deps.api.addr_validate(&sender)?;
+                        execute::execute_aggregate_swaps_internal(
+                            deps,
+                            env,
+                            info,
+                            stages,
+                            minimum_receive,
+                            offer_asset,
+                            initiator,
+                        )
+                    }
                 }
+            } else {
+                Ok(Response::new()
+                    .add_event(
+                        Event::new("wasm")
+                            .add_attribute("action", "internal_conversion_complete")
+                            .add_attribute("recipient", env.contract.address.to_string())
+                            .add_attribute("amount", amount.to_string()),
+                    )
+                    .add_attribute("info", "cw20_received_for_normalization"))
             }
         }
         ExecuteMsg::ExecuteRoute {

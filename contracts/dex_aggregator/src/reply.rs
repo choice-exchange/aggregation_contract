@@ -289,6 +289,7 @@ fn execute_next_swap_stage(
             .ready_for_next_stage_amount
             .multiply_ratio(split.percent as u128, 100u128);
         let msg = create_swap_cosmos_msg(
+            &deps,
             &split.operation,
             &offer_asset_info,
             amount_for_split,

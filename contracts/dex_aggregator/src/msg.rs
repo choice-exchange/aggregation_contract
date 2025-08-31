@@ -138,7 +138,6 @@ pub struct OrderbookSwapOp {
     pub swap_contract: String,
     pub offer_asset_info: external::AssetInfo,
     pub ask_asset_info: external::AssetInfo,
-    pub min_output: String,
 }
 
 #[cw_serde]
@@ -158,7 +157,6 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
-// --- Message embedded in Cw20ReceiveMsg ---
 #[cw_serde]
 pub enum Cw20HookMsg {
     AggregateSwaps {
@@ -202,8 +200,6 @@ pub enum QueryMsg {
 pub struct SimulateRouteResponse {
     pub output_amount: Uint128,
 }
-
-// --- NEW DESCRIPTIVE DATA STRUCTURES ---
 
 #[cw_serde]
 pub enum AssetType {

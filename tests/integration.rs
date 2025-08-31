@@ -315,7 +315,6 @@ fn test_aggregate_swap_success() {
                         offer_asset_info: external::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        min_output: "740000000".to_string(), // 740 USDT
                     }),
                 },
             ],
@@ -402,7 +401,6 @@ fn test_multi_stage_aggregate_swap_success() {
                         offer_asset_info: external::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        min_output: "99000000000000000000000".to_string(), // 99,000 INJ
                     }),
                 }],
             },
@@ -936,7 +934,6 @@ fn test_full_normalization_route() {
                             ask_asset_info: external::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
-                            min_output: "490000000".to_string(),
                         }),
                     },
                     Split {
@@ -1022,7 +1019,6 @@ fn test_multi_stage_with_final_normalization() {
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        min_output: "99000000000000000000".to_string(), // 99 INJ
                     }),
                 }],
             },
@@ -1051,7 +1047,6 @@ fn test_multi_stage_with_final_normalization() {
                             ask_asset_info: external::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
-                            min_output: "8900000000".to_string(), // 8,900 Native SHROOM
                         }),
                     },
                 ],
@@ -1232,7 +1227,6 @@ fn test_reverse_normalization_route() {
                         ask_asset_info: external::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        min_output: "495000000".to_string(), // Min 495 USDT
                     }),
                 }],
             },
@@ -1332,7 +1326,6 @@ fn test_failure_if_minimum_receive_not_met() {
                         offer_asset_info: external::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        min_output: "0".to_string(), // Set to 0 for this test
                     }),
                 },
             ],

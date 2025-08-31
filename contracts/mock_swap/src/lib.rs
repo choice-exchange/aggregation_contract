@@ -1,5 +1,3 @@
-// In mock_swap.rs / lib.rs
-
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
     entry_point, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps,
@@ -7,6 +5,8 @@ use cosmwasm_std::{
 };
 use cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cw_storage_plus::Item;
+use injective_cosmwasm::InjectiveQueryWrapper;
+use injective_math::FPDecimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -22,6 +22,19 @@ pub enum AssetInfo {
 pub struct Asset {
     pub info: AssetInfo,
     pub amount: Uint128,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct SwapEstimationResult {
+    pub result_quantity: FPDecimal,
+    // For a mock, we can return a dummy fee estimate
+    pub expected_fees: Vec<FPCoin>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct FPCoin {
+    pub amount: FPDecimal,
+    pub denom: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
@@ -77,7 +90,13 @@ pub struct MockSwapHookSwapField {
 }
 
 #[cw_serde]
-pub enum QueryMsg {}
+pub enum QueryMsg {
+    GetOutputQuantity {
+        from_quantity: FPDecimal,
+        source_denom: String,
+        target_denom: String,
+    },
+}
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
 const DECIMAL_PRECISION: u32 = 18;
@@ -202,7 +221,52 @@ fn get_denom_and_addr(asset_info: &AssetInfo) -> (String, String) {
     }
 }
 
-#[entry_point]
-pub fn query(_deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
-    match msg {}
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn query(
+    deps: Deps<InjectiveQueryWrapper>,
+    _env: Env,
+    msg: QueryMsg,
+) -> Result<Binary, StdError> {
+    match msg {
+        QueryMsg::GetOutputQuantity {
+            from_quantity,
+            source_denom,
+            target_denom,
+        } => {
+            let config = CONFIG.load(deps.storage)?;
+
+            // 1. Validation: Ensure the query matches the contract's configured trading pair.
+            let config_source_denom = match config.input_asset_info {
+                AssetInfo::NativeToken { denom } => denom,
+                AssetInfo::Token { contract_addr } => contract_addr,
+            };
+            let config_target_denom = match config.output_asset_info {
+                AssetInfo::NativeToken { denom } => denom,
+                AssetInfo::Token { contract_addr } => contract_addr,
+            };
+
+            if source_denom != config_source_denom || target_denom != config_target_denom {
+                return Err(StdError::generic_err(format!(
+                    "Invalid trading pair for this mock contract. Expected {} -> {}, got {} -> {}",
+                    config_source_denom, config_target_denom, source_denom, target_denom
+                )));
+            }
+
+            // 2. The Core Mock Logic: Perform the simple rate calculation.
+            let rate = FPDecimal::from_str(&config.rate)?;
+            let result_quantity = from_quantity * rate;
+
+            // 3. Construct the response object that the aggregator expects.
+            let response = SwapEstimationResult {
+                result_quantity,
+                // For a mock, we can return an empty or zero fee.
+                expected_fees: vec![FPCoin {
+                    amount: FPDecimal::ZERO,
+                    denom: target_denom, // The fee is in the output currency
+                }],
+            };
+
+            to_json_binary(&response)
+        }
+    }
 }

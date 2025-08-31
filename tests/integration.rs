@@ -1148,11 +1148,11 @@ fn test_cw20_entry_point_swap_success() {
     let res = wasm.execute(
         &setup.shroom_cw20_addr,
         &cw20::Cw20ExecuteMsg::Send {
-            contract: setup.env.aggregator_addr.clone(), 
+            contract: setup.env.aggregator_addr.clone(),
             amount: initial_shroom_amount,
             msg: to_json_binary(&hook_msg).unwrap(),
         },
-        &[], 
+        &[],
         user,
     );
 
@@ -1181,7 +1181,7 @@ fn test_cw20_entry_point_swap_success() {
         )
         .unwrap();
 
-    let expected_sai_balance = Uint128::new(100_000_000u128); 
+    let expected_sai_balance = Uint128::new(100_000_000u128);
     assert_eq!(final_sai_balance.balance, expected_sai_balance);
 }
 
@@ -1344,7 +1344,10 @@ fn test_failure_if_minimum_receive_not_met() {
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
     let res = wasm.execute(&env.aggregator_addr, &msg, &[funds_to_send.clone()], user);
 
-    assert!(res.is_err(), "Transaction should have failed due to not meeting minimum receive, but it succeeded");
+    assert!(
+        res.is_err(),
+        "Transaction should have failed due to not meeting minimum receive, but it succeeded"
+    );
 
     let error = res.unwrap_err();
     assert!(
@@ -1366,5 +1369,91 @@ fn test_failure_if_minimum_receive_not_met() {
     assert_eq!(
         initial_inj_amount, final_inj_amount,
         "User's INJ balance changed despite the transaction failing"
+    );
+}
+
+#[test]
+fn test_failure_on_invalid_percentage_sum() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let user = &env.user;
+    let bank = Bank::new(&env.app);
+
+    let initial_inj_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_inj_amount = Uint128::from_str(&initial_inj_balance.amount).unwrap();
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 50, // 50%
+                    operation: Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_1_addr.clone(),
+                        ask_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    }),
+                },
+                Split {
+                    percent: 49, // + 49% = 99% (Invalid!)
+                    operation: Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_2_addr.clone(),
+                        ask_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    }),
+                },
+            ],
+        }],
+        minimum_receive: None,
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        user,
+    );
+
+    assert!(
+        res.is_err(),
+        "Transaction should have failed due to invalid percentage sum, but it succeeded"
+    );
+
+    let error = res.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Percentages in a stage must sum to 100"),
+        "Error message was not the expected 'InvalidPercentageSum'. Got: {}",
+        error
+    );
+
+    let final_inj_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let final_inj_amount = Uint128::from_str(&final_inj_balance.amount).unwrap();
+
+    assert_eq!(
+        initial_inj_amount, final_inj_amount,
+        "User's INJ balance changed despite the transaction failing due to invalid input"
     );
 }

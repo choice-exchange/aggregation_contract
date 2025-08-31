@@ -292,10 +292,7 @@ fn execute_next_swap_stage(
             &split.operation,
             &offer_asset_info,
             amount_for_split,
-            &state.sender,
             &env,
-            &state.stages,
-            next_stage_idx,
         )?;
         submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
@@ -421,7 +418,7 @@ fn parse_amount_from_conversion_reply(msg: &Reply, env: &Env) -> Result<Uint128,
             .ok_or(ContractError::NoAmountInReply {})?;
 
         let numeric_part =
-            if let Some(first_non_digit) = amount_attr.value.find(|c: char| !c.is_digit(10)) {
+            if let Some(first_non_digit) = amount_attr.value.find(|c: char| !c.is_ascii_digit()) {
                 &amount_attr.value[..first_non_digit]
             } else {
                 &amount_attr.value

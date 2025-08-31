@@ -83,10 +83,7 @@ pub fn execute_aggregate_swaps_internal(
             &split.operation,
             &offer_asset.info,
             split_amount,
-            &initiator,
             &env,
-            &stages,
-            0,
         )?;
         submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
@@ -102,18 +99,9 @@ pub fn create_swap_cosmos_msg(
     operation: &Operation,
     offer_asset_info: &external::AssetInfo,
     amount: Uint128,
-    initiator: &Addr,
     env: &Env,
-    stages: &[Stage],
-    current_stage_index: usize,
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
-    let is_last_stage = current_stage_index == stages.len() - 1;
-
-    let recipient = if is_last_stage {
-        initiator.to_string()
-    } else {
-        env.contract.address.to_string()
-    };
+    let recipient = env.contract.address.to_string();
 
     let cosmos_msg = match operation {
         Operation::AmmSwap(amm_op) => {

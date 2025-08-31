@@ -420,14 +420,18 @@ fn parse_amount_from_conversion_reply(msg: &Reply, env: &Env) -> Result<Uint128,
             .find(|a| a.key == "amount")
             .ok_or(ContractError::NoAmountInReply {})?;
 
-        let amount_val = amount_attr
-            .value
-            .trim_end_matches(|c: char| !c.is_ascii_digit());
-        return amount_val
-            .parse::<Uint128>()
-            .map_err(|_| ContractError::MalformedAmountInReply {
+        let numeric_part =
+            if let Some(first_non_digit) = amount_attr.value.find(|c: char| !c.is_digit(10)) {
+                &amount_attr.value[..first_non_digit]
+            } else {
+                &amount_attr.value
+            };
+
+        return numeric_part.parse::<Uint128>().map_err(|_| {
+            ContractError::MalformedAmountInReply {
                 value: amount_attr.value.clone(),
-            });
+            }
+        });
     }
 
     if let Some(wasm_event) = events.iter().find(|e| {

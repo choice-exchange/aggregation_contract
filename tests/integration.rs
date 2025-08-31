@@ -6,8 +6,8 @@ use cosmwasm_std::{to_json_binary, Addr, Coin, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    cw20_adapter, external, AmmSwapOp, ExecuteMsg, InstantiateMsg, Operation, OrderbookSwapOp,
-    Split, Stage,
+    cw20_adapter, external, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
+    OrderbookSwapOp, Split, Stage,
 };
 use injective_test_tube::{
     injective_std::types::cosmos::{
@@ -513,17 +513,21 @@ pub struct ConversionTestSetup {
     pub mock_inj_to_cw20_shroom_amm: String,
     pub mock_cw20_shroom_to_cw20_sai_amm: String,
     pub mock_usdt_to_inj_ob: String,
+    pub mock_native_shroom_to_usdt_ob: String,
 }
 
 fn setup_for_conversion_test() -> ConversionTestSetup {
     let app = InjectiveTestApp::new();
     let admin = app
-        .init_account(&[Coin::new(1_000_000_000_000_000_000_000_000u128, "inj")])
+        .init_account(&[
+            Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+            Coin::new(1_000_000_000_000u128, "usdt"),
+        ])
         .unwrap();
     let user = app
         .init_account(&[
-            Coin::new(100_000_000_000_000_000_000u128, "inj"), // 100 INJ
-            Coin::new(1_000_000_000_000u128, "usdt"), // 1,000,000 USDT (assuming 6 decimals)
+            Coin::new(100_000_000_000_000_000_000u128, "inj"),
+            Coin::new(1_000_000_000_000u128, "usdt"),
         ])
         .unwrap();
     let wasm = Wasm::new(&app);
@@ -756,6 +760,32 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
+    let mock_native_shroom_to_usdt_ob = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: native_shroom_denom.clone(), // ACCEPTS NATIVE SHROOM
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(), // PAYS OUT USDT
+                    },
+                    rate: "0.5".to_string(), // Rate: 1 SHROOM = 0.5 USDT
+                    protocol_type: ProtocolType::Orderbook,
+                    input_decimals: 6,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("ob-native-shroom-usdt"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
     wasm.execute(
         &shroom_cw20_addr,
         &cw20_base::msg::ExecuteMsg::Mint {
@@ -844,6 +874,19 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: mock_native_shroom_to_usdt_ob.clone(),
+            amount: vec![ProtoCoin {
+                denom: "usdt".to_string(),
+                amount: "10000000000".to_string(), // 10,000 USDT
+            }],
+        },
+        &admin,
+    )
+    .unwrap();
+
     ConversionTestSetup {
         env: TestEnv {
             app,
@@ -862,6 +905,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         mock_inj_to_cw20_shroom_amm,
         mock_cw20_shroom_to_cw20_sai_amm,
         mock_usdt_to_inj_ob,
+        mock_native_shroom_to_usdt_ob,
     }
 }
 
@@ -1057,4 +1101,213 @@ fn test_multi_stage_with_final_normalization() {
     // Expected final amount: 10,000 SHROOM (with 6 decimals)
     let expected_final_balance = Uint128::new(10_000_000_000u128);
     assert_eq!(balance.balance, expected_final_balance);
+}
+
+#[test]
+fn test_cw20_entry_point_swap_success() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let admin = &setup.env.admin;
+
+    // --- Test Setup ---
+    // 1. Mint some SHROOM tokens directly to the user so they can initiate the swap.
+    let initial_shroom_amount = Uint128::new(1_000_000_000u128); // 1,000 SHROOM
+    wasm.execute(
+        &setup.shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: user.address(),
+            amount: initial_shroom_amount,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // 2. Verify user's initial balances (optional but good practice)
+    let initial_shroom_balance: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    assert_eq!(initial_shroom_balance.balance, initial_shroom_amount);
+
+    let initial_sai_balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    assert_eq!(initial_sai_balance.balance, Uint128::zero());
+
+    // --- Define the Swap ---
+    // The user wants to swap 1,000 SHROOM for SAI.
+    // The mock AMM rate is 0.1, so they expect 100 SAI in return.
+
+    // This is the message that the aggregator will process.
+    let hook_msg = Cw20HookMsg::AggregateSwaps {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
+                    offer_asset_info: external::AssetInfo::Token {
+                        contract_addr: setup.shroom_cw20_addr.clone(),
+                    },
+                    ask_asset_info: external::AssetInfo::Token {
+                        contract_addr: setup.sai_cw20_addr.clone(),
+                    },
+                }),
+            }],
+        }],
+        minimum_receive: Some("99000000".to_string()), // Min 99 SAI
+    };
+
+    // --- Execute the Swap via CW20 Send ---
+    // The user calls `Send` on the SHROOM token contract. The aggregator contract's
+    // `Receive` function will be triggered by this message.
+    let res = wasm.execute(
+        &setup.shroom_cw20_addr, // The user interacts with the CW20 token contract
+        &cw20::Cw20ExecuteMsg::Send {
+            contract: setup.env.aggregator_addr.clone(), // The recipient is the aggregator
+            amount: initial_shroom_amount,
+            msg: to_json_binary(&hook_msg).unwrap(), // The hook message contains the swap instructions
+        },
+        &[], // No native funds are sent
+        user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "CW20 entry point execution failed: {:?}",
+        res.unwrap_err()
+    );
+
+    // --- Assert Final Balances ---
+    // 1. User's SHROOM balance should now be 0.
+    let final_shroom_balance: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    assert_eq!(final_shroom_balance.balance, Uint128::zero());
+
+    // 2. User's SAI balance should be 100 SAI.
+    let final_sai_balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+
+    let expected_sai_balance = Uint128::new(100_000_000u128); // 100 SAI with 6 decimals
+    assert_eq!(final_sai_balance.balance, expected_sai_balance);
+}
+
+#[test]
+fn test_reverse_normalization_route() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let bank = Bank::new(&setup.env.app);
+
+    // --- THE ROUTE ---
+    // Stage 1: 10 INJ -> AMM @ 100.0 = 1,000 CW20 SHROOM
+    //   - After this, the aggregator holds 1,000 CW20 SHROOM.
+    // Stage 2: 1,000 Native SHROOM -> OB @ 0.5 = 500 USDT
+    //   - This stage REQUIRES Native SHROOM. The aggregator must automatically convert
+    //     its CW20 SHROOM balance from Stage 1 into Native SHROOM to proceed.
+    // Final Result: The user receives 500 USDT.
+
+    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![
+            // Stage 1: Get CW20 SHROOM
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    operation: Operation::AmmSwap(AmmSwapOp {
+                        pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        ask_asset_info: external::AssetInfo::Token {
+                            contract_addr: setup.shroom_cw20_addr.clone(),
+                        },
+                    }),
+                }],
+            },
+            // Stage 2: Swap Native SHROOM for USDT
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                        swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
+                        // This is the key part of the test: the offer asset is NATIVE
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: native_shroom_denom.clone(),
+                        },
+                        ask_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        min_output: "495000000".to_string(), // Min 495 USDT
+                    }),
+                }],
+            },
+        ],
+        minimum_receive: Some("495000000".to_string()), // Min 495 USDT
+    };
+
+    // --- Get initial user balance for final comparison ---
+    let initial_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_amount = Uint128::from_str(&initial_balance.amount).unwrap();
+
+    // --- Execute the Swap ---
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")], // User sends 10 INJ
+        user,
+    );
+    assert!(
+        res.is_ok(),
+        "Reverse normalization execution failed: {:?}",
+        res.unwrap_err()
+    );
+
+    // --- Assert Final Balance ---
+    // Check the user's final USDT balance.
+    let final_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // Expected final amount: Initial Balance + 500 USDT (with 6 decimals)
+    let swap_output = Uint128::new(500_000_000u128);
+    let expected_final_balance = initial_amount + swap_output;
+
+    let final_balance = final_balance_response.balance.unwrap();
+    let final_amount = Uint128::from_str(&final_balance.amount).unwrap();
+
+    assert_eq!(final_amount, expected_final_balance);
 }

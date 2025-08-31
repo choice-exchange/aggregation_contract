@@ -3,10 +3,9 @@ use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{cw20_adapter, external, Operation, Stage};
 use crate::state::{Awaiting, Config, ReplyState, CONFIG, REPLY_STATES};
 use cosmwasm_std::{
-    to_json_binary, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg, Uint128,
-    WasmMsg,
+    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg,
+    Uint128, WasmMsg,
 };
-use cosmwasm_std::{BankQuery, QueryRequest, WasmQuery};
 use cw20::Cw20ExecuteMsg;
 use cw20::{BalanceResponse as Cw20BalanceResponse, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -20,6 +19,7 @@ pub fn handle_reply(
     match state.awaiting {
         Awaiting::Swaps => handle_swap_reply(deps, env, msg, &mut state),
         Awaiting::Conversions => handle_conversion_reply(deps, env, msg, &mut state),
+        Awaiting::FinalConversions => handle_final_conversion_reply(deps, env, msg, &mut state),
     }
 }
 
@@ -37,8 +37,6 @@ fn handle_swap_reply(
         .into_result()
         .map_err(|e| ContractError::SubmessageResultError { error: e })?
         .events;
-
-    // 1. Get all contract addresses that emitted a wasm event in this transaction.
     let replying_addresses: Vec<&str> = events
         .iter()
         .filter(|e| e.ty.starts_with("wasm"))
@@ -51,29 +49,14 @@ fn handle_swap_reply(
             }
         })
         .collect();
-
-    // 2. Find a split in the current stage whose operation address is in our list of replying addresses.
     let current_stage = &state.stages[state.current_stage_index as usize];
-    let relevant_split = current_stage
-        .splits
-        .iter()
-        .find(|s| {
-            let op_addr = match &s.operation {
-                Operation::AmmSwap(op) => op.pool_address.as_str(),
-                Operation::OrderbookSwap(op) => op.swap_contract.as_str(),
-            };
-            replying_addresses.contains(&op_addr)
-        })
-        .ok_or_else(|| {
-            StdError::generic_err(format!(
-                "Could not find a split matching any replying contract. Contracts that replied: {:?}",
-                replying_addresses
-            ))
-        })?;
+    let relevant_split = current_stage.splits.iter().find(|s| {
+        let op_addr = match &s.operation { Operation::AmmSwap(op) => op.pool_address.as_str(), Operation::OrderbookSwap(op) => op.swap_contract.as_str() };
+        replying_addresses.contains(&op_addr)
+    }).ok_or_else(|| StdError::generic_err(format!("Could not find a split matching any replying contract. Contracts that replied: {:?}", replying_addresses)))?;
 
     let asset_info = get_operation_output(&relevant_split.operation)?;
     let amount = parse_amount_from_swap_reply(&msg)?;
-
     state.accumulated_assets.push(external::Asset {
         info: asset_info,
         amount,
@@ -86,9 +69,11 @@ fn handle_swap_reply(
     }
 
     if state.current_stage_index as usize >= state.stages.len() - 1 {
+        // This is the final stage, hand off to the dedicated final stage handler.
         return handle_final_stage(deps, env, msg.id, state);
     }
 
+    // This is an intermediate stage, check for normalization.
     let config = CONFIG.load(deps.storage)?;
     let target_input_asset = get_next_stage_input_asset(&state.stages, state.current_stage_index)?;
     let mut conversion_submsgs = vec![];
@@ -107,8 +92,7 @@ fn handle_swap_reply(
 
     if conversion_submsgs.is_empty() {
         state.current_stage_index += 1;
-        let offer_asset_info = get_operation_output(&current_stage.splits[0].operation)?;
-        execute_next_swap_stage(deps, env, state, master_reply_id, offer_asset_info)
+        execute_next_swap_stage(deps, env, state, master_reply_id, target_input_asset)
     } else {
         state.awaiting = Awaiting::Conversions;
         state.replies_expected = conversion_submsgs.len() as u64;
@@ -117,6 +101,153 @@ fn handle_swap_reply(
             .add_submessages(conversion_submsgs)
             .add_attribute("action", "normalizing_assets"))
     }
+}
+
+fn query_balance(
+    deps: cosmwasm_std::Deps<InjectiveQueryWrapper>,
+    env: &Env,
+    asset_info: &external::AssetInfo,
+) -> Result<Uint128, ContractError> {
+    match asset_info {
+        external::AssetInfo::NativeToken { denom } => {
+            let balance = deps.querier.query_balance(&env.contract.address, denom)?;
+            Ok(balance.amount)
+        }
+        external::AssetInfo::Token { contract_addr } => {
+            let balance: Cw20BalanceResponse = deps.querier.query_wasm_smart(
+                contract_addr,
+                &Cw20QueryMsg::Balance {
+                    address: env.contract.address.to_string(),
+                },
+            )?;
+            Ok(balance.balance)
+        }
+    }
+}
+
+// A helper to create the final transfer message.
+fn create_send_msg(
+    recipient: &Addr,
+    asset_info: &external::AssetInfo,
+    amount: Uint128,
+) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
+    match asset_info {
+        external::AssetInfo::NativeToken { denom } => {
+            Ok(CosmosMsg::Bank(cosmwasm_std::BankMsg::Send {
+                to_address: recipient.to_string(),
+                amount: vec![Coin {
+                    denom: denom.clone(),
+                    amount,
+                }],
+            }))
+        }
+        external::AssetInfo::Token { contract_addr } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: contract_addr.clone(),
+            msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                recipient: recipient.to_string(),
+                amount,
+            })?,
+            funds: vec![],
+        })),
+    }
+}
+
+fn handle_final_stage(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    reply_id: u64,
+    state: &mut ReplyState,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let target_asset_info = state
+        .accumulated_assets
+        .iter()
+        .find(|a| matches!(a.info, external::AssetInfo::Token { .. }))
+        .map(|a| a.info.clone())
+        .unwrap_or_else(|| state.accumulated_assets.first().unwrap().info.clone());
+
+    let mut conversion_submsgs = vec![];
+    let mut ready_amount = Uint128::zero();
+    let config = CONFIG.load(deps.storage)?;
+    for asset in &state.accumulated_assets {
+        if asset.info == target_asset_info {
+            ready_amount += asset.amount;
+        } else {
+            conversion_submsgs.push(SubMsg::reply_on_success(
+                create_conversion_msg(asset, &config, &env)?,
+                reply_id,
+            ));
+        }
+    }
+
+    if conversion_submsgs.is_empty() {
+        // SCENARIO A: No conversion needed.
+        let total_from_events: Uint128 = state.accumulated_assets.iter().map(|a| a.amount).sum();
+        if total_from_events < state.minimum_receive {
+            return Err(ContractError::MinimumReceiveNotMet {});
+        }
+
+        let forwardable_balance = query_balance(deps.as_ref(), &env, &target_asset_info)?;
+        let mut response = Response::new();
+        if !forwardable_balance.is_zero() {
+            let send_msg = create_send_msg(&state.sender, &target_asset_info, forwardable_balance)?;
+            response = response.add_message(send_msg);
+        }
+
+        REPLY_STATES.remove(deps.storage, reply_id);
+        Ok(response
+            .add_attribute("action", "aggregate_swap_complete")
+            .add_attribute("final_received", total_from_events.to_string())
+            .add_attribute("final_asset_type", format!("{:?}", target_asset_info)))
+    } else {
+        // SCENARIO B: Conversion is needed.
+        state.awaiting = Awaiting::FinalConversions;
+        state.replies_expected = conversion_submsgs.len() as u64;
+        state.ready_for_next_stage_amount = ready_amount;
+        state.accumulated_assets = vec![external::Asset {
+            info: target_asset_info,
+            amount: Uint128::zero(),
+        }];
+        REPLY_STATES.save(deps.storage, reply_id, state)?;
+        Ok(Response::new()
+            .add_submessages(conversion_submsgs)
+            .add_attribute("action", "final_asset_normalization_started"))
+    }
+}
+
+fn handle_final_conversion_reply(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    msg: Reply,
+    state: &mut ReplyState,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let reply_id = msg.id;
+    state.ready_for_next_stage_amount += parse_amount_from_conversion_reply(&msg, &env)?;
+    state.replies_expected -= 1;
+
+    if state.replies_expected > 0 {
+        REPLY_STATES.save(deps.storage, reply_id, state)?;
+        return Ok(Response::new().add_attribute("action", "accumulating_final_conversions"));
+    }
+
+    let total_final_amount = state.ready_for_next_stage_amount;
+    let final_asset_info = state.accumulated_assets.first().unwrap().info.clone();
+
+    if total_final_amount < state.minimum_receive {
+        return Err(ContractError::MinimumReceiveNotMet {});
+    }
+
+    let forwardable_balance = query_balance(deps.as_ref(), &env, &final_asset_info)?;
+    let mut response = Response::new();
+    if !forwardable_balance.is_zero() {
+        let send_msg = create_send_msg(&state.sender, &final_asset_info, forwardable_balance)?;
+        response = response.add_message(send_msg);
+    }
+
+    REPLY_STATES.remove(deps.storage, reply_id);
+    Ok(response
+        .add_attribute("action", "aggregate_swap_complete")
+        .add_attribute("final_received", total_final_amount.to_string())
+        .add_attribute("final_asset_type", format!("{:?}", final_asset_info)))
 }
 
 fn handle_conversion_reply(
@@ -138,88 +269,6 @@ fn handle_conversion_reply(
     let offer_asset_info =
         get_next_stage_input_asset(&state.stages, state.current_stage_index - 1)?;
     execute_next_swap_stage(deps, env, state, master_reply_id, offer_asset_info)
-}
-
-fn handle_final_stage(
-    deps: DepsMut<InjectiveQueryWrapper>,
-    env: Env,
-    reply_id: u64,
-    state: &mut ReplyState,
-) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let mut response = Response::new();
-
-    // 1. Calculate the TOTAL output from all splits by summing the event logs.
-    // This represents the overall success of the transaction.
-    let mut total_final_amount = Uint128::zero();
-    for asset in &state.accumulated_assets {
-        total_final_amount += asset.amount;
-    }
-
-    // 2. Check if this total meets the user's minimum requirement.
-    if total_final_amount < state.minimum_receive {
-        return Err(ContractError::MinimumReceiveNotMet {});
-    }
-
-    // 3. Determine what funds, if any, were sent to THIS aggregator contract.
-    // We do this by querying our own balance of the final asset.
-    let final_asset_info = state
-        .accumulated_assets
-        .first()
-        .map(|a| a.info.clone())
-        .ok_or(ContractError::EmptyRoute {})?;
-
-    let forwardable_balance: Uint128 = match &final_asset_info {
-        external::AssetInfo::NativeToken { denom } => {
-            let balance_query: cosmwasm_std::BalanceResponse =
-                deps.querier
-                    .query(&cosmwasm_std::QueryRequest::Bank(BankQuery::Balance {
-                        address: env.contract.address.to_string(),
-                        denom: denom.clone(),
-                    }))?;
-            balance_query.amount.amount
-        }
-        external::AssetInfo::Token { contract_addr } => {
-            let balance_query: Cw20BalanceResponse =
-                deps.querier.query(&QueryRequest::Wasm(WasmQuery::Smart {
-                    contract_addr: contract_addr.clone(),
-                    msg: to_json_binary(&Cw20QueryMsg::Balance {
-                        address: env.contract.address.to_string(),
-                    })?,
-                }))?;
-            balance_query.balance
-        }
-    };
-
-    // 4. If we are holding a balance, create a single message to forward it to the user.
-    if !forwardable_balance.is_zero() {
-        let send_msg: CosmosMsg<InjectiveMsgWrapper> = match &final_asset_info {
-            external::AssetInfo::NativeToken { denom } => {
-                CosmosMsg::Bank(cosmwasm_std::BankMsg::Send {
-                    to_address: state.sender.to_string(),
-                    amount: vec![Coin {
-                        denom: denom.clone(),
-                        amount: forwardable_balance,
-                    }],
-                })
-            }
-            external::AssetInfo::Token { contract_addr } => CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: contract_addr.clone(),
-                msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
-                    recipient: state.sender.to_string(),
-                    amount: forwardable_balance,
-                })?,
-                funds: vec![],
-            }),
-        };
-        response = response.add_message(send_msg);
-    }
-
-    REPLY_STATES.remove(deps.storage, reply_id);
-
-    Ok(response
-        .add_attribute("action", "aggregate_swap_complete")
-        .add_attribute("final_received", total_final_amount.to_string())
-        .add_attribute("final_asset_type", format!("{:?}", final_asset_info)))
 }
 
 fn execute_next_swap_stage(

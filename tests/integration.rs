@@ -512,6 +512,7 @@ pub struct ConversionTestSetup {
     pub mock_inj_to_native_shroom_ob: String,
     pub mock_inj_to_cw20_shroom_amm: String,
     pub mock_cw20_shroom_to_cw20_sai_amm: String,
+    pub mock_usdt_to_inj_ob: String,
 }
 
 fn setup_for_conversion_test() -> ConversionTestSetup {
@@ -522,6 +523,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     let user = app
         .init_account(&[
             Coin::new(100_000_000_000_000_000_000u128, "inj"), // 100 INJ
+            Coin::new(1_000_000_000_000u128, "usdt"), // 1,000,000 USDT (assuming 6 decimals)
         ])
         .unwrap();
     let wasm = Wasm::new(&app);
@@ -728,6 +730,32 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
+    let mock_usdt_to_inj_ob = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    rate: "0.1".to_string(), // Rate: 1 USDT = 0.1 INJ
+                    protocol_type: ProtocolType::Orderbook,
+                    input_decimals: 6,
+                    output_decimals: 18,
+                },
+            },
+            Some(&admin.address()),
+            Some("ob-usdt-inj"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
     wasm.execute(
         &shroom_cw20_addr,
         &cw20_base::msg::ExecuteMsg::Mint {
@@ -803,6 +831,19 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: mock_usdt_to_inj_ob.clone(),
+            amount: vec![ProtoCoin {
+                denom: "inj".to_string(),
+                amount: "10000000000000000000000".to_string(), // 10,000 INJ
+            }],
+        },
+        &admin,
+    )
+    .unwrap();
+
     ConversionTestSetup {
         env: TestEnv {
             app,
@@ -820,6 +861,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         mock_inj_to_native_shroom_ob,
         mock_inj_to_cw20_shroom_amm,
         mock_cw20_shroom_to_cw20_sai_amm,
+        mock_usdt_to_inj_ob,
     }
 }
 
@@ -894,10 +936,25 @@ fn test_full_normalization_route() {
         user,
     );
     assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+    // let response = res.unwrap();
 
-    // Assert the final outcome
-    // The final SAI tokens are sent directly from the last DEX to the user.
-    // So, we query the user's SAI balance.
+    // println!("\n\n--- ADDRESS LEGEND ---");
+    // println!("User Address:                  {}", user.address());
+    // println!("Aggregator Contract:           {}", setup.env.aggregator_addr);
+    // println!("CW20 Adapter Contract:         {}", setup.adapter_addr);
+    // println!("SHROOM CW20 Token:             {}", setup.shroom_cw20_addr);
+    // println!("SAI CW20 Token:                {}", setup.sai_cw20_addr);
+    // println!("DEX (INJ -> Native SHROOM OB): {}", setup.mock_inj_to_native_shroom_ob);
+    // println!("DEX (INJ -> CW20 SHROOM AMM):  {}", setup.mock_inj_to_cw20_shroom_amm);
+    // println!("DEX (SHROOM -> SAI AMM):       {}", setup.mock_cw20_shroom_to_cw20_sai_amm);
+    // println!("--- END LEGEND ---\n");
+    // // ----------------------------------------------------
+
+    // // Print the transaction logs
+    // println!("--- TRANSACTION EVENTS ---");
+    // println!("{:#?}", response.events);
+    // println!("--- END EVENTS ---\n");
+
     let balance: BalanceResponse = wasm
         .query(
             &setup.sai_cw20_addr,
@@ -907,7 +964,97 @@ fn test_full_normalization_route() {
         )
         .unwrap();
 
-    // 10 INJ * 100 rate = 1000 SHROOM. 1000 SHROOM * 0.1 rate = 100 SAI.
-    // Tokens have 6 decimals.
     assert_eq!(balance.balance, Uint128::new(100_000_000));
+}
+
+#[test]
+fn test_multi_stage_with_final_normalization() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+
+    // THE ROUTE:
+    // Stage 1: 1,000 USDT -> OB @ 0.1 = 100 INJ
+    // Stage 2: 100 INJ is split:
+    //   - 10% (10 INJ) -> AMM @ 100.0 = 1,000 CW20 SHROOM
+    //   - 90% (90 INJ) -> OB  @ 100.0 = 9,000 Native SHROOM
+    // Final Result: The aggregator normalizes the 9,000 Native SHROOM and sends the
+    //               total 10,000 CW20 SHROOM to the user.
+
+    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![
+            // Stage 1: 100% of USDT to the Orderbook to get INJ.
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                        swap_contract: setup.mock_usdt_to_inj_ob.clone(),
+                        offer_asset_info: external::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        ask_asset_info: external::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        min_output: "99000000000000000000".to_string(), // 99 INJ
+                    }),
+                }],
+            },
+            // Stage 2: The resulting INJ is split 10/90 to get a mix of SHROOM types.
+            Stage {
+                splits: vec![
+                    Split {
+                        percent: 10, // 10% to CW20 SHROOM
+                        operation: Operation::AmmSwap(AmmSwapOp {
+                            pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: external::AssetInfo::Token {
+                                contract_addr: setup.shroom_cw20_addr.clone(),
+                            },
+                        }),
+                    },
+                    Split {
+                        percent: 90, // 90% to Native SHROOM
+                        operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                            swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
+                            offer_asset_info: external::AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: external::AssetInfo::NativeToken {
+                                denom: native_shroom_denom.clone(),
+                            },
+                            min_output: "8900000000".to_string(), // 8,900 Native SHROOM
+                        }),
+                    },
+                ],
+            },
+        ],
+        // The final expected output is unified CW20 SHROOM
+        minimum_receive: Some("9900000000".to_string()), // Min 9,900 CW20 SHROOM
+    };
+
+    // The user initiates the swap with 1,000 USDT
+    let initial_funds = Coin::new(1_000_000_000u128, "usdt"); // 1,000 USDT with 6 decimals
+
+    let res = wasm.execute(&setup.env.aggregator_addr, &msg, &[initial_funds], user);
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // Assert the final outcome.
+    // The aggregator should have performed the swaps, normalized the assets, and sent
+    // the final unified CW20 SHROOM to the user.
+    let balance: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+
+    // Expected final amount: 10,000 SHROOM (with 6 decimals)
+    let expected_final_balance = Uint128::new(10_000_000_000u128);
+    assert_eq!(balance.balance, expected_final_balance);
 }

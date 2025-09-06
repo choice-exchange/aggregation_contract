@@ -86,13 +86,13 @@ fn handle_swap_reply(
     if reconciliation.conversions_needed.is_empty() {
         // SCENARIO A: No conversions needed. Proceed directly to the next stage.
         state.current_stage_index += 1;
-        return execute_next_swap_stage(
+        execute_next_swap_stage(
             deps,
             env,
             state,
             master_reply_id,
             reconciliation.assets_ready_to_use,
-        );
+        )
     } else {
         // SCENARIO B: Conversions are required.
         let mut conversion_submsgs = vec![];
@@ -106,9 +106,9 @@ fn handle_swap_reply(
         state.ready_assets_for_next_stage = reconciliation.assets_ready_to_use;
         REPLY_STATES.save(deps.storage, master_reply_id, state)?;
 
-        return Ok(Response::new()
+        Ok(Response::new()
             .add_submessages(conversion_submsgs)
-            .add_attribute("action", "performing_minimal_conversions"));
+            .add_attribute("action", "performing_minimal_conversions"))
     }
 }
 
@@ -707,10 +707,8 @@ fn reconcile_assets(
                 target_info.clone(),
             ));
         }
-    } else {
-        if !native_have.is_zero() {
-            assets_ready_to_use.push((native_info.as_ref().unwrap().clone(), native_have));
-        }
+    } else if !native_have.is_zero() {
+        assets_ready_to_use.push((native_info.as_ref().unwrap().clone(), native_have));
     }
 
     // Reconcile CW20 Tokens
@@ -727,10 +725,8 @@ fn reconcile_assets(
                 target_info.clone(),
             ));
         }
-    } else {
-        if !cw20_have.is_zero() {
-            assets_ready_to_use.push((cw20_info.as_ref().unwrap().clone(), cw20_have));
-        }
+    } else if !cw20_have.is_zero() {
+        assets_ready_to_use.push((cw20_info.as_ref().unwrap().clone(), cw20_have));
     }
 
     Ok(Reconciliation {

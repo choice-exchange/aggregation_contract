@@ -70,6 +70,8 @@ pub fn execute_aggregate_swaps_internal(
         // Initialize accumulators
         accumulated_assets: vec![],
         ready_for_next_stage_amount: Uint128::zero(),
+        ready_assets_for_next_stage: vec![],
+        conversion_target_asset: None,
     };
     REPLY_STATES.save(deps.storage, reply_id, &initial_state)?;
 

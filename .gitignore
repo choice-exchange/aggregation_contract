@@ -1,2 +1,4 @@
 target/
 deploy_testnet.sh
+
+.env

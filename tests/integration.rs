@@ -512,6 +512,7 @@ pub struct ConversionTestSetup {
     pub mock_cw20_shroom_to_cw20_sai_amm: String,
     pub mock_usdt_to_inj_ob: String,
     pub mock_native_shroom_to_usdt_ob: String,
+    pub mock_cw20_shroom_to_usdt_amm: String,
 }
 
 fn setup_for_conversion_test() -> ConversionTestSetup {
@@ -784,6 +785,32 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
+    let mock_cw20_shroom_to_usdt_amm = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::Token {
+                        contract_addr: shroom_cw20_addr.clone(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "0.4".to_string(), // The specific rate for our test
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,  // SHROOM decimals
+                    output_decimals: 6, // USDT decimals
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-cw20-shroom-usdt"), // A clear, new label
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
     wasm.execute(
         &shroom_cw20_addr,
         &cw20_base::msg::ExecuteMsg::Mint {
@@ -885,6 +912,19 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: mock_cw20_shroom_to_usdt_amm.clone(),
+            amount: vec![ProtoCoin {
+                denom: "usdt".to_string(),
+                amount: "10000000000".to_string(), // 10,000 USDT
+            }],
+        },
+        &admin,
+    )
+    .unwrap();
+
     ConversionTestSetup {
         env: TestEnv {
             app,
@@ -904,6 +944,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         mock_cw20_shroom_to_cw20_sai_amm,
         mock_usdt_to_inj_ob,
         mock_native_shroom_to_usdt_ob,
+        mock_cw20_shroom_to_usdt_amm,
     }
 }
 
@@ -1449,4 +1490,114 @@ fn test_failure_on_invalid_percentage_sum() {
         initial_inj_amount, final_inj_amount,
         "User's INJ balance changed despite the transaction failing due to invalid input"
     );
+}
+
+#[test]
+fn test_mixed_input_unified_output_reconciliation() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let bank = Bank::new(&setup.env.app);
+
+    // --- SCENARIO ---
+    // Stage 1: 10 INJ -> 1000 CW20 SHROOM.
+    // Stage 2: Requires a mixed input (600 Native SHROOM, 400 CW20 SHROOM).
+    // Reconciliation: Must convert 600 of the CW20 SHROOM to Native SHROOM.
+    // Final Output: Both splits result in USDT.
+    //  - 600 Native SHROOM @ 0.5 rate -> 300 USDT
+    //  - 400 CW20 SHROOM  @ 0.4 rate -> 160 USDT
+    //  - TOTAL: 460 USDT
+
+    // Asset definitions
+    let cw20_shroom_info = external::AssetInfo::Token {
+        contract_addr: setup.shroom_cw20_addr.clone(),
+    };
+    let native_shroom_info = external::AssetInfo::NativeToken {
+        denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
+    };
+    let usdt_info = external::AssetInfo::NativeToken {
+        denom: "usdt".to_string(),
+    };
+
+    // Stage 1: Get 1000 CW20 SHROOM
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                offer_asset_info: external::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                ask_asset_info: cw20_shroom_info.clone(),
+            }),
+        }],
+    };
+
+    // Stage 2: Requires mixed SHROOM, outputs unified USDT
+    let stage2 = Stage {
+        splits: vec![
+            Split {
+                // 60% requires Native SHROOM
+                percent: 60,
+                operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
+                    offer_asset_info: native_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+            Split {
+                // 40% requires CW20 SHROOM
+                percent: 40,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    // --- USING THE NEW, DEDICATED POOL ---
+                    pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
+                    offer_asset_info: cw20_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+        ],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        minimum_receive: Some("459000000".to_string()), // Min 459 USDT (Target is 460)
+        stages: vec![stage1, stage2],
+    };
+
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        user,
+    );
+
+    // Use the original, simple assert. The error message will now be informative.
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- ASSERT FINAL BALANCE ---
+    let final_usdt_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // Expected Output: 300 USDT + 160 USDT = 460 USDT
+    let total_swap_output = Uint128::new(460_000_000u128);
+    let expected_final_usdt = initial_usdt_amount + total_swap_output;
+
+    let final_usdt_amount =
+        Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
+
+    assert_eq!(final_usdt_amount, expected_final_usdt);
 }

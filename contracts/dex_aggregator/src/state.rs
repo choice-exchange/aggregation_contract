@@ -32,6 +32,12 @@ pub struct ReplyState {
     pub replies_expected: u64,
     pub accumulated_assets: Vec<external::Asset>,
     pub ready_for_next_stage_amount: Uint128,
+
+    pub ready_assets_for_next_stage: Vec<(external::AssetInfo, Uint128)>,
+
+    // Stores the target asset type for the current batch of conversions.
+    // We assume all pending conversions in a single step are to the same target type.
+    pub conversion_target_asset: Option<external::AssetInfo>,
 }
 
 pub const REPLY_STATES: Map<u64, ReplyState> = Map::new("reply_states");

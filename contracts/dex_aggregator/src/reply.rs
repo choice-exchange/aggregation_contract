@@ -69,37 +69,46 @@ fn handle_swap_reply(
     }
 
     if state.current_stage_index as usize >= state.stages.len() - 1 {
-        // This is the final stage, hand off to the dedicated final stage handler.
         return handle_final_stage(deps, env, msg.id, state);
     }
 
-    // This is an intermediate stage, check for normalization.
+    let next_stage = state
+        .stages
+        .get((state.current_stage_index + 1) as usize)
+        .unwrap();
     let config = CONFIG.load(deps.storage)?;
-    let target_input_asset = get_next_stage_input_asset(&state.stages, state.current_stage_index)?;
-    let mut conversion_submsgs = vec![];
 
-    for asset in &state.accumulated_assets {
-        if asset.info == target_input_asset {
-            state.ready_for_next_stage_amount += asset.amount;
-        } else {
-            conversion_submsgs.push(SubMsg::reply_on_success(
-                create_conversion_msg(asset, &config, &env)?,
-                master_reply_id,
-            ));
-        }
-    }
-    state.accumulated_assets.clear();
+    // --- CALL THE RECONCILER ---
+    let reconciliation = reconcile_assets(&state.accumulated_assets, next_stage)?;
 
-    if conversion_submsgs.is_empty() {
+    state.accumulated_assets.clear(); // We are done with the raw outputs.
+
+    if reconciliation.conversions_needed.is_empty() {
+        // SCENARIO A: No conversions needed. Proceed directly to the next stage.
         state.current_stage_index += 1;
-        execute_next_swap_stage(deps, env, state, master_reply_id, target_input_asset)
+        return execute_next_swap_stage(
+            deps,
+            env,
+            state,
+            master_reply_id,
+            reconciliation.assets_ready_to_use,
+        );
     } else {
+        // SCENARIO B: Conversions are required.
+        let mut conversion_submsgs = vec![];
+        for (asset_to_convert, _target_info) in &reconciliation.conversions_needed {
+            let msg = create_conversion_msg(asset_to_convert, &config, &env)?;
+            conversion_submsgs.push(SubMsg::reply_on_success(msg, master_reply_id));
+        }
+
         state.awaiting = Awaiting::Conversions;
         state.replies_expected = conversion_submsgs.len() as u64;
+        state.ready_assets_for_next_stage = reconciliation.assets_ready_to_use;
         REPLY_STATES.save(deps.storage, master_reply_id, state)?;
-        Ok(Response::new()
+
+        return Ok(Response::new()
             .add_submessages(conversion_submsgs)
-            .add_attribute("action", "normalizing_assets"))
+            .add_attribute("action", "performing_minimal_conversions"));
     }
 }
 
@@ -257,7 +266,22 @@ fn handle_conversion_reply(
     state: &mut ReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let master_reply_id = msg.id;
-    state.ready_for_next_stage_amount += parse_amount_from_conversion_reply(&msg, &env)?;
+    let converted_amount = parse_amount_from_conversion_reply(&msg, &env)?;
+    let converted_asset_info = parse_asset_info_from_conversion_reply(&msg, &env)?;
+
+    // Add the newly converted asset to our list of ready assets.
+    if let Some((_info, amount)) = state
+        .ready_assets_for_next_stage
+        .iter_mut()
+        .find(|(info, _)| *info == converted_asset_info)
+    {
+        *amount += converted_amount;
+    } else {
+        state
+            .ready_assets_for_next_stage
+            .push((converted_asset_info, converted_amount));
+    }
+
     state.replies_expected -= 1;
 
     if state.replies_expected > 0 {
@@ -265,10 +289,11 @@ fn handle_conversion_reply(
         return Ok(Response::new().add_attribute("action", "accumulating_conversion_outputs"));
     }
 
+    // All conversions are complete.
     state.current_stage_index += 1;
-    let offer_asset_info =
-        get_next_stage_input_asset(&state.stages, state.current_stage_index - 1)?;
-    execute_next_swap_stage(deps, env, state, master_reply_id, offer_asset_info)
+    let final_ready_assets = std::mem::take(&mut state.ready_assets_for_next_stage);
+
+    execute_next_swap_stage(deps, env, state, master_reply_id, final_ready_assets)
 }
 
 fn execute_next_swap_stage(
@@ -276,31 +301,102 @@ fn execute_next_swap_stage(
     env: Env,
     state: &mut ReplyState,
     reply_id: u64,
-    offer_asset_info: external::AssetInfo,
+    ready_assets: Vec<(external::AssetInfo, Uint128)>,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let next_stage_idx = state.current_stage_index as usize;
     let next_stage = state
         .stages
         .get(next_stage_idx)
         .ok_or(ContractError::EmptyRoute {})?;
+
     let mut submessages = vec![];
-    for split in &next_stage.splits {
-        let amount_for_split = state
-            .ready_for_next_stage_amount
-            .multiply_ratio(split.percent as u128, 100u128);
+
+    // --- NEW LOGIC ---
+    // Keep track of how much of each asset pile we have allocated.
+    let mut amounts_allocated: Vec<(external::AssetInfo, Uint128)> = vec![];
+
+    for (i, split) in next_stage.splits.iter().enumerate() {
+        let offer_asset_info_for_split = match &split.operation {
+            Operation::AmmSwap(o) => &o.offer_asset_info,
+            Operation::OrderbookSwap(o) => &o.offer_asset_info,
+        };
+
+        // Find the total available amount for this asset type from the reconciled assets.
+        let total_amount_for_type = ready_assets
+            .iter()
+            .find(|(info, _amount)| info == offer_asset_info_for_split)
+            .map(|(_info, amount)| *amount)
+            .unwrap_or_else(Uint128::zero);
+
+        // Determine how many other splits also require this same asset.
+        // This is important for the remainder calculation.
+        let num_splits_for_this_asset = next_stage
+            .splits
+            .iter()
+            .filter(|s| {
+                let offer_info = match &s.operation {
+                    Operation::AmmSwap(o) => &o.offer_asset_info,
+                    Operation::OrderbookSwap(o) => &o.offer_asset_info,
+                };
+                offer_info == offer_asset_info_for_split
+            })
+            .count();
+
+        // Find the index of the current split among those that use the same asset.
+        let current_split_index_for_asset = next_stage
+            .splits
+            .iter()
+            .enumerate()
+            .filter(|(_i, s)| {
+                let offer_info = match &s.operation {
+                    Operation::AmmSwap(o) => &o.offer_asset_info,
+                    Operation::OrderbookSwap(o) => &o.offer_asset_info,
+                };
+                offer_info == offer_asset_info_for_split
+            })
+            .position(|(idx, _s)| idx == i)
+            .unwrap_or(0);
+
+        // Use the remainder method for splitting the pile.
+        let amount_for_split = if current_split_index_for_asset < num_splits_for_this_asset - 1 {
+            total_amount_for_type.multiply_ratio(split.percent as u128, 100u128)
+        } else {
+            // This is the last split for this asset type, it gets the remainder.
+            let already_allocated = amounts_allocated
+                .iter()
+                .find(|(info, _)| info == offer_asset_info_for_split)
+                .map(|(_, amount)| *amount)
+                .unwrap_or_else(Uint128::zero);
+            total_amount_for_type
+                .checked_sub(already_allocated)
+                .map_err(StdError::overflow)?
+        };
+
+        // Update our running total of allocated funds.
+        if let Some((_, allocated)) = amounts_allocated
+            .iter_mut()
+            .find(|(info, _)| info == offer_asset_info_for_split)
+        {
+            *allocated += amount_for_split;
+        } else {
+            amounts_allocated.push((offer_asset_info_for_split.clone(), amount_for_split));
+        }
+
         let msg = create_swap_cosmos_msg(
             &deps,
             &split.operation,
-            &offer_asset_info,
+            offer_asset_info_for_split,
             amount_for_split,
             &env,
         )?;
         submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
+
     state.awaiting = Awaiting::Swaps;
     state.replies_expected = submessages.len() as u64;
-    state.ready_for_next_stage_amount = Uint128::zero();
+    state.ready_assets_for_next_stage.clear();
     REPLY_STATES.save(deps.storage, reply_id, state)?;
+
     Ok(Response::new()
         .add_submessages(submessages)
         .add_attribute("action", "executing_next_stage")
@@ -347,24 +443,6 @@ fn get_operation_output(op: &Operation) -> Result<external::AssetInfo, ContractE
     Ok(match op {
         Operation::AmmSwap(o) => o.ask_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.ask_asset_info.clone(),
-    })
-}
-
-fn get_next_stage_input_asset(
-    stages: &[Stage],
-    current_stage_index: u64,
-) -> Result<external::AssetInfo, ContractError> {
-    let next_stage = stages
-        .get((current_stage_index + 1) as usize)
-        .ok_or(ContractError::EmptyRoute {})?;
-    let op = &next_stage
-        .splits
-        .first()
-        .ok_or(ContractError::EmptyRoute {})?
-        .operation;
-    Ok(match op {
-        Operation::AmmSwap(o) => o.offer_asset_info.clone(),
-        Operation::OrderbookSwap(o) => o.offer_asset_info.clone(),
     })
 }
 
@@ -452,4 +530,211 @@ fn parse_amount_from_conversion_reply(msg: &Reply, env: &Env) -> Result<Uint128,
     }
 
     Err(ContractError::NoConversionEventInReply {})
+}
+
+fn parse_asset_info_from_conversion_reply(
+    msg: &Reply,
+    env: &Env,
+) -> Result<external::AssetInfo, ContractError> {
+    let events = &msg
+        .result
+        .clone()
+        .into_result()
+        .map_err(|e| ContractError::SubmessageResultError { error: e })?
+        .events;
+
+    // --- Case 1: Look for a native token transfer from the bank module ---
+    // This event indicates we received a native (e.g., token-factory) asset.
+    if let Some(transfer_event) = events.iter().find(|e| {
+        e.ty == "transfer"
+            && e.attributes
+                .iter()
+                .any(|a| a.key == "recipient" && a.value == env.contract.address.to_string())
+    }) {
+        // Find the amount attribute, which contains both the amount and the denom.
+        let amount_attr = transfer_event
+            .attributes
+            .iter()
+            .find(|a| a.key == "amount")
+            .ok_or(ContractError::NoAmountInReply {})?;
+
+        // The denom is the non-numeric part of the amount string.
+        let denom_start_index = amount_attr
+            .value
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| ContractError::MalformedAmountInReply {
+                value: amount_attr.value.clone(),
+            })?;
+
+        let denom = &amount_attr.value[denom_start_index..];
+        return Ok(external::AssetInfo::NativeToken {
+            denom: denom.to_string(),
+        });
+    }
+
+    // --- Case 2: Look for a CW20 token transfer from a wasm module ---
+    // This event indicates we received a CW20 asset.
+    if let Some(wasm_event) = events.iter().find(|e| {
+        // Find the specific wasm event corresponding to a CW20 transfer TO our contract.
+        e.ty == "wasm"
+            && e.attributes
+                .iter()
+                .any(|a| a.key == "action" && a.value == "transfer")
+            && e.attributes
+                .iter()
+                .any(|a| a.key == "to" && a.value == env.contract.address.to_string())
+    }) {
+        // The '_contract_address' of this event is the address of the CW20 token.
+        let contract_addr_attr = wasm_event
+            .attributes
+            .iter()
+            .find(|a| a.key == "_contract_address")
+            .ok_or(ContractError::NoConversionEventInReply {})?; // Or a more specific error
+
+        return Ok(external::AssetInfo::Token {
+            contract_addr: contract_addr_attr.value.clone(),
+        });
+    }
+
+    // If neither pattern was found, it's an error.
+    Err(ContractError::NoConversionEventInReply {})
+}
+
+struct Reconciliation {
+    // Assets that are already the correct type and amount for the next stage.
+    pub assets_ready_to_use: Vec<(external::AssetInfo, Uint128)>,
+    // The specific conversions required to meet the needs of the next stage.
+    pub conversions_needed: Vec<(external::Asset, external::AssetInfo)>, // (Asset to Convert, Target AssetInfo)
+}
+
+/// Compares the assets produced by the last stage with the assets required by the next stage
+/// and determines the minimum set of conversions needed.
+fn reconcile_assets(
+    // The outputs from the completed stage (our "haves").
+    accumulated_assets: &[external::Asset],
+    // The definition of the next stage (to calculate our "needs").
+    next_stage: &Stage,
+) -> Result<Reconciliation, ContractError> {
+    let mut native_info: Option<external::AssetInfo> = None;
+    let mut cw20_info: Option<external::AssetInfo> = None;
+
+    // --- NEW STEP 1: Discover all AssetInfos required by the next stage ---
+    // This ensures we know the AssetInfo for a token even if we don't have any of it yet.
+    for split in &next_stage.splits {
+        let offer_info = match &split.operation {
+            Operation::AmmSwap(o) => &o.offer_asset_info,
+            Operation::OrderbookSwap(o) => &o.offer_asset_info,
+        };
+        match offer_info {
+            external::AssetInfo::NativeToken { .. } => {
+                if native_info.is_none() {
+                    native_info = Some(offer_info.clone());
+                }
+            }
+            external::AssetInfo::Token { .. } => {
+                if cw20_info.is_none() {
+                    cw20_info = Some(offer_info.clone());
+                }
+            }
+        }
+    }
+
+    // --- STEP 2: Tally the "Haves" and the total logical amount ---
+    let mut native_have = Uint128::zero();
+    let mut cw20_have = Uint128::zero();
+
+    for asset in accumulated_assets {
+        match &asset.info {
+            external::AssetInfo::NativeToken { .. } => {
+                native_have += asset.amount;
+                // If we didn't learn about native_info from the next stage, learn it from the haves.
+                if native_info.is_none() {
+                    native_info = Some(asset.info.clone());
+                }
+            }
+            external::AssetInfo::Token { .. } => {
+                cw20_have += asset.amount;
+                if cw20_info.is_none() {
+                    cw20_info = Some(asset.info.clone());
+                }
+            }
+        }
+    }
+    let total_logical_amount = native_have + cw20_have;
+
+    // --- STEP 3: Calculate the "Needs" ---
+    let mut native_needs = Uint128::zero();
+    let mut cw20_needs = Uint128::zero();
+    let mut amount_allocated = Uint128::zero();
+    let splits_count = next_stage.splits.len();
+
+    for (i, split) in next_stage.splits.iter().enumerate() {
+        // Calculate the amount for all but the last split using ratios.
+        // The last split gets the remainder to prevent dust loss.
+        let amount_for_split = if i < splits_count - 1 {
+            total_logical_amount.multiply_ratio(split.percent as u128, 100u128)
+        } else {
+            total_logical_amount
+                .checked_sub(amount_allocated)
+                .map_err(|e| ContractError::Std(StdError::overflow(e)))?
+        };
+        amount_allocated += amount_for_split;
+
+        let offer_info = match &split.operation {
+            Operation::AmmSwap(o) => &o.offer_asset_info,
+            Operation::OrderbookSwap(o) => &o.offer_asset_info,
+        };
+        match offer_info {
+            external::AssetInfo::NativeToken { .. } => native_needs += amount_for_split,
+            external::AssetInfo::Token { .. } => cw20_needs += amount_for_split,
+        }
+    }
+
+    // --- STEP 4: Determine the Delta and Plan Conversions ---
+    let mut assets_ready_to_use: Vec<(external::AssetInfo, Uint128)> = vec![];
+    let mut conversions_needed: Vec<(external::Asset, external::AssetInfo)> = vec![];
+
+    // Reconcile Native Tokens
+    if native_have > native_needs {
+        let surplus = native_have - native_needs;
+        assets_ready_to_use.push((native_info.as_ref().unwrap().clone(), native_needs));
+        if let Some(target_info) = &cw20_info {
+            conversions_needed.push((
+                external::Asset {
+                    info: native_info.as_ref().unwrap().clone(),
+                    amount: surplus,
+                },
+                target_info.clone(),
+            ));
+        }
+    } else {
+        if !native_have.is_zero() {
+            assets_ready_to_use.push((native_info.as_ref().unwrap().clone(), native_have));
+        }
+    }
+
+    // Reconcile CW20 Tokens
+    if cw20_have > cw20_needs {
+        let surplus = cw20_have - cw20_needs;
+        assets_ready_to_use.push((cw20_info.as_ref().unwrap().clone(), cw20_needs));
+        // MODIFIED: This check will now succeed because we populated native_info in Step 1.
+        if let Some(target_info) = &native_info {
+            conversions_needed.push((
+                external::Asset {
+                    info: cw20_info.as_ref().unwrap().clone(),
+                    amount: surplus,
+                },
+                target_info.clone(),
+            ));
+        }
+    } else {
+        if !cw20_have.is_zero() {
+            assets_ready_to_use.push((cw20_info.as_ref().unwrap().clone(), cw20_have));
+        }
+    }
+
+    Ok(Reconciliation {
+        assets_ready_to_use,
+        conversions_needed,
+    })
 }

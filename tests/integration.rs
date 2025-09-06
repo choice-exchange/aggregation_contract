@@ -1601,3 +1601,113 @@ fn test_mixed_input_unified_output_reconciliation() {
 
     assert_eq!(final_usdt_amount, expected_final_usdt);
 }
+
+#[test]
+fn test_cw20_input_with_initial_reconciliation() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let admin = &setup.env.admin;
+    let bank = Bank::new(&setup.env.app);
+
+    // --- SCENARIO ---
+    // Input: User sends 1,000 CW20 SHROOM to the contract.
+    // Stage 1: Requires a MIXED input (700 Native SHROOM, 300 CW20 SHROOM).
+    // Reconciliation: Contract must convert 700 of the input CW20 SHROOM to Native SHROOM.
+    // Final Output: Both splits result in USDT.
+    //  - 700 Native SHROOM @ 0.5 rate -> 350 USDT
+    //  - 300 CW20 SHROOM  @ 0.4 rate -> 120 USDT
+    //  - TOTAL: 470 USDT
+
+    // Mint the initial CW20 SHROOM to the user.
+    let initial_user_shroom = Uint128::new(1_000_000_000); // 1,000 SHROOM (6 decimals)
+    wasm.execute(
+        &setup.shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: user.address(),
+            amount: initial_user_shroom,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // Asset definitions for the stage
+    let cw20_shroom_info = external::AssetInfo::Token {
+        contract_addr: setup.shroom_cw20_addr.clone(),
+    };
+    let native_shroom_info = external::AssetInfo::NativeToken {
+        denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
+    };
+    let usdt_info = external::AssetInfo::NativeToken {
+        denom: "usdt".to_string(),
+    };
+
+    let stage1 = Stage {
+        splits: vec![
+            Split {
+                // 70% requires Native SHROOM
+                percent: 70,
+                operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
+                    offer_asset_info: native_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+            Split {
+                // 30% requires CW20 SHROOM
+                percent: 30,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
+                    offer_asset_info: cw20_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+        ],
+    };
+
+    // The hook message sent with the CW20 token
+    let hook_msg = Cw20HookMsg::AggregateSwaps {
+        minimum_receive: Some("469000000".to_string()), // Min 469 USDT (Target is 470)
+        stages: vec![stage1],
+    };
+
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Execute the transaction via Cw20::Send
+    let res = wasm.execute(
+        &setup.shroom_cw20_addr,
+        &cw20::Cw20ExecuteMsg::Send {
+            contract: setup.env.aggregator_addr.clone(),
+            amount: initial_user_shroom,
+            msg: to_json_binary(&hook_msg).unwrap(),
+        },
+        &[],
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- ASSERT FINAL BALANCE ---
+    let final_usdt_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // Expected Output: 350 USDT (Native split) + 120 USDT (CW20 split) = 470 USDT
+    let total_swap_output = Uint128::new(470_000_000u128);
+    let expected_final_usdt = initial_usdt_amount + total_swap_output;
+    let final_usdt_amount =
+        Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
+
+    assert_eq!(final_usdt_amount, expected_final_usdt);
+}

@@ -23,69 +23,25 @@ pub fn handle_reply(
     }
 }
 
-fn handle_swap_reply(
-    deps: DepsMut<InjectiveQueryWrapper>,
+pub(crate) fn proceed_to_next_step(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
-    msg: Reply,
     state: &mut ReplyState,
+    master_reply_id: u64,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let master_reply_id = msg.id;
-
-    let events = msg
-        .result
-        .clone()
-        .into_result()
-        .map_err(|e| ContractError::SubmessageResultError { error: e })?
-        .events;
-    let replying_addresses: Vec<&str> = events
-        .iter()
-        .filter(|e| e.ty.starts_with("wasm"))
-        .flat_map(|e| &e.attributes)
-        .filter_map(|attr| {
-            if attr.key == "_contract_address" {
-                Some(attr.value.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let current_stage = &state.stages[state.current_stage_index as usize];
-    let relevant_split = current_stage.splits.iter().find(|s| {
-        let op_addr = match &s.operation { Operation::AmmSwap(op) => op.pool_address.as_str(), Operation::OrderbookSwap(op) => op.swap_contract.as_str() };
-        replying_addresses.contains(&op_addr)
-    }).ok_or_else(|| StdError::generic_err(format!("Could not find a split matching any replying contract. Contracts that replied: {:?}", replying_addresses)))?;
-
-    let asset_info = get_operation_output(&relevant_split.operation)?;
-    let amount = parse_amount_from_swap_reply(&msg)?;
-    state.accumulated_assets.push(external::Asset {
-        info: asset_info,
-        amount,
-    });
-    state.replies_expected -= 1;
-
-    if state.replies_expected > 0 {
-        REPLY_STATES.save(deps.storage, master_reply_id, state)?;
-        return Ok(Response::new().add_attribute("action", "accumulating_swap_outputs"));
+    if state.current_stage_index as usize >= state.stages.len() {
+        return handle_final_stage(deps, env, master_reply_id, state);
     }
 
-    if state.current_stage_index as usize >= state.stages.len() - 1 {
-        return handle_final_stage(deps, env, msg.id, state);
-    }
-
-    let next_stage = state
+    let next_stage_to_execute = state
         .stages
-        .get((state.current_stage_index + 1) as usize)
+        .get(state.current_stage_index as usize)
         .unwrap();
     let config = CONFIG.load(deps.storage)?;
-
-    // --- CALL THE RECONCILER ---
-    let reconciliation = reconcile_assets(&state.accumulated_assets, next_stage)?;
-
-    state.accumulated_assets.clear(); // We are done with the raw outputs.
+    let reconciliation = reconcile_assets(&state.accumulated_assets, next_stage_to_execute)?;
+    state.accumulated_assets.clear();
 
     if reconciliation.conversions_needed.is_empty() {
-        // SCENARIO A: No conversions needed. Proceed directly to the next stage.
-        state.current_stage_index += 1;
         execute_next_swap_stage(
             deps,
             env,
@@ -94,21 +50,43 @@ fn handle_swap_reply(
             reconciliation.assets_ready_to_use,
         )
     } else {
-        // SCENARIO B: Conversions are required.
         let mut conversion_submsgs = vec![];
         for (asset_to_convert, _target_info) in &reconciliation.conversions_needed {
             let msg = create_conversion_msg(asset_to_convert, &config, &env)?;
             conversion_submsgs.push(SubMsg::reply_on_success(msg, master_reply_id));
         }
-
         state.awaiting = Awaiting::Conversions;
         state.replies_expected = conversion_submsgs.len() as u64;
         state.ready_assets_for_next_stage = reconciliation.assets_ready_to_use;
         REPLY_STATES.save(deps.storage, master_reply_id, state)?;
-
         Ok(Response::new()
             .add_submessages(conversion_submsgs)
             .add_attribute("action", "performing_minimal_conversions"))
+    }
+}
+
+fn handle_swap_reply(
+    mut deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    msg: Reply,
+    state: &mut ReplyState,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let master_reply_id = msg.id;
+    let amount = parse_amount_from_swap_reply(&msg)?;
+    let asset_info = find_asset_info_from_swap_reply(&msg, state)?;
+    state.accumulated_assets.push(external::Asset {
+        info: asset_info,
+        amount,
+    });
+    state.replies_expected -= 1;
+
+    if state.replies_expected > 0 {
+        REPLY_STATES.save(deps.storage, master_reply_id, state)?;
+        Ok(Response::new().add_attribute("action", "accumulating_swap_outputs"))
+    } else {
+        // This stage is complete. Increment index and proceed to the next step.
+        state.current_stage_index += 1;
+        proceed_to_next_step(&mut deps, env, state, master_reply_id)
     }
 }
 
@@ -162,17 +140,15 @@ fn create_send_msg(
 }
 
 fn handle_final_stage(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
     reply_id: u64,
     state: &mut ReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let target_asset_info = state
-        .accumulated_assets
-        .iter()
-        .find(|a| matches!(a.info, external::AssetInfo::Token { .. }))
-        .map(|a| a.info.clone())
-        .unwrap_or_else(|| state.accumulated_assets.first().unwrap().info.clone());
+    let target_asset_info = match state.accumulated_assets.first() {
+        Some(asset) => asset.info.clone(),
+        None => return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty")),
+    };
 
     let mut conversion_submsgs = vec![];
     let mut ready_amount = Uint128::zero();
@@ -260,7 +236,7 @@ fn handle_final_conversion_reply(
 }
 
 fn handle_conversion_reply(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    mut deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
     msg: Reply,
     state: &mut ReplyState,
@@ -268,9 +244,7 @@ fn handle_conversion_reply(
     let master_reply_id = msg.id;
     let converted_amount = parse_amount_from_conversion_reply(&msg, &env)?;
     let converted_asset_info = parse_asset_info_from_conversion_reply(&msg, &env)?;
-
-    // Add the newly converted asset to our list of ready assets.
-    if let Some((_info, amount)) = state
+    if let Some((_, amount)) = state
         .ready_assets_for_next_stage
         .iter_mut()
         .find(|(info, _)| *info == converted_asset_info)
@@ -281,7 +255,6 @@ fn handle_conversion_reply(
             .ready_assets_for_next_stage
             .push((converted_asset_info, converted_amount));
     }
-
     state.replies_expected -= 1;
 
     if state.replies_expected > 0 {
@@ -289,107 +262,102 @@ fn handle_conversion_reply(
         return Ok(Response::new().add_attribute("action", "accumulating_conversion_outputs"));
     }
 
-    // All conversions are complete.
-    state.current_stage_index += 1;
     let final_ready_assets = std::mem::take(&mut state.ready_assets_for_next_stage);
-
-    execute_next_swap_stage(deps, env, state, master_reply_id, final_ready_assets)
+    // Execute the stage we were preparing for. DO NOT increment the index.
+    execute_next_swap_stage(&mut deps, env, state, master_reply_id, final_ready_assets)
 }
 
 fn execute_next_swap_stage(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
     state: &mut ReplyState,
     reply_id: u64,
     ready_assets: Vec<(external::AssetInfo, Uint128)>,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let next_stage_idx = state.current_stage_index as usize;
     let next_stage = state
         .stages
-        .get(next_stage_idx)
+        .get(state.current_stage_index as usize)
         .ok_or(ContractError::EmptyRoute {})?;
 
     let mut submessages = vec![];
 
-    // --- NEW LOGIC ---
-    // Keep track of how much of each asset pile we have allocated.
-    let mut amounts_allocated: Vec<(external::AssetInfo, Uint128)> = vec![];
+    // --- NEW, SMARTER LOGIC ---
+    if ready_assets.len() > 1 {
+        // SCENARIO A: Multiple, distinct asset piles are ready.
+        // This means `reconcile_assets` has already calculated the exact amounts.
+        // We must send the entire pile for each corresponding split.
+        for split in &next_stage.splits {
+            let offer_asset_info_for_split = match &split.operation {
+                Operation::AmmSwap(o) => &o.offer_asset_info,
+                Operation::OrderbookSwap(o) => &o.offer_asset_info,
+            };
 
-    for (i, split) in next_stage.splits.iter().enumerate() {
-        let offer_asset_info_for_split = match &split.operation {
-            Operation::AmmSwap(o) => &o.offer_asset_info,
-            Operation::OrderbookSwap(o) => &o.offer_asset_info,
-        };
+            let amount_to_send = ready_assets
+                .iter()
+                .find(|(info, _)| info == offer_asset_info_for_split)
+                .map(|(_, amount)| *amount)
+                .ok_or_else(|| {
+                    StdError::generic_err(format!(
+                        "Reconciliation failed to provide asset for split: {:?}",
+                        offer_asset_info_for_split
+                    ))
+                })?;
 
-        // Find the total available amount for this asset type from the reconciled assets.
-        let total_amount_for_type = ready_assets
-            .iter()
-            .find(|(info, _amount)| info == offer_asset_info_for_split)
-            .map(|(_info, amount)| *amount)
-            .unwrap_or_else(Uint128::zero);
+            let msg = create_swap_cosmos_msg(
+                deps,
+                &split.operation,
+                offer_asset_info_for_split,
+                amount_to_send,
+                &env,
+            )?;
+            submessages.push(SubMsg::reply_on_success(msg, reply_id));
+        }
+    } else {
+        // SCENARIO B: Only one type of asset is ready.
+        // This means we must split this single pile according to the stage percentages.
+        let mut amounts_allocated: Vec<(external::AssetInfo, Uint128)> = vec![];
+        for (i, split) in next_stage.splits.iter().enumerate() {
+            let offer_asset_info_for_split = match &split.operation {
+                Operation::AmmSwap(o) => &o.offer_asset_info,
+                Operation::OrderbookSwap(o) => &o.offer_asset_info,
+            };
 
-        // Determine how many other splits also require this same asset.
-        // This is important for the remainder calculation.
-        let num_splits_for_this_asset = next_stage
-            .splits
-            .iter()
-            .filter(|s| {
-                let offer_info = match &s.operation {
-                    Operation::AmmSwap(o) => &o.offer_asset_info,
-                    Operation::OrderbookSwap(o) => &o.offer_asset_info,
-                };
-                offer_info == offer_asset_info_for_split
-            })
-            .count();
-
-        // Find the index of the current split among those that use the same asset.
-        let current_split_index_for_asset = next_stage
-            .splits
-            .iter()
-            .enumerate()
-            .filter(|(_i, s)| {
-                let offer_info = match &s.operation {
-                    Operation::AmmSwap(o) => &o.offer_asset_info,
-                    Operation::OrderbookSwap(o) => &o.offer_asset_info,
-                };
-                offer_info == offer_asset_info_for_split
-            })
-            .position(|(idx, _s)| idx == i)
-            .unwrap_or(0);
-
-        // Use the remainder method for splitting the pile.
-        let amount_for_split = if current_split_index_for_asset < num_splits_for_this_asset - 1 {
-            total_amount_for_type.multiply_ratio(split.percent as u128, 100u128)
-        } else {
-            // This is the last split for this asset type, it gets the remainder.
-            let already_allocated = amounts_allocated
+            let total_amount_for_type = ready_assets
                 .iter()
                 .find(|(info, _)| info == offer_asset_info_for_split)
                 .map(|(_, amount)| *amount)
                 .unwrap_or_else(Uint128::zero);
-            total_amount_for_type
-                .checked_sub(already_allocated)
-                .map_err(StdError::overflow)?
-        };
 
-        // Update our running total of allocated funds.
-        if let Some((_, allocated)) = amounts_allocated
-            .iter_mut()
-            .find(|(info, _)| info == offer_asset_info_for_split)
-        {
-            *allocated += amount_for_split;
-        } else {
-            amounts_allocated.push((offer_asset_info_for_split.clone(), amount_for_split));
+            let amount_for_split = if i < next_stage.splits.len() - 1 {
+                total_amount_for_type.multiply_ratio(split.percent as u128, 100u128)
+            } else {
+                let already_allocated = amounts_allocated
+                    .iter()
+                    .find(|(info, _)| info == offer_asset_info_for_split)
+                    .map(|(_, amount)| *amount)
+                    .unwrap_or_else(Uint128::zero);
+                total_amount_for_type
+                    .checked_sub(already_allocated)
+                    .map_err(StdError::from)?
+            };
+
+            if let Some((_, allocated)) = amounts_allocated
+                .iter_mut()
+                .find(|(info, _)| info == offer_asset_info_for_split)
+            {
+                *allocated += amount_for_split;
+            } else {
+                amounts_allocated.push((offer_asset_info_for_split.clone(), amount_for_split));
+            }
+            let msg = create_swap_cosmos_msg(
+                deps,
+                &split.operation,
+                offer_asset_info_for_split,
+                amount_for_split,
+                &env,
+            )?;
+            submessages.push(SubMsg::reply_on_success(msg, reply_id));
         }
-
-        let msg = create_swap_cosmos_msg(
-            &deps,
-            &split.operation,
-            offer_asset_info_for_split,
-            amount_for_split,
-            &env,
-        )?;
-        submessages.push(SubMsg::reply_on_success(msg, reply_id));
     }
 
     state.awaiting = Awaiting::Swaps;
@@ -598,6 +566,56 @@ fn parse_asset_info_from_conversion_reply(
 
     // If neither pattern was found, it's an error.
     Err(ContractError::NoConversionEventInReply {})
+}
+
+fn find_asset_info_from_swap_reply(
+    msg: &Reply,
+    state: &ReplyState,
+) -> Result<external::AssetInfo, ContractError> {
+    let events = &msg
+        .result
+        .clone()
+        .into_result()
+        .map_err(|e| ContractError::SubmessageResultError { error: e })?
+        .events;
+
+    // Find all potential contract addresses from the events.
+    let mut potential_addrs = vec![];
+    for e in events.iter().filter(|e| e.ty.starts_with("wasm")) {
+        // The address of the contract that was executed.
+        if let Some(addr) = e.attributes.iter().find(|a| a.key == "_contract_address") {
+            potential_addrs.push(&addr.value);
+        }
+        // For Cw20::Send, the `sender` of the hook message is the pool.
+        if let Some(addr) = e.attributes.iter().find(|a| a.key == "sender") {
+            potential_addrs.push(&addr.value);
+        }
+    }
+
+    let current_stage = state
+        .stages
+        .get(state.current_stage_index as usize)
+        .ok_or(ContractError::EmptyRoute {})?;
+
+    // Find the split that matches any of the potential addresses.
+    let relevant_split = current_stage
+        .splits
+        .iter()
+        .find(|s| {
+            let op_addr = match &s.operation {
+                Operation::AmmSwap(op) => &op.pool_address,
+                Operation::OrderbookSwap(op) => &op.swap_contract,
+            };
+            potential_addrs.contains(&op_addr)
+        })
+        .ok_or_else(|| {
+            StdError::generic_err(format!(
+                "Could not find a split matching any replying contract addresses: {:?}",
+                potential_addrs
+            ))
+        })?;
+
+    get_operation_output(&relevant_split.operation)
 }
 
 struct Reconciliation {

@@ -1,6 +1,6 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, SubMsg,
-    Uint128, WasmMsg,
+    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, Uint128,
+    WasmMsg,
 };
 use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -9,7 +9,8 @@ use std::str::FromStr;
 
 use crate::error::ContractError;
 use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Route, Stage};
-use crate::state::{Awaiting, ReplyState, REPLY_ID_COUNTER, REPLY_STATES};
+use crate::reply::proceed_to_next_step;
+use crate::state::{Awaiting, ReplyState, REPLY_ID_COUNTER};
 
 pub fn execute_route(
     _deps: DepsMut<InjectiveQueryWrapper>,
@@ -34,7 +35,7 @@ pub fn update_admin(
 }
 
 pub fn execute_aggregate_swaps_internal(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    mut deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
     _info: MessageInfo,
     stages: Vec<Stage>,
@@ -45,7 +46,11 @@ pub fn execute_aggregate_swaps_internal(
     if offer_asset.amount.is_zero() {
         return Err(ContractError::ZeroAmount {});
     }
-    let first_stage = stages.first().ok_or(ContractError::NoStages {})?;
+    if stages.is_empty() {
+        return Err(ContractError::NoStages {});
+    }
+
+    let first_stage = stages.first().unwrap();
     let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
     if total_percentage != 100 {
         return Err(ContractError::InvalidPercentageSum {});
@@ -59,47 +64,24 @@ pub fn execute_aggregate_swaps_internal(
         None => Uint128::zero(),
     };
 
-    let initial_state = ReplyState {
+    let mut initial_state = ReplyState {
         sender: initiator.clone(),
         minimum_receive,
-        stages: stages.clone(),
-        // Initialize the state machine
+        stages,
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
-        replies_expected: first_stage.splits.len() as u64,
-        // Initialize accumulators
-        accumulated_assets: vec![],
-        ready_for_next_stage_amount: Uint128::zero(),
+        replies_expected: 0,
+        accumulated_assets: vec![offer_asset],
         ready_assets_for_next_stage: vec![],
+        ready_for_next_stage_amount: Uint128::zero(),
         conversion_target_asset: None,
     };
-    REPLY_STATES.save(deps.storage, reply_id, &initial_state)?;
 
-    let mut submessages: Vec<SubMsg<InjectiveMsgWrapper>> = vec![];
-    for split in &first_stage.splits {
-        let split_amount = offer_asset
-            .amount
-            .multiply_ratio(split.percent as u128, 100u128);
-
-        let msg = create_swap_cosmos_msg(
-            &deps,
-            &split.operation,
-            &offer_asset.info,
-            split_amount,
-            &env,
-        )?;
-        submessages.push(SubMsg::reply_on_success(msg, reply_id));
-    }
-
-    Ok(Response::new()
-        .add_submessages(submessages)
-        .add_attribute("action", "multi_stage_swap_started")
-        .add_attribute("initiator", initiator)
-        .add_attribute("reply_id", reply_id.to_string()))
+    proceed_to_next_step(&mut deps, env, &mut initial_state, reply_id)
 }
 
 pub fn create_swap_cosmos_msg(
-    deps: &DepsMut<InjectiveQueryWrapper>,
+    deps: &mut DepsMut<InjectiveQueryWrapper>, // Changed to mutable reference
     operation: &Operation,
     offer_asset_info: &external::AssetInfo,
     amount: Uint128,

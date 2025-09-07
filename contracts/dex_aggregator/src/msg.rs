@@ -157,6 +157,18 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
+#[cw_serde] // Add this if you plan to store it in state
+pub struct PlannedSwap {
+    pub operation: Operation,
+    pub amount: Uint128,
+}
+
+// The complete plan for a stage, produced by the planner.
+pub struct StagePlan {
+    pub swaps_to_execute: Vec<PlannedSwap>,
+    pub conversions_needed: Vec<(external::Asset, external::AssetInfo)>,
+}
+
 #[cw_serde]
 pub enum Cw20HookMsg {
     AggregateSwaps {

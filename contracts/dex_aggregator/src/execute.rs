@@ -72,8 +72,7 @@ pub fn execute_aggregate_swaps_internal(
         current_stage_index: 0,
         replies_expected: 0,
         accumulated_assets: vec![offer_asset],
-        ready_assets_for_next_stage: vec![],
-        ready_for_next_stage_amount: Uint128::zero(),
+        pending_swaps: vec![],
         conversion_target_asset: None,
     };
 

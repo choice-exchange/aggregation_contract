@@ -1711,3 +1711,589 @@ fn test_cw20_input_with_initial_reconciliation() {
 
     assert_eq!(final_usdt_amount, expected_final_usdt);
 }
+
+#[test]
+fn test_complex_reconciliation_mixed_to_mixed() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let bank = Bank::new(&setup.env.app);
+
+    // --- SCENARIO ---
+    // Stage 1: 10 INJ -> Mixed output of 600 Native SHROOM and 400 CW20 SHROOM.
+    // Reconciliation: The contract now holds a mixed pile.
+    // Stage 2: Requires a *different* mixed input: 250 Native SHROOM and 750 CW20 SHROOM.
+    // Planner Logic:
+    //  - Native: Have 600, Need 250 -> Surplus of 350.
+    //  - CW20:   Have 400, Need 750 -> Deficit of 350.
+    //  - Action: Must convert 350 Native SHROOM into CW20 SHROOM.
+    // Final Output: Both splits result in USDT.
+    //  - 250 Native SHROOM @ 0.5 rate -> 125 USDT
+    //  - 750 CW20 SHROOM  @ 0.4 rate -> 300 USDT
+    //  - TOTAL: 425 USDT
+
+    // Asset definitions for clarity
+    let cw20_shroom_info = external::AssetInfo::Token {
+        contract_addr: setup.shroom_cw20_addr.clone(),
+    };
+    let native_shroom_info = external::AssetInfo::NativeToken {
+        denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
+    };
+    let usdt_info = external::AssetInfo::NativeToken {
+        denom: "usdt".to_string(),
+    };
+    let inj_info = external::AssetInfo::NativeToken {
+        denom: "inj".to_string(),
+    };
+
+    // Stage 1: 10 INJ -> Mixed SHROOM output
+    let stage1 = Stage {
+        splits: vec![
+            Split {
+                // 60% of INJ goes to create Native SHROOM
+                percent: 60,
+                operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                    swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
+                    offer_asset_info: inj_info.clone(),
+                    ask_asset_info: native_shroom_info.clone(),
+                }),
+            },
+            Split {
+                // 40% of INJ goes to create CW20 SHROOM
+                percent: 40,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                    offer_asset_info: inj_info.clone(),
+                    ask_asset_info: cw20_shroom_info.clone(),
+                }),
+            },
+        ],
+    };
+
+    // Stage 2: Requires a different mix of SHROOM to output unified USDT
+    let stage2 = Stage {
+        splits: vec![
+            Split {
+                // 25% of total value requires Native SHROOM
+                percent: 25,
+                operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
+                    offer_asset_info: native_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+            Split {
+                // 75% of total value requires CW20 SHROOM
+                percent: 75,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
+                    offer_asset_info: cw20_shroom_info.clone(),
+                    ask_asset_info: usdt_info.clone(),
+                }),
+            },
+        ],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        minimum_receive: Some("424000000".to_string()), // Min 424 USDT (Target is 425)
+        stages: vec![stage1, stage2],
+    };
+
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")], // User sends 10 INJ
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- ASSERT FINAL BALANCE ---
+    let final_usdt_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    // Expected Output: 125 USDT + 300 USDT = 425 USDT
+    let total_swap_output = Uint128::new(425_000_000u128);
+    let expected_final_usdt = initial_usdt_amount + total_swap_output;
+
+    let final_usdt_amount =
+        Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
+
+    assert_eq!(final_usdt_amount, expected_final_usdt);
+}
+
+#[test]
+fn test_final_output_is_cw20_token() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+
+    // --- SCENARIO ---
+    // A simple two-stage swap where the final output is a CW20 token (SAI).
+    // This tests the contract's ability to transfer the final CW20 balance to the user.
+    // Stage 1: 10 INJ -> 1000 CW20 SHROOM
+    // Stage 2: 1000 CW20 SHROOM -> 100 CW20 SAI
+
+    // Asset definitions for clarity
+    let inj_info = external::AssetInfo::NativeToken {
+        denom: "inj".to_string(),
+    };
+    let cw20_shroom_info = external::AssetInfo::Token {
+        contract_addr: setup.shroom_cw20_addr.clone(),
+    };
+    let cw20_sai_info = external::AssetInfo::Token {
+        contract_addr: setup.sai_cw20_addr.clone(),
+    };
+
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
+                offer_asset_info: inj_info.clone(),
+                ask_asset_info: cw20_shroom_info.clone(),
+            }),
+        }],
+    };
+
+    let stage2 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
+                offer_asset_info: cw20_shroom_info.clone(),
+                ask_asset_info: cw20_sai_info.clone(),
+            }),
+        }],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
+        stages: vec![stage1, stage2],
+    };
+
+    // Check initial SAI balance is zero.
+    let initial_sai_balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    assert_eq!(initial_sai_balance.balance, Uint128::zero());
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")], // User sends 10 INJ
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- ASSERT FINAL BALANCE ---
+    // The user should now have the final CW20 SAI tokens.
+    let final_sai_balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+
+    // Expected Output: 100 SAI (6 decimals)
+    let expected_final_sai = Uint128::new(100_000_000u128);
+    assert_eq!(final_sai_balance.balance, expected_final_sai);
+}
+
+#[test]
+fn test_native_input_with_initial_cw20_requirement() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let user = &setup.env.user;
+    let admin = &setup.env.admin;
+    let bank = Bank::new(&setup.env.app);
+
+    // --- SCENARIO ---
+    // User sends Native SHROOM, but the first stage requires CW20 SHROOM.
+    // The contract must perform an initial conversion before the first swap.
+    // 1. Input: 1000 Native SHROOM
+    // 2. Reconciliation: Convert 1000 Native SHROOM -> 1000 CW20 SHROOM
+    // 3. Stage 1: 1000 CW20 SHROOM -> 100 CW20 SAI
+
+    // Asset definitions
+    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let cw20_shroom_info = external::AssetInfo::Token {
+        contract_addr: setup.shroom_cw20_addr.clone(),
+    };
+    let cw20_sai_info = external::AssetInfo::Token {
+        contract_addr: setup.sai_cw20_addr.clone(),
+    };
+
+    // First, we need to get some Native SHROOM to the user.
+    // Admin mints CW20 -> sends to Adapter -> Adapter sends Native SHROOM to Admin -> Admin sends to User.
+    let amount_to_test = Uint128::new(1_000_000_000); // 1,000 SHROOM
+    wasm.execute(
+        // Admin gets CW20
+        &setup.shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: admin.address(),
+            amount: amount_to_test,
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+    wasm.execute(
+        // Admin converts to Native
+        &setup.shroom_cw20_addr,
+        &cw20::Cw20ExecuteMsg::Send {
+            contract: setup.adapter_addr.clone(),
+            amount: amount_to_test,
+            msg: to_json_binary(&"{}").unwrap(),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+    bank.send(
+        // Admin sends Native to User
+        MsgSend {
+            from_address: admin.address(),
+            to_address: user.address(),
+            amount: vec![ProtoCoin {
+                denom: native_shroom_denom.clone(),
+                amount: amount_to_test.to_string(),
+            }],
+        },
+        &admin,
+    )
+    .unwrap();
+
+    // Stage 1: Requires CW20 SHROOM
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
+                offer_asset_info: cw20_shroom_info.clone(),
+                ask_asset_info: cw20_sai_info.clone(),
+            }),
+        }],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
+        stages: vec![stage1],
+    };
+
+    // Execute the transaction with native funds
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin {
+            denom: native_shroom_denom,
+            amount: amount_to_test,
+        }],
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- ASSERT FINAL BALANCE ---
+    // The user should have received the final CW20 SAI tokens.
+    let final_sai_balance: BalanceResponse = wasm
+        .query(
+            &setup.sai_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+
+    // Expected Output: 100 SAI (6 decimals)
+    let expected_final_sai = Uint128::new(100_000_000u128);
+    assert_eq!(final_sai_balance.balance, expected_final_sai);
+}
+
+#[test]
+fn test_zero_amount_from_split_is_handled_gracefully() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let user = &env.user;
+    let bank = Bank::new(&env.app);
+
+    // --- SCENARIO ---
+    // User sends a tiny amount (1 wei) that, when split, will result in at least one
+    // of the splits having an amount of 0. The contract must not panic and should
+    // proceed with only the non-zero splits.
+
+    // Stage 1: Split 1 wei of INJ 50/50 across two pools.
+    // - Split A (50%): 1 * 50 / 100 = 0. This split should be ignored or result in a no-op.
+    // - Split B (50%, remainder): 1 - 0 = 1. This split should proceed.
+    let stage1 = Stage {
+        splits: vec![
+            Split {
+                percent: 50,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.mock_amm_1_addr.clone(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+            Split {
+                percent: 50,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.mock_amm_2_addr.clone(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+        ],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![stage1],
+        minimum_receive: None, // We don't care about the output amount, only that it doesn't fail.
+    };
+
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Execute the transaction with 1 wei of INJ.
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[Coin::new(1u128, "inj")], user);
+    assert!(
+        res.is_ok(),
+        "Execution with a zero-amount split failed: {:?}",
+        res.unwrap_err()
+    );
+
+    // --- ASSERT FINAL BALANCE ---
+    // Due to the mock pool's decimal conversion (18 for INJ, 6 for USDT), swapping
+    // just 1 wei of INJ will result in 0 USDT. Therefore, the user's balance should not change.
+    let final_usdt_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_usdt_amount =
+        Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
+
+    assert_eq!(
+        final_usdt_amount, initial_usdt_amount,
+        "User's USDT balance should not change for a 1 wei swap"
+    );
+}
+
+#[test]
+fn test_stage_with_single_hundred_percent_split() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let user = &env.user;
+
+    // --- SCENARIO ---
+    // Stage 1: 100 INJ -> 1000 USDT (using a single 100% split)
+    // Stage 2: 1000 USDT -> 100 INJ (using a single 100% split)
+
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: env.mock_amm_1_addr.clone(),
+                ask_asset_info: external::AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+                offer_asset_info: external::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            }),
+        }],
+    };
+
+    let stage2 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                swap_contract: env.mock_ob_usdt_inj_addr.clone(),
+                ask_asset_info: external::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                offer_asset_info: external::AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+            }),
+        }],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![stage1, stage2],
+        minimum_receive: Some("99000000000000000000".to_string()), // Min 99 INJ
+    };
+
+    let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
+
+    // Execute the transaction
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[funds_to_send.clone()], user);
+    assert!(
+        res.is_ok(),
+        "Execution with single-split stage failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
+
+    let final_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // The final swap (1000 USDT -> INJ @ rate 0.1) should yield exactly 100 INJ.
+    let expected_final_amount = "100000000000000000000"; // 100 INJ with 18 decimals
+    assert_eq!(final_received_attr.value, expected_final_amount);
+}
+
+#[test]
+fn test_intermediate_swap_failure_reverts_transaction() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let user = &env.user;
+    let bank = Bank::new(&env.app);
+
+    // --- SCENARIO ---
+    // We create a route where an intermediate step is guaranteed to fail by using
+    // an invalid contract address. We then assert that the entire transaction
+    // is reverted and the user's initial funds are returned.
+
+    // Get the user's initial USDT balance to confirm the rollback.
+    let initial_funds = Coin::new(1_000_000_000u128, "usdt"); // 1,000 USDT
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Stage 1: A valid swap from USDT to INJ. This part will succeed internally.
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::OrderbookSwap(OrderbookSwapOp {
+                swap_contract: env.mock_ob_usdt_inj_addr.clone(),
+                ask_asset_info: external::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                offer_asset_info: external::AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+            }),
+        }],
+    };
+
+    // Stage 2: The resulting INJ is split, but one split is sent to a bad address.
+    let stage2 = Stage {
+        splits: vec![
+            Split {
+                // This split is valid.
+                percent: 50,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.mock_amm_1_addr.clone(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+            Split {
+                // THIS SPLIT IS INTENTIONALLY INVALID.
+                percent: 50,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: "inj1invalidcontractaddressxxxxxxxxxxxxxx".to_string(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+        ],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![stage1, stage2],
+        minimum_receive: None, // Not relevant, as the transaction should fail.
+    };
+
+    // Execute the transaction
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[initial_funds.clone()], user);
+
+    // --- ASSERT FAILURE AND ROLLBACK ---
+
+    // 1. Assert that the transaction failed.
+    assert!(
+        res.is_err(),
+        "Transaction should have failed due to an invalid contract address, but it succeeded"
+    );
+
+    // 2. Assert that the user's funds were returned.
+    let final_usdt_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_usdt_amount =
+        Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
+
+    assert_eq!(
+        final_usdt_amount, initial_usdt_amount,
+        "User's funds were not rolled back after a failed intermediate swap"
+    );
+}

@@ -1,4 +1,4 @@
-use crate::msg::{external, Route};
+use crate::msg::{external, PlannedSwap, Route};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -31,12 +31,7 @@ pub struct ReplyState {
     pub current_stage_index: u64,
     pub replies_expected: u64,
     pub accumulated_assets: Vec<external::Asset>,
-    pub ready_for_next_stage_amount: Uint128,
-
-    pub ready_assets_for_next_stage: Vec<(external::AssetInfo, Uint128)>,
-
-    // Stores the target asset type for the current batch of conversions.
-    // We assume all pending conversions in a single step are to the same target type.
+    pub pending_swaps: Vec<PlannedSwap>,
     pub conversion_target_asset: Option<external::AssetInfo>,
 }
 

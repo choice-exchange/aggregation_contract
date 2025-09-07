@@ -1,6 +1,6 @@
-use crate::msg::{external, Route};
+use crate::msg::{external, PlannedSwap, Route};
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std::{Addr, Uint128};
+use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub admin: Addr,
     pub cw20_adapter_address: Addr,
+    pub fee_collector: Addr,
 }
 
 #[cw_serde]
@@ -19,7 +20,7 @@ pub enum Awaiting {
 }
 
 pub const CONFIG: Item<Config> = Item::new("config");
-
+pub const FEE_MAP: Map<&Addr, Decimal> = Map::new("fee_map");
 pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
 
 #[cw_serde]
@@ -31,7 +32,8 @@ pub struct ReplyState {
     pub current_stage_index: u64,
     pub replies_expected: u64,
     pub accumulated_assets: Vec<external::Asset>,
-    pub ready_for_next_stage_amount: Uint128,
+    pub pending_swaps: Vec<PlannedSwap>,
+    pub conversion_target_asset: Option<external::AssetInfo>,
 }
 
 pub const REPLY_STATES: Map<u64, ReplyState> = Map::new("reply_states");

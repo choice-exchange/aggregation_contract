@@ -157,6 +157,18 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
+#[cw_serde] // Add this if you plan to store it in state
+pub struct PlannedSwap {
+    pub operation: Operation,
+    pub amount: Uint128,
+}
+
+// The complete plan for a stage, produced by the planner.
+pub struct StagePlan {
+    pub swaps_to_execute: Vec<PlannedSwap>,
+    pub conversions_needed: Vec<(external::Asset, external::AssetInfo)>,
+}
+
 #[cw_serde]
 pub enum Cw20HookMsg {
     AggregateSwaps {
@@ -169,6 +181,7 @@ pub enum Cw20HookMsg {
 pub struct InstantiateMsg {
     pub admin: String,
     pub cw20_adapter_address: String,
+    pub fee_collector_address: String,
 }
 
 #[cw_serde]
@@ -184,6 +197,18 @@ pub enum ExecuteMsg {
     },
     UpdateAdmin {
         new_admin: String,
+    },
+    SetFee {
+        pool_address: String,
+        fee_percent: Decimal,
+    },
+    /// Admin-only. Removes the fee configuration for a specific pool.
+    RemoveFee {
+        pool_address: String,
+    },
+    /// Admin-only. Updates the address where fees are sent.
+    UpdateFeeCollector {
+        new_fee_collector: String,
     },
 }
 

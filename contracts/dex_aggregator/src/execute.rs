@@ -1,6 +1,6 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, MessageInfo, Response, StdError, Uint128,
-    WasmMsg,
+    to_json_binary, Addr, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response, StdError,
+    Uint128, WasmMsg,
 };
 use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -10,7 +10,7 @@ use std::str::FromStr;
 use crate::error::ContractError;
 use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Route, Stage};
 use crate::reply::proceed_to_next_step;
-use crate::state::{Awaiting, ReplyState, REPLY_ID_COUNTER};
+use crate::state::{Awaiting, ReplyState, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
 
 pub fn execute_route(
     _deps: DepsMut<InjectiveQueryWrapper>,
@@ -25,13 +25,33 @@ pub fn execute_route(
 }
 
 pub fn update_admin(
-    _deps: DepsMut<InjectiveQueryWrapper>,
-    _info: MessageInfo,
-    _new_admin: String,
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    new_admin: String,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    // ... implementation logic ...
+    // Load the current config from storage.
+    let mut config = CONFIG.load(deps.storage)?;
 
-    Err(ContractError::Unauthorized {}) // Reverted to generic_err
+    // Check if the sender of the message is the current admin.
+    // If not, return an Unauthorized error.
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Validate that the `new_admin` string is a valid blockchain address.
+    // This will return an error if the address is malformed.
+    let new_admin_addr = deps.api.addr_validate(&new_admin)?;
+
+    // Update the admin field in the config struct.
+    config.admin = new_admin_addr.clone();
+
+    // Save the updated config back to storage.
+    CONFIG.save(deps.storage, &config)?;
+
+    // Return a success response with attributes indicating the action and the new admin.
+    Ok(Response::new()
+        .add_attribute("action", "update_admin")
+        .add_attribute("new_admin", new_admin_addr.to_string()))
 }
 
 pub fn execute_aggregate_swaps_internal(
@@ -176,4 +196,71 @@ pub fn create_swap_cosmos_msg(
     };
 
     Ok(cosmos_msg)
+}
+
+/// Admin-only. Sets or updates the fee for a given pool address.
+pub fn set_fee(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    pool_address: String,
+    fee_percent: Decimal,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    // Validate that the fee is reasonable (e.g., less than 100%)
+    if fee_percent >= Decimal::one() {
+        return Err(ContractError::Std(StdError::generic_err(
+            "Fee percentage must be less than 100%",
+        )));
+    }
+
+    let pool_addr = deps.api.addr_validate(&pool_address)?;
+    FEE_MAP.save(deps.storage, &pool_addr, &fee_percent)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "set_fee")
+        .add_attribute("pool_address", pool_addr)
+        .add_attribute("fee_percent", fee_percent.to_string()))
+}
+
+/// Admin-only. Removes the fee for a given pool address.
+pub fn remove_fee(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    pool_address: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let pool_addr = deps.api.addr_validate(&pool_address)?;
+    FEE_MAP.remove(deps.storage, &pool_addr);
+
+    Ok(Response::new()
+        .add_attribute("action", "remove_fee")
+        .add_attribute("pool_address", pool_addr))
+}
+
+/// Admin-only. Updates the fee collector address.
+pub fn update_fee_collector(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    new_fee_collector: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let mut config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let new_collector_addr = deps.api.addr_validate(&new_fee_collector)?;
+    config.fee_collector = new_collector_addr.clone();
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "update_fee_collector")
+        .add_attribute("new_fee_collector", new_collector_addr))
 }

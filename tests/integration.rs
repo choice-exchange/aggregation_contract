@@ -2,13 +2,14 @@
 
 use std::str::FromStr;
 
-use cosmwasm_std::{to_json_binary, Addr, Coin, Uint128};
+use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
     cw20_adapter, external, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
-    OrderbookSwapOp, Split, Stage,
+    OrderbookSwapOp, QueryMsg, Split, Stage,
 };
+use dex_aggregator::state::Config as AggregatorConfig;
 use injective_test_tube::{
     injective_std::types::cosmos::{
         bank::v1beta1::{MsgSend, QueryBalanceRequest},
@@ -32,6 +33,7 @@ pub struct TestEnv {
     pub app: InjectiveTestApp,
     pub admin: SigningAccount,
     pub user: SigningAccount,
+    pub fee_collector: SigningAccount,
     pub aggregator_addr: String,
     pub mock_amm_1_addr: String,
     pub mock_amm_2_addr: String,
@@ -62,6 +64,8 @@ fn setup() -> TestEnv {
             Coin::new(1_000_000_000_000u128, "usdt"),
         ])
         .unwrap();
+
+    let fee_collector_account = app.init_account(&[]).unwrap();
 
     let wasm = Wasm::new(&app);
 
@@ -108,6 +112,7 @@ fn setup() -> TestEnv {
             &InstantiateMsg {
                 admin: admin.address(),
                 cw20_adapter_address: adapter_addr,
+                fee_collector_address: fee_collector_account.address(),
             },
             Some(&admin.address()),
             Some("dex-aggregator"),
@@ -257,6 +262,7 @@ fn setup() -> TestEnv {
         app,
         admin: admin,
         user: user,
+        fee_collector: fee_collector_account,
         aggregator_addr,
         mock_amm_1_addr,
         mock_amm_2_addr,
@@ -529,6 +535,8 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             Coin::new(1_000_000_000_000u128, "usdt"),
         ])
         .unwrap();
+    let fee_collector_account = app.init_account(&[]).unwrap();
+
     let wasm = Wasm::new(&app);
 
     // 1. Store all contract codes
@@ -572,6 +580,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             &InstantiateMsg {
                 admin: admin.address(),
                 cw20_adapter_address: adapter_addr.clone(),
+                fee_collector_address: fee_collector_account.address(),
             },
             Some(&admin.address()),
             Some("aggregator"),
@@ -930,6 +939,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             app,
             admin,
             user,
+            fee_collector: fee_collector_account,
             aggregator_addr,
             mock_amm_1_addr: "".to_string(),
             mock_amm_2_addr: "".to_string(),
@@ -2295,5 +2305,735 @@ fn test_intermediate_swap_failure_reverts_transaction() {
     assert_eq!(
         final_usdt_amount, initial_usdt_amount,
         "User's funds were not rolled back after a failed intermediate swap"
+    );
+}
+
+#[test]
+fn test_fee_collection_on_single_swap() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let admin = &env.admin;
+    let user = &env.user;
+    let fee_collector = &env.fee_collector;
+
+    // --- 1. SETUP: Admin sets a 0.3% fee on the first mock AMM pool ---
+    let fee_pool_address = env.mock_amm_1_addr.clone();
+    let fee_percent = Decimal::from_str("0.003").unwrap(); // 0.3%
+
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: fee_pool_address.clone(),
+            fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 2. EXECUTION: User performs a swap through the taxed pool ---
+    // User sends 100 INJ. The pool rate is 10.0.
+    // Gross Output: 100 INJ * 10.0 = 1,000 USDT.
+    // Fee: 1,000 USDT * 0.3% = 3 USDT.
+    // Net Output to User: 1000 - 3 = 997 USDT.
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: fee_pool_address.clone(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            }],
+        }],
+        minimum_receive: Some("996000000".to_string()), // Min 996 USDT
+    };
+
+    let initial_collector_balance_res = bank
+        .query_balance(&QueryBalanceRequest {
+            address: fee_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    let initial_collector_amount = initial_collector_balance_res
+        .balance
+        .map(|c| Uint128::from_str(&c.amount).unwrap()) // If Some(coin), parse its amount
+        .unwrap_or_else(Uint128::zero); // If None, treat it as zero
+
+    assert_eq!(
+        initial_collector_amount,
+        Uint128::zero(),
+        "Fee collector should start with zero USDT"
+    );
+
+    // Execute the swap
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")], // 100 INJ
+        user,
+    );
+    assert!(
+        res.is_ok(),
+        "Swap execution with fee failed: {:?}",
+        res.unwrap_err()
+    );
+    let response = res.unwrap();
+
+    // --- 3. ASSERTIONS ---
+
+    // Assertion A: Check the event logs for the user's net amount
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
+
+    let final_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    let expected_net_output_to_user = Uint128::new(997_000_000u128); // 997 USDT (6 decimals)
+    assert_eq!(
+        final_received_attr.value,
+        expected_net_output_to_user.to_string()
+    );
+
+    // Assertion B: Check the fee event attribute
+    let fee_event = response
+        .events
+        .iter()
+        .find(|e| e.ty == "wasm" && e.attributes.iter().any(|a| a.key == "fee_collected"))
+        .expect("Did not find fee_collected event");
+
+    let fee_collected_attr = fee_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "fee_collected")
+        .unwrap();
+
+    let expected_fee = Uint128::new(3_000_000u128); // 3 USDT (6 decimals)
+    assert_eq!(fee_collected_attr.value, expected_fee.to_string());
+
+    // Assertion C: Check the fee collector's final bank balance
+    let final_collector_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: fee_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+
+    assert_eq!(final_collector_balance.amount, expected_fee.to_string());
+    assert_eq!(final_collector_balance.denom, "usdt");
+}
+
+#[test]
+fn test_fee_collection_on_cw20_output() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let admin = &setup.env.admin;
+    let user = &setup.env.user;
+    let fee_collector = &setup.env.fee_collector;
+
+    // --- 1. SETUP: Admin sets a 1.5% fee on the INJ -> CW20 SHROOM pool ---
+    let fee_pool_address = setup.mock_inj_to_cw20_shroom_amm.clone();
+    let fee_percent = Decimal::from_str("0.015").unwrap(); // 1.5%
+
+    wasm.execute(
+        &setup.env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: fee_pool_address.clone(),
+            fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 2. EXECUTION: User swaps 10 INJ, which should produce 1000 CW20 SHROOM ---
+    // Gross Output: 1000 SHROOM
+    // Fee: 1000 * 1.5% = 15 SHROOM
+    // Net Output to User: 1000 - 15 = 985 SHROOM
+
+    let stage1 = Stage {
+        splits: vec![Split {
+            percent: 100,
+            operation: Operation::AmmSwap(AmmSwapOp {
+                pool_address: fee_pool_address,
+                ask_asset_info: external::AssetInfo::Token {
+                    contract_addr: setup.shroom_cw20_addr.clone(),
+                },
+                offer_asset_info: external::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            }),
+        }],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![stage1],
+        minimum_receive: Some("984000000".to_string()), // Min 984 SHROOM
+    };
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")], // 10 INJ
+        user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+
+    // --- 3. ASSERTIONS ---
+
+    // Assertion A: Check the user's final CW20 balance
+    let user_balance: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    let expected_net_output = Uint128::new(985_000_000); // 985 SHROOM (6 decimals)
+    assert_eq!(user_balance.balance, expected_net_output);
+
+    // Assertion B: Check the fee collector's final CW20 balance
+    let collector_balance: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: fee_collector.address(),
+            },
+        )
+        .unwrap();
+    let expected_fee = Uint128::new(15_000_000); // 15 SHROOM (6 decimals)
+    assert_eq!(collector_balance.balance, expected_fee);
+}
+
+#[test]
+fn test_admin_functions_fail_for_unauthorized_user() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let unauthorized_user = &env.user; // Use the regular 'user' as the attacker
+
+    // --- SetFee ---
+    let res_set_fee = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: env.mock_amm_1_addr.clone(),
+            fee_percent: Decimal::from_str("0.01").unwrap(),
+        },
+        &[],
+        unauthorized_user,
+    );
+    assert!(
+        res_set_fee.is_err(),
+        "SetFee should fail for unauthorized user"
+    );
+    assert!(res_set_fee
+        .unwrap_err()
+        .to_string()
+        .contains("Unauthorized"));
+
+    // --- RemoveFee ---
+    let res_remove_fee = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::RemoveFee {
+            pool_address: env.mock_amm_1_addr.clone(),
+        },
+        &[],
+        unauthorized_user,
+    );
+    assert!(
+        res_remove_fee.is_err(),
+        "RemoveFee should fail for unauthorized user"
+    );
+    assert!(res_remove_fee
+        .unwrap_err()
+        .to_string()
+        .contains("Unauthorized"));
+
+    // --- UpdateFeeCollector ---
+    let res_update_collector = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::UpdateFeeCollector {
+            new_fee_collector: unauthorized_user.address(),
+        },
+        &[],
+        unauthorized_user,
+    );
+    assert!(
+        res_update_collector.is_err(),
+        "UpdateFeeCollector should fail for unauthorized user"
+    );
+    assert!(res_update_collector
+        .unwrap_err()
+        .to_string()
+        .contains("Unauthorized"));
+}
+
+#[test]
+fn test_full_admin_fee_lifecycle() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let admin = &env.admin;
+    let user = &env.user;
+    let original_collector = &env.fee_collector;
+
+    let fee_pool_address = env.mock_amm_1_addr.clone();
+    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+    let expected_fee = Uint128::new(10_000_000); // 10 USDT fee
+
+    // --- 1. Admin sets a fee ---
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: fee_pool_address.clone(),
+            fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 2. User swaps, fee goes to ORIGINAL collector ---
+    let swap_msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: fee_pool_address.clone(),
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            }],
+        }],
+        minimum_receive: None,
+    };
+    wasm.execute(
+        &env.aggregator_addr,
+        &swap_msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        user,
+    )
+    .unwrap();
+
+    // Assert fee was collected
+    let collector1_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: original_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    assert_eq!(collector1_balance.amount, expected_fee.to_string());
+
+    // --- 3. Admin REMOVES the fee ---
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::RemoveFee {
+            pool_address: fee_pool_address.clone(),
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 4. User swaps again, NO fee is collected ---
+    wasm.execute(
+        &env.aggregator_addr,
+        &swap_msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        user,
+    )
+    .unwrap();
+
+    // Assert balance of original collector has NOT changed
+    let collector1_balance_after_remove = bank
+        .query_balance(&QueryBalanceRequest {
+            address: original_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    assert_eq!(
+        collector1_balance_after_remove.amount,
+        expected_fee.to_string()
+    );
+
+    // --- 5. Admin sets fee again and UPDATES collector ---
+    let new_collector = env.app.init_account(&[]).unwrap();
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: fee_pool_address.clone(),
+            fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::UpdateFeeCollector {
+            new_fee_collector: new_collector.address(),
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 6. User swaps, fee goes to NEW collector ---
+    wasm.execute(
+        &env.aggregator_addr,
+        &swap_msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        user,
+    )
+    .unwrap();
+
+    // Assert new collector received the fee
+    let collector2_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: new_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    assert_eq!(collector2_balance.amount, expected_fee.to_string());
+
+    // Assert original collector's balance is still unchanged
+    let collector1_final_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: original_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    assert_eq!(collector1_final_balance.amount, expected_fee.to_string());
+}
+
+#[test]
+fn test_multi_split_with_mixed_fees() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let admin = &env.admin;
+    let user = &env.user;
+    let fee_collector = &env.fee_collector;
+
+    // --- 1. SETUP: Admin sets a 1% fee on AMM1, but NO fee on AMM2 ---
+    let taxed_pool = env.mock_amm_1_addr.clone();
+    let untaxed_pool = env.mock_amm_2_addr.clone();
+    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: taxed_pool.clone(),
+            fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 2. EXECUTION: User swaps through a stage with splits to both pools ---
+    let stage1 = Stage {
+        splits: vec![
+            Split {
+                // This split goes to the TAXED pool
+                percent: 40,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: taxed_pool,
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+            Split {
+                // This split goes to the UNTAXED pool
+                percent: 60,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: untaxed_pool,
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            },
+        ],
+    };
+
+    let msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![stage1],
+        minimum_receive: Some("1595000000".to_string()), // Min 1595 USDT
+    };
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")], // 100 INJ
+        user,
+    );
+    assert!(
+        res.is_ok(),
+        "Execution with mixed fees failed: {:?}",
+        res.unwrap_err()
+    );
+    let response = res.unwrap();
+
+    // --- 3. ASSERTIONS ---
+
+    // Assertion A: Check the user's final received amount
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
+
+    let final_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    let expected_net_output = Uint128::new(1596_000_000u128); // 396 + 1200 = 1596 USDT
+    assert_eq!(final_received_attr.value, expected_net_output.to_string());
+
+    // Assertion B: Check the fee collector's final balance
+    let collector_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: fee_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+
+    let expected_fee = Uint128::new(4_000_000u128); // 4 USDT fee from the 400 USDT gross output
+    assert_eq!(collector_balance.amount, expected_fee.to_string());
+}
+
+#[test]
+fn test_fee_truncates_to_zero() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let admin = &env.admin;
+    let user = &env.user;
+    let fee_collector = &env.fee_collector;
+
+    // --- 1. SETUP: Admin sets a tiny fee on a pool ---
+    let fee_pool_address = env.mock_amm_1_addr.clone();
+    // This fee is 0.0001%, which is 0.000001 as a decimal.
+    let tiny_fee_percent = Decimal::from_str("0.000001").unwrap();
+
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: fee_pool_address.clone(),
+            fee_percent: tiny_fee_percent,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // --- 2. EXECUTION: User swaps an amount that is small, but not dust. ---
+    // We send 10^16 wei INJ.
+    // Mock Pool Math: (10^16 * 10.0) * 10^6 / 10^18 = 10^17 * 10^-12 = 10^5 = 100,000 uusdt.
+    // Gross Output: 100,000 uusdt (or 0.1 USDT).
+    // Fee Calculation: 100,000 * 0.000001 = 0.1, which truncates to 0.
+    let input_amount = Uint128::new(10_000_000_000_000_000u128); // 10^16
+
+    let swap_msg = ExecuteMsg::AggregateSwaps {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                operation: Operation::AmmSwap(AmmSwapOp {
+                    pool_address: fee_pool_address,
+                    ask_asset_info: external::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    offer_asset_info: external::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                }),
+            }],
+        }],
+        minimum_receive: None,
+    };
+
+    // Execute the transaction
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &swap_msg,
+        &[Coin::new(input_amount.u128(), "inj")],
+        user,
+    );
+    assert!(
+        res.is_ok(),
+        "Execution with zero-fee truncation failed: {:?}",
+        res.unwrap_err()
+    );
+    let response = res.unwrap();
+
+    // --- 3. ASSERTIONS ---
+
+    // Assertion A: The user should receive the FULL gross amount.
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
+
+    let final_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    let expected_gross_output = Uint128::new(100_000u128);
+    assert_eq!(final_received_attr.value, expected_gross_output.to_string());
+
+    // Assertion B: The fee collector's balance should be zero.
+    let collector_balance_res = bank
+        .query_balance(&QueryBalanceRequest {
+            address: fee_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+
+    let collector_amount = collector_balance_res
+        .balance
+        .map(|c| Uint128::from_str(&c.amount).unwrap())
+        .unwrap_or_else(Uint128::zero);
+
+    assert_eq!(
+        collector_amount,
+        Uint128::zero(),
+        "Fee collector should have a zero balance"
+    );
+}
+
+#[test]
+fn test_update_admin_success_and_failure() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let admin = &env.admin;
+    let unauthorized_user = &env.user;
+
+    // --- 1. Initial State Check ---
+    // First, let's query the config to confirm the initial admin is correct.
+    let initial_config: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(initial_config.admin.to_string(), admin.address());
+
+    // --- 2. SUCCESS PATH: The current admin changes the admin ---
+    // Create a new, distinct account to be the new admin.
+    let new_admin_account = env.app.init_account(&[]).unwrap();
+
+    let res_success = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::UpdateAdmin {
+            new_admin: new_admin_account.address(),
+        },
+        &[],   // No funds needed
+        admin, // Executed by the current admin
+    );
+    assert!(
+        res_success.is_ok(),
+        "Admin update should succeed when called by the current admin. Error: {:?}",
+        res_success.unwrap_err()
+    );
+
+    // --- 3. Verify State Change ---
+    // Query the config again to ensure the admin was actually updated in the state.
+    let updated_config: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(
+        updated_config.admin.to_string(),
+        new_admin_account.address()
+    );
+    assert_ne!(updated_config.admin.to_string(), admin.address()); // Also check it's not the old admin
+
+    // --- 4. FAILURE PATH: An unauthorized user tries to change the admin ---
+    let res_fail = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::UpdateAdmin {
+            new_admin: unauthorized_user.address(), // The target doesn't matter, it should fail before this.
+        },
+        &[],
+        unauthorized_user, // Executed by a random user
+    );
+    assert!(
+        res_fail.is_err(),
+        "Admin update should fail when called by a non-admin user"
+    );
+
+    // Check that the error message is the one we expect.
+    let error = res_fail.unwrap_err();
+    assert!(
+        error.to_string().contains("Unauthorized"),
+        "Error message was not the expected 'Unauthorized'. Got: {}",
+        error
+    );
+
+    // --- 5. Verify No State Change After Failure ---
+    // Query the config one last time to ensure the failed transaction did not change the admin.
+    let final_config: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(
+        final_config.admin.to_string(),
+        new_admin_account.address(),
+        "Admin should not change after a failed update attempt"
     );
 }

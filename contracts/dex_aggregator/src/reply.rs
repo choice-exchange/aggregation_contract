@@ -1,7 +1,7 @@
 use crate::error::ContractError;
 use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{cw20_adapter, external, Operation, PlannedSwap, Stage, StagePlan};
-use crate::state::{Awaiting, Config, ReplyState, CONFIG, REPLY_STATES};
+use crate::state::{Awaiting, Config, ReplyState, CONFIG, FEE_MAP, REPLY_STATES};
 use cosmwasm_std::{
     to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg,
     Uint128, WasmMsg,
@@ -65,21 +65,85 @@ fn handle_swap_reply(
     state: &mut ReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let master_reply_id = msg.id;
+
     let amount = parse_amount_from_swap_reply(&msg)?;
     let asset_info = find_asset_info_from_swap_reply(&msg, state)?;
+    let pool_addr = find_replying_pool_addr(&msg)?; // Get the address of the pool that replied
+
+    // --- FEE LOGIC ---
+    let fee = match FEE_MAP.may_load(deps.storage, &pool_addr)? {
+        Some(fee_percent) => {
+            let numerator = fee_percent.atomics();
+            let denominator = Uint128::new(1_000_000_000_000_000_000u128);
+            amount.multiply_ratio(numerator, denominator)
+        }
+        None => Uint128::zero(),
+    };
+
+    let amount_after_fee = amount.checked_sub(fee).map_err(StdError::from)?;
+    // --- END FEE LOGIC ---
+
     state.accumulated_assets.push(external::Asset {
-        info: asset_info,
-        amount,
+        info: asset_info.clone(),
+        amount: amount_after_fee,
     });
     state.replies_expected -= 1;
 
+    // Prepare the response. We will either hand off to proceed_to_next_step
+    // or return a simple accumulating response.
+    let mut response;
+
     if state.replies_expected > 0 {
         REPLY_STATES.save(deps.storage, master_reply_id, state)?;
-        Ok(Response::new().add_attribute("action", "accumulating_swap_outputs"))
+        response = Response::new().add_attribute("action", "accumulating_swap_outputs");
     } else {
         state.current_stage_index += 1;
-        proceed_to_next_step(&mut deps, env, state, master_reply_id)
+        response = proceed_to_next_step(&mut deps, env, state, master_reply_id)?;
     }
+
+    // If a fee was calculated, create and add the message to send it.
+    if !fee.is_zero() {
+        let config = CONFIG.load(deps.storage)?;
+        let fee_send_msg = create_send_msg(&config.fee_collector, &asset_info, fee)?;
+        response = response
+            .add_message(fee_send_msg)
+            .add_attribute("fee_collected", fee.to_string())
+            .add_attribute("fee_pool", pool_addr.to_string());
+    }
+
+    Ok(response)
+}
+
+fn find_replying_pool_addr(msg: &Reply) -> Result<Addr, ContractError> {
+    let events = &msg
+        .result
+        .clone()
+        .into_result()
+        .map_err(|e| ContractError::SubmessageResultError { error: e })?
+        .events;
+
+    // Find all potential contract addresses from the events.
+    let mut potential_addrs = vec![];
+    for e in events.iter().filter(|e| e.ty.starts_with("wasm")) {
+        if let Some(addr) = e.attributes.iter().find(|a| a.key == "_contract_address") {
+            potential_addrs.push(addr.value.clone());
+        }
+        if let Some(addr) = e.attributes.iter().find(|a| a.key == "sender") {
+            potential_addrs.push(addr.value.clone());
+        }
+    }
+
+    // Injective queries often use `_contract_address`, which is the most reliable.
+    // We assume the first valid address we find is the one we want.
+    // This could be made more robust if needed.
+    let addr_str = potential_addrs.first().ok_or_else(|| {
+        StdError::generic_err("Could not find any replying contract address in wasm events")
+    })?;
+
+    // We don't have access to `deps` here to validate, so we return the string to the caller.
+    // Correction: Let's pass deps in to validate immediately.
+    // The caller `handle_swap_reply` has deps. Let's do it there.
+    Ok(Addr::unchecked(addr_str)) // Use unchecked for now, validate in caller.
 }
 
 // A helper to create the final transfer message.

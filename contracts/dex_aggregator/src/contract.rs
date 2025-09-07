@@ -4,7 +4,7 @@ use cosmwasm_std::{
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
-use crate::execute;
+use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
 use crate::msg::{external, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{Config, CONFIG};
 use cw20::Cw20ReceiveMsg;
@@ -23,11 +23,13 @@ pub fn instantiate(
 
     let admin_addr = deps.api.addr_validate(&msg.admin)?;
     let adapter_addr = deps.api.addr_validate(&msg.cw20_adapter_address)?;
+    let fee_collector_addr = deps.api.addr_validate(&msg.fee_collector_address)?;
 
     // Save the full config
     let config = Config {
         admin: admin_addr,
         cw20_adapter_address: adapter_addr,
+        fee_collector: fee_collector_addr,
     };
     CONFIG.save(deps.storage, &config)?;
 
@@ -113,6 +115,14 @@ pub fn execute(
         } => crate::execute::execute_route(deps, env, info, route, minimum_receive),
         ExecuteMsg::UpdateAdmin { new_admin } => {
             crate::execute::update_admin(deps, info, new_admin)
+        }
+        ExecuteMsg::SetFee {
+            pool_address,
+            fee_percent,
+        } => set_fee(deps, info, pool_address, fee_percent),
+        ExecuteMsg::RemoveFee { pool_address } => remove_fee(deps, info, pool_address),
+        ExecuteMsg::UpdateFeeCollector { new_fee_collector } => {
+            update_fee_collector(deps, info, new_fee_collector)
         }
     }
 }

@@ -148,7 +148,7 @@ pub enum Operation {
 
 #[cw_serde]
 pub struct Split {
-    pub operation: Operation,
+    pub path: Vec<Operation>,
     pub percent: u8,
 }
 

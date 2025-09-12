@@ -1,3 +1,5 @@
+# Choice Aggregation Contract
+
 ## Getting Started
 
 ### Prerequisites
@@ -104,57 +106,59 @@ AGGREGATION_CONTRACT/
 
 ## Core Functionality: `AggregateSwaps`
 
-The `AggregateSwaps` message is the primary entry point for executing complex, multi-step trading routes. It is designed to be highly flexible, allowing users to split funds across different decentralized exchanges (DEXs), chain swaps together in sequence, and seamlessly handle conversions between native and CW20 token types.
+The `AggregateSwaps` message is the primary entry point for executing complex trading routes. It is designed to be highly flexible, allowing users to define routes as a **Directed Acyclic Graph (DAG)** of swaps. This enables parallel, multi-hop paths that can utilize different intermediate assets, all within a single transaction.
 
 ### Execution Flow
 
 When the contract receives an `AggregateSwaps` message, it performs the following steps:
 
-1.  **Takes Custody:** The user sends their initial funds (either a native token or a CW20 token via a `Send` message) along with the `AggregateSwaps` instructions. The aggregator contract takes custody of these initial funds.
+1.  **Takes Custody:** The user sends their initial funds (either a native token or a CW20 token via a `Receive` message) along with the `AggregateSwaps` instructions. The aggregator contract takes custody of these initial funds.
 
-2.  **Processes Stage by Stage:** The contract processes the route one `Stage` at a time.
-    *   For the current stage, it divides the input funds according to the `percent` specified in each `Split`.
-    *   It then executes the `Operation` (e.g., an AMM swap) for each split in parallel as submessages.
+2.  **Processes Stage by Stage:** The contract processes the route one `Stage` at a time. A stage represents a synchronization point where all parallel paths must complete before the next stage begins.
 
-3.  **Accumulates and Normalizes:** The contract's `reply` handler waits for all splits in a stage to complete.
-    *   It accumulates the outputs from all the swaps.
-    *   **Asset Normalization (Key Feature):** Before proceeding, it checks if the accumulated assets match the required input for the *next* stage. If there is a mismatch (e.g., it holds a mix of native and CW20 tokens, but the next stage requires only the CW20 version), it will automatically call the `cw20_adapter` contract to convert the assets into the required type.
+3.  **Executes Parallel Paths:** Within each stage, the contract divides the input funds according to the `percent` specified in each `Split`. Each `Split` defines a `Path` of one or more sequential swap `Operation`s.
+    *   The contract begins executing the first operation of each `Path` in parallel.
+    *   The `reply` handler receives the output of an operation and seamlessly dispatches the *next* operation in that specific `Path`, using the output of the previous step as the new input.
 
-4.  **Repeats or Completes:**
-    *   If there is another stage, it uses the now-unified assets as input and repeats step 2.
+4.  **Accumulates and Normalizes:**
+    *   **Mid-Path Conversion (Key Feature):** If the output of one hop in a path (e.g., `CW20 SHROOM`) does not match the required input for the next hop (e.g., `Native SHROOM`), the contract will automatically pause that path, perform the necessary conversion via the `cw20_adapter`, and then resume the path with the correctly-formed asset.
+    *   **End-of-Stage Normalization:** When all parallel paths in a stage are complete, the contract accumulates all the final outputs. Before proceeding to the next stage, it plans and executes the minimum set of conversions required to satisfy the input requirements of all splits in the upcoming stage.
+
+5.  **Repeats or Completes:**
+    *   If there is another stage, it uses the now-normalized assets as input and repeats step 3.
     *   If it was the final stage, it proceeds to the final payout.
 
-5.  **Final Payout and Safety Check:** After the final stage (and any final normalizations) are complete, the contract performs its most critical safety check.
-    *   It verifies that the total amount of the final asset it holds in custody is greater than or equal to the user's specified `minimum_receive`.
+6.  **Final Payout and Safety Check:** After the final stage (and any final normalizations) are complete, the contract performs its most critical safety check.
+    *   It verifies that the total amount of the final asset it holds is greater than or equal to the user's specified `minimum_receive`.
     *   If the check passes, it sends the full balance of the final asset to the user.
     *   If the check fails, the entire transaction is reverted, and the user gets their initial funds back.
 
 ### Message Structure
 
-The `AggregateSwaps` message is composed of several nested structs that define the route.
+The `AggregateSwaps` message is composed of several nested structs that define the route graph.
 
 ```rust
 pub struct ExecuteMsg::AggregateSwaps {
-    /// A vector of `Stage`s, executed sequentially.
+    /// A vector of `Stage`s, executed sequentially. Each stage is a synchronization barrier.
     pub stages: Vec<Stage>,
 
     /// The minimum amount of the *final* output token the user is willing to receive.
-    /// Acts as a final, global safety check for the entire route. If the final balance
-    /// held by the contract is less than this, the transaction reverts.
+    /// If the final balance held by the contract is less than this, the transaction reverts.
     pub minimum_receive: Option<String>,
 }
 
 pub struct Stage {
-    /// A vector of `Split`s, executed in parallel within the stage.
+    /// A vector of `Split`s, whose paths are executed in parallel.
     pub splits: Vec<Split>,
 }
 
 pub struct Split {
-    /// The percentage of the stage's input funds to allocate to this operation.
+    /// The percentage of the stage's input funds to allocate to this path.
     /// All percentages in a stage must sum to 100.
     pub percent: u8,
-    /// The specific swap operation to perform.
-    pub operation: Operation,
+    
+    /// A `Path` is a vector of `Operation`s, representing a sequence of multi-hop swaps.
+    pub path: Vec<Operation>,
 }
 
 pub enum Operation {
@@ -163,45 +167,75 @@ pub enum Operation {
     /// A swap on an orderbook-style DEX.
     OrderbookSwap(OrderbookSwapOp),
 }
+
+// These structs define the specific details for each operation type.
+pub struct AmmSwapOp {
+    pub pool_address: String,
+    pub offer_asset_info: external::AssetInfo,
+    pub ask_asset_info: external::AssetInfo,
+}
+
+pub struct OrderbookSwapOp {
+    pub swap_contract: String,
+    pub offer_asset_info: external::AssetInfo,
+    pub ask_asset_info: external::AssetInfo,
+}
 ```
 
 ### Example Usage
 
-Here is an example of a complex, three-stage route that swaps USDT for a mix of native and CW20 SHROOM, which are then automatically normalized and sent to the user.
+Here is an example of a complex route that showcases the multi-hop `Path` functionality.
 
-**Route:**
-1.  **Stage 1:** Swap 1,000 USDT for INJ.
-2.  **Stage 2:** Split the resulting INJ, sending 10% to an AMM to get CW20 SHROOM and 90% to an Orderbook to get Native SHROOM.
-3.  **Final Payout:** The contract automatically converts the Native SHROOM to CW20 SHROOM and sends the total unified SHROOM balance to the user.
+**Route:** Start with `INJ`. Split the funds 50/50 into two parallel, multi-hop paths that use different intermediate assets (`USDT` and `AUSD`) but both end up with `SHROOM`.
 
-```rust
-let msg = ExecuteMsg::AggregateSwaps {
-    stages: vec![
-        // Stage 1: 100% of USDT to the Orderbook to get INJ.
-        Stage {
-            splits: vec![Split {
-                percent: 100,
-                operation: Operation::OrderbookSwap(/* ... */),
-            }],
-        },
-        // Stage 2: The resulting INJ is split 10/90 to get a mix of SHROOM types.
-        Stage {
-            splits: vec![
-                Split {
-                    percent: 10, // 10% to CW20 SHROOM
-                    operation: Operation::AmmSwap(/* ... */),
-                },
-                Split {
-                    percent: 90, // 90% to Native SHROOM
-                    operation: Operation::OrderbookSwap(/* ... */),
-                },
-            ],
-        },
+```json
+{
+  "aggregate_swaps": {
+    "stages": [
+      {
+        "splits": [
+          {
+            "percent": 50,
+            "path": [
+              {
+                "amm_swap": {
+                  "pool_address": "inj1...",
+                  "offer_asset_info": { "native_token": { "denom": "inj" } },
+                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
+                }
+              },
+              {
+                "orderbook_swap": {
+                  "swap_contract": "inj1...",
+                  "offer_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
+                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } }
+                }
+              }
+            ]
+          },
+          {
+            "percent": 50,
+            "path": [
+              {
+                "amm_swap": {
+                  "pool_address": "inj1...",
+                  "offer_asset_info": { "native_token": { "denom": "inj" } },
+                  "ask_asset_info": { "native_token": { "denom": "peggy0x...ausd" } }
+                }
+              },
+              {
+                "amm_swap": {
+                  "pool_address": "inj1...",
+                  "offer_asset_info": { "native_token": { "denom": "peggy0x...ausd" } },
+                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } }
+                }
+              }
+            ]
+          }
+        ]
+      }
     ],
-    // The final expected output is unified CW20 SHROOM.
-    minimum_receive: Some("9900000000".to_string()), // Min 9,900 CW20 SHROOM
-};
-
-// This message would be sent to the aggregator contract with 1,000 USDT.
-wasm.execute(&aggregator_addr, &msg, &[Coin::new(1_000_000_000, "usdt")], &user);
+    "minimum_receive": "123000000"
+  }
+}
 ```

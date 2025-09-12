@@ -94,6 +94,7 @@ pub fn execute_aggregate_swaps_internal(
         accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
         conversion_target_asset: None,
+        pending_path_op: None,
     };
 
     proceed_to_next_step(&mut deps, env, &mut initial_state, reply_id)

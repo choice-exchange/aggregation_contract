@@ -74,8 +74,6 @@ fn handle_swap_reply(
         .map_err(|e| ContractError::SubmessageResultError { error: e })?
         .events;
 
-    // --- THIS IS THE NEW, ROBUST LOGIC ---
-
     // Find the specific DEX event. This is our source of truth for the amount.
     let swap_event_opt = events.iter().rev().find(|e| {
         e.ty.starts_with("wasm")
@@ -86,7 +84,6 @@ fn handle_swap_reply(
     // If there is no swap event, we assume the output was zero.
     // In this case, the path cannot continue, so we treat it as "complete" with a zero value.
     if swap_event_opt.is_none() {
-        // We still need to decrement replies_expected to know when the STAGE is done.
         state.replies_expected -= 1;
 
         let response = if state.replies_expected > 0 {
@@ -100,10 +97,8 @@ fn handle_swap_reply(
         };
         return Ok(response);
     }
-    // --- END OF THE NEW LOGIC BLOCK ---
 
-    // If we get here, a swap_event was found, so we can proceed with the original logic.
-    let swap_event = swap_event_opt.unwrap(); // Safe to unwrap now
+    let swap_event = swap_event_opt.unwrap();
 
     // Get the address of the contract that emitted this specific event.
     let replying_pool_addr_str = swap_event
@@ -145,7 +140,6 @@ fn handle_swap_reply(
     let replied_path = &current_stage.splits[split_index].path;
 
     if let Some(next_op) = replied_path.get(op_index + 1) {
-        // --- This entire block for handling the next hop in a path is unchanged ---
         let required_input_info = get_operation_input(next_op)?;
         let offer_asset_for_next_op = external::Asset {
             info: received_asset_info,
@@ -180,7 +174,6 @@ fn handle_swap_reply(
             .add_attribute("split_index", split_index.to_string())
             .add_attribute("op_index", (op_index + 1).to_string()))
     } else {
-        // --- This block for handling the final step of a path is unchanged ---
         let fee = match FEE_MAP.may_load(deps.storage, &replying_pool_addr)? {
             Some(fee_percent) => {
                 let numerator = fee_percent.atomics();
@@ -296,9 +289,6 @@ fn handle_final_stage(
         // SCENARIO B: Conversions are needed. Set up the state for the final reply.
         state.awaiting = Awaiting::FinalConversions;
         state.replies_expected = conversion_submsgs.len() as u64;
-
-        // CRITICAL: The `accumulated_assets` now stores our in-progress total.
-        // It contains a single entry representing the assets that are already the target type.
         state.accumulated_assets = vec![external::Asset {
             info: target_asset_info,
             amount: ready_amount,
@@ -361,8 +351,6 @@ fn handle_conversion_reply(
     state: &mut ReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let master_reply_id = msg.id;
-    // Note: for this new architecture, we don't need to accumulate converted assets.
-    // The planner has already accounted for them. We just need to wait for all conversions to finish.
     state.replies_expected -= 1;
 
     if state.replies_expected > 0 {
@@ -370,7 +358,6 @@ fn handle_conversion_reply(
         return Ok(Response::new().add_attribute("action", "accumulating_conversion_outputs"));
     }
 
-    // All conversions are done. Take the saved plan and execute it.
     let swaps_to_execute = std::mem::take(&mut state.pending_swaps);
     execute_planned_swaps(&mut deps, env, state, master_reply_id, swaps_to_execute)
 }
@@ -444,13 +431,10 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
                 .map(|attr| attr.value.clone())
         });
 
-    // --- THIS IS THE FIX ---
     match amount_str_opt {
-        // If we found the attribute, parse it as before.
         Some(amount_str) => amount_str
             .parse::<Uint128>()
             .map_err(|_| ContractError::MalformedAmountInReply { value: amount_str }),
-        // If we did NOT find the attribute, it means the return was 0. Return Ok(0).
         None => Ok(Uint128::zero()),
     }
 }
@@ -562,10 +546,8 @@ fn plan_next_stage(
     }
 
     let mut conversions_needed: Vec<(external::Asset, external::AssetInfo)> = vec![];
-    // --- FIX #1 START: CORRECT CONVERSION PLANNING ---
     if native_have > total_native_needs {
         if let Some(target_info) = &cw20_info {
-            // Find the info for the asset we ACTUALLY HAVE, not from the next stage's needs.
             let native_asset_to_convert_info = accumulated_assets
                 .iter()
                 .find(|a| matches!(a.info, external::AssetInfo::NativeToken { .. }))
@@ -587,7 +569,6 @@ fn plan_next_stage(
     }
     if cw20_have > total_cw20_needs {
         if let Some(target_info) = &native_info {
-            // Find the info for the asset we ACTUALLY HAVE.
             let cw20_asset_to_convert_info = accumulated_assets
                 .iter()
                 .find(|a| matches!(a.info, external::AssetInfo::Token { .. }))
@@ -607,7 +588,6 @@ fn plan_next_stage(
             ));
         }
     }
-    // --- FIX #1 END ---
 
     let mut swaps_to_execute: Vec<PlannedSwap> = vec![];
     let mut native_allocated = Uint128::zero();
@@ -651,7 +631,7 @@ fn execute_planned_swaps(
     env: Env,
     state: &mut ReplyState,
     reply_id: u64,
-    swaps: Vec<PlannedSwap>, // Takes the concrete plan
+    swaps: Vec<PlannedSwap>,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let mut submessages = vec![];
 
@@ -667,7 +647,6 @@ fn execute_planned_swaps(
     // We need to handle this case by proceeding directly to the next step.
     if submessages.is_empty() {
         state.current_stage_index += 1;
-        // We pass `deps` by mutable reference.
         return proceed_to_next_step(deps, env, state, reply_id);
     }
 

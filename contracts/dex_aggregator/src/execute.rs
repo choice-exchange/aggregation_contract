@@ -29,26 +29,18 @@ pub fn update_admin(
     info: MessageInfo,
     new_admin: String,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    // Load the current config from storage.
     let mut config = CONFIG.load(deps.storage)?;
 
-    // Check if the sender of the message is the current admin.
-    // If not, return an Unauthorized error.
     if info.sender != config.admin {
         return Err(ContractError::Unauthorized {});
     }
 
-    // Validate that the `new_admin` string is a valid blockchain address.
-    // This will return an error if the address is malformed.
     let new_admin_addr = deps.api.addr_validate(&new_admin)?;
 
-    // Update the admin field in the config struct.
     config.admin = new_admin_addr.clone();
 
-    // Save the updated config back to storage.
     CONFIG.save(deps.storage, &config)?;
 
-    // Return a success response with attributes indicating the action and the new admin.
     Ok(Response::new()
         .add_attribute("action", "update_admin")
         .add_attribute("new_admin", new_admin_addr.to_string()))
@@ -101,7 +93,7 @@ pub fn execute_aggregate_swaps_internal(
 }
 
 pub fn create_swap_cosmos_msg(
-    deps: &mut DepsMut<InjectiveQueryWrapper>, // Changed to mutable reference
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
     operation: &Operation,
     offer_asset_info: &external::AssetInfo,
     amount: Uint128,

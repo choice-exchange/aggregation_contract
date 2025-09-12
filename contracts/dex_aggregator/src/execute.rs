@@ -8,21 +8,9 @@ use injective_math::FPDecimal;
 use std::str::FromStr;
 
 use crate::error::ContractError;
-use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Route, Stage};
+use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Stage};
 use crate::reply::proceed_to_next_step;
 use crate::state::{Awaiting, ReplyState, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
-
-pub fn execute_route(
-    _deps: DepsMut<InjectiveQueryWrapper>,
-    _env: Env,
-    _info: MessageInfo,
-    _route: Route,
-    _minimum_receive: Option<Uint128>,
-) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    // ... implementation logic ...
-
-    Err(ContractError::Std(StdError::generic_err("Not implemented"))) // Reverted to generic_err
-}
 
 pub fn update_admin(
     deps: DepsMut<InjectiveQueryWrapper>,

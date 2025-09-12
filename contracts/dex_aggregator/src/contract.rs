@@ -109,10 +109,6 @@ pub fn execute(
                     .add_attribute("info", "cw20_received_for_normalization"))
             }
         }
-        ExecuteMsg::ExecuteRoute {
-            route,
-            minimum_receive,
-        } => crate::execute::execute_route(deps, env, info, route, minimum_receive),
         ExecuteMsg::UpdateAdmin { new_admin } => {
             crate::execute::update_admin(deps, info, new_admin)
         }
@@ -130,8 +126,8 @@ pub fn execute(
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
-        QueryMsg::SimulateRoute { route, amount_in } => {
-            crate::query::simulate_route(deps, env, route, amount_in)
+        QueryMsg::SimulateRoute { stages, amount_in } => {
+            crate::query::simulate_route(deps, env, stages, amount_in)
         }
         QueryMsg::Config {} => crate::query::query_config(deps),
     }

@@ -1,92 +1,101 @@
-use crate::msg::{external, orderbook, ActionDescription, Route, SimulateRouteResponse, Step};
+use crate::msg::{external, orderbook, Operation, SimulateRouteResponse, Stage};
 use crate::state::Config;
 use cosmwasm_std::{
-    to_json_binary, Binary, Coin, Deps, Env, QuerierWrapper, StdResult, Uint128, WasmQuery,
+    to_json_binary, Binary, Coin, Deps, Env, QuerierWrapper, StdError, StdResult, Uint128,
+    WasmQuery,
 };
-use std::collections::{HashMap, HashSet};
 
-// The main entry point for the query
-pub fn simulate_route(deps: Deps, _env: Env, route: Route, amount_in: Coin) -> StdResult<Binary> {
-    if route.steps.is_empty() {
+pub fn query_config(deps: Deps) -> StdResult<Binary> {
+    let config: Config = crate::state::CONFIG.load(deps.storage)?;
+    to_json_binary(&config)
+}
+
+pub fn simulate_route(
+    deps: Deps,
+    _env: Env,
+    stages: Vec<Stage>,
+    amount_in: Coin,
+) -> StdResult<Binary> {
+    if stages.is_empty() {
         return to_json_binary(&SimulateRouteResponse {
             output_amount: Uint128::zero(),
         });
     }
 
-    let mut step_outputs: HashMap<usize, Uint128> = HashMap::new();
+    let mut current_assets: Vec<external::Asset> = vec![external::Asset {
+        info: external::AssetInfo::NativeToken {
+            denom: amount_in.denom,
+        },
+        amount: amount_in.amount,
+    }];
 
-    let all_indices: HashSet<usize> = (0..route.steps.len()).collect();
-    let destination_indices: HashSet<usize> = route
-        .steps
-        .iter()
-        .flat_map(|step| step.next_steps.iter().cloned())
-        .collect();
-    let root_node_indices: Vec<usize> = all_indices
-        .difference(&destination_indices)
-        .cloned()
-        .collect();
+    for stage in stages {
+        let mut next_stage_outputs: Vec<external::Asset> = vec![];
 
-    if root_node_indices.is_empty() {
-        return Err(cosmwasm_std::StdError::generic_err(
-            "Route has a cycle or is invalid; no root nodes found",
-        ));
-    }
-
-    let mut to_process: Vec<usize> = root_node_indices;
-
-    'main_loop: while let Some(step_index) = to_process.pop() {
-        if step_outputs.contains_key(&step_index) {
-            continue;
-        }
-
-        let step = &route.steps[step_index];
-
-        let current_input_amount = if destination_indices.contains(&step_index) {
-            let mut total_input = Uint128::zero();
-            for (parent_index, parent_step) in route.steps.iter().enumerate() {
-                if parent_step.next_steps.contains(&step_index) {
-                    if let Some(parent_output) = step_outputs.get(&parent_index) {
-                        total_input += parent_output
-                            .multiply_ratio(step.amount_in_percentage as u128, 100u128);
-                    } else {
-                        to_process.push(step_index);
-                        to_process.push(parent_index);
-                        continue 'main_loop;
-                    }
-                }
-            }
-            total_input
-        } else {
-            amount_in
-                .amount
-                .multiply_ratio(step.amount_in_percentage as u128, 100u128)
-        };
-
-        let current_step_output_amount =
-            simulate_single_step(&deps.querier, step, current_input_amount)?;
-
-        step_outputs.insert(step_index, current_step_output_amount);
-
-        for &next_step_index in &step.next_steps {
-            if !step_outputs.contains_key(&next_step_index) {
-                to_process.push(next_step_index);
-            }
-        }
-    }
-
-    let mut total_output = Uint128::zero();
-    for (i, step) in route.steps.iter().enumerate() {
-        if step.next_steps.is_empty() {
-            if let Some(output) = step_outputs.get(&i) {
-                total_output += output;
+        // Group the current assets by their type to get the total for each pile.
+        let mut grouped_inputs: Vec<(external::AssetInfo, Uint128)> = vec![];
+        for asset in current_assets {
+            if let Some((_, amount)) = grouped_inputs
+                .iter_mut()
+                .find(|(info, _)| *info == asset.info)
+            {
+                *amount += asset.amount;
             } else {
-                return Err(cosmwasm_std::StdError::generic_err(format!(
-                    "Could not calculate output for leaf node {}",
-                    i
-                )));
+                grouped_inputs.push((asset.info, asset.amount));
             }
         }
+
+        let mut amounts_allocated: Vec<(external::AssetInfo, Uint128)> = vec![];
+
+        for (i, split) in stage.splits.iter().enumerate() {
+            let path_input_info = get_path_start_info(&split.path)?;
+
+            let total_amount_for_type = grouped_inputs
+                .iter()
+                .find(|(info, _)| *info == path_input_info)
+                .map(|(_, amount)| *amount)
+                .unwrap_or_else(Uint128::zero);
+
+            let amount_for_split = if i < stage.splits.len() - 1 {
+                total_amount_for_type.multiply_ratio(split.percent as u128, 100u128)
+            } else {
+                let already_allocated = amounts_allocated
+                    .iter()
+                    .find(|(info, _)| *info == path_input_info)
+                    .map(|(_, amount)| *amount)
+                    .unwrap_or_else(Uint128::zero);
+                total_amount_for_type
+                    .checked_sub(already_allocated)
+                    .map_err(StdError::from)?
+            };
+
+            if let Some((_, allocated)) = amounts_allocated
+                .iter_mut()
+                .find(|(info, _)| *info == path_input_info)
+            {
+                *allocated += amount_for_split;
+            } else {
+                amounts_allocated.push((path_input_info.clone(), amount_for_split));
+            }
+
+            let mut current_path_asset = external::Asset {
+                info: path_input_info,
+                amount: amount_for_split,
+            };
+
+            for operation in &split.path {
+                let output_asset =
+                    simulate_single_operation(&deps.querier, operation, &current_path_asset)?;
+                current_path_asset = output_asset;
+            }
+
+            next_stage_outputs.push(current_path_asset);
+        }
+
+        current_assets = next_stage_outputs;
     }
+
+    let total_output: Uint128 = current_assets.iter().map(|a| a.amount).sum();
 
     let response = SimulateRouteResponse {
         output_amount: total_output,
@@ -94,86 +103,101 @@ pub fn simulate_route(deps: Deps, _env: Env, route: Route, amount_in: Coin) -> S
     to_json_binary(&response)
 }
 
-fn simulate_single_step(
+/// Simulates a single swap operation.
+fn simulate_single_operation(
     querier: &QuerierWrapper,
-    step: &Step,
-    input_amount: Uint128,
-) -> StdResult<Uint128> {
-    match &step.description {
-        ActionDescription::AmmSwap {
-            protocol: _,
-            offer_asset_info,
-            .. // ask_asset_info is not needed for the simulation query
-        } => {
-            let offer_asset = external::Asset {
-                info: offer_asset_info.clone(),
-                amount: input_amount,
+    operation: &Operation,
+    offer_asset: &external::Asset,
+) -> StdResult<external::Asset> {
+    match operation {
+        Operation::AmmSwap(op) => {
+            let pair_query = external::QueryMsg::Simulation {
+                offer_asset: offer_asset.clone(),
             };
+            let contract_addr = op.pool_address.to_string();
 
-            let pair_query = external::QueryMsg::Simulation { offer_asset };
-
-            let sim_response: external::SimulationResponse =
-                querier.query(&WasmQuery::Smart {
-                    contract_addr: step.protocol_address.to_string(),
+            let sim_response: external::SimulationResponse = querier.query(
+                &WasmQuery::Smart {
+                    contract_addr,
                     msg: to_json_binary(&pair_query)?,
-                }.into())?;
+                }
+                .into(),
+            )?;
 
-            Ok(sim_response.return_amount)
+            Ok(external::Asset {
+                info: op.ask_asset_info.clone(),
+                amount: sim_response.return_amount,
+            })
         }
-        ActionDescription::OrderbookSwap {
-            source_denom,
-            target_denom,
-        } => {
-            // This part of the logic was already direct and remains unchanged.
-            let orderbook_query = orderbook::QueryMsg::GetOutputQuantity {
-                from_quantity: input_amount.into(),
-                source_denom: source_denom.clone(),
-                target_denom: target_denom.clone(),
+        Operation::OrderbookSwap(op) => {
+            let source_denom = match &offer_asset.info {
+                external::AssetInfo::NativeToken { denom } => denom.clone(),
+                _ => {
+                    return Err(StdError::generic_err(
+                        "Orderbook simulation only supports native token inputs",
+                    ))
+                }
+            };
+            let target_denom = match &op.ask_asset_info {
+                external::AssetInfo::NativeToken { denom } => denom.clone(),
+                _ => {
+                    return Err(StdError::generic_err(
+                        "Orderbook simulation only supports native token outputs",
+                    ))
+                }
             };
 
-            let sim_response: orderbook::SwapEstimationResult =
-                querier.query(&WasmQuery::Smart {
-                    contract_addr: step.protocol_address.to_string(),
-                    msg: to_json_binary(&orderbook_query)?,
-                }.into())?;
+            let orderbook_query = orderbook::QueryMsg::GetOutputQuantity {
+                from_quantity: offer_asset.amount.into(),
+                source_denom,
+                target_denom,
+            };
+            let contract_addr = op.swap_contract.to_string();
 
-            Ok(sim_response.result_quantity.into())
+            let sim_response: orderbook::SwapEstimationResult = querier.query(
+                &WasmQuery::Smart {
+                    contract_addr,
+                    msg: to_json_binary(&orderbook_query)?,
+                }
+                .into(),
+            )?;
+
+            Ok(external::Asset {
+                info: op.ask_asset_info.clone(),
+                amount: sim_response.result_quantity.into(),
+            })
         }
     }
 }
 
-pub fn query_config(deps: Deps) -> StdResult<Binary> {
-    let config: Config = crate::state::CONFIG.load(deps.storage)?;
-    to_json_binary(&config)
+fn get_path_start_info(path: &[Operation]) -> StdResult<external::AssetInfo> {
+    let first_op = path
+        .first()
+        .ok_or_else(|| StdError::generic_err("Path cannot be empty"))?;
+    Ok(match first_op {
+        Operation::AmmSwap(op) => op.offer_asset_info.clone(),
+        Operation::OrderbookSwap(op) => op.offer_asset_info.clone(),
+    })
 }
-
-// --- UNIT TEST FOR simulate_route ---
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Import the new pair module for testing
-    use crate::msg::external;
-    use crate::msg::{ActionDescription, AmmProtocol, Step};
+    use crate::msg::{AmmSwapOp, Split, Stage};
     use cosmwasm_std::testing::{mock_dependencies, mock_env, MockQuerier};
-    use cosmwasm_std::{from_json, Addr, ContractResult, SystemResult};
+    use cosmwasm_std::{from_json, ContractResult, SystemResult};
     use external::AssetInfo;
 
-    // Renaming for clarity: these are now PAIR contracts, not routers.
-    const FAKE_PAIR_CONTRACT_A: &str = "inj1pair_a";
-    const FAKE_PAIR_CONTRACT_B: &str = "inj1pair_b";
-    const FAKE_ORDERBOOK: &str = "inj1orderbook";
-    const FINAL_TOKEN: &str = "inj1final_token_contract";
+    const FAKE_POOL_A: &str = "inj1pool_a";
+    const FAKE_POOL_B: &str = "inj1pool_b";
 
     #[test]
-    fn test_simulate_simple_amm_route_direct_to_pair() {
+    fn test_simulate_simple_path() {
         let mut querier = MockQuerier::new(&[]);
-
-        // Mock the response from a PAIR contract's `Simulation` query.
         let mock_response = external::SimulationResponse {
             return_amount: Uint128::new(50000),
-            spread_amount: Uint128::new(100),    // Dummy data
-            commission_amount: Uint128::new(50), // Dummy data
+            spread_amount: Uint128::zero(),
+            commission_amount: Uint128::zero(),
         };
         let mock_response_binary = to_json_binary(&mock_response).unwrap();
 
@@ -182,9 +206,9 @@ mod tests {
                 match query {
                     WasmQuery::Smart {
                         contract_addr,
-                        msg: _, // No need to inspect msg for this simple test
+                        msg: _,
                     } => {
-                        if contract_addr == FAKE_PAIR_CONTRACT_A {
+                        if contract_addr == FAKE_POOL_A {
                             SystemResult::Ok(ContractResult::Ok(mock_response_binary.clone()))
                         } else {
                             panic!("Unexpected contract call to {}", contract_addr);
@@ -194,240 +218,220 @@ mod tests {
                 }
             },
         );
-
         let mut deps = mock_dependencies();
         deps.querier = querier;
 
-        let route = Route {
-            steps: vec![Step {
-                // Address is now the PAIR address.
-                protocol_address: Addr::unchecked(FAKE_PAIR_CONTRACT_A),
-                description: ActionDescription::AmmSwap {
-                    protocol: AmmProtocol::Choice, // Protocol is just for context now
+        let stages = vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: FAKE_POOL_A.to_string(),
                     offer_asset_info: AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
-                    ask_asset_info: AssetInfo::Token {
-                        contract_addr: "some_token".to_string(),
+                    ask_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
                     },
-                },
-                amount_in_percentage: 100,
-                next_steps: vec![],
+                })],
             }],
-        };
+        }];
 
-        let result_binary =
-            simulate_route(deps.as_ref(), mock_env(), route, Coin::new(1000u128, "inj")).unwrap();
+        let result_binary = simulate_route(
+            deps.as_ref(),
+            mock_env(),
+            stages,
+            Coin::new(1000u128, "inj"),
+        )
+        .unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
         assert_eq!(result.output_amount, Uint128::new(50000));
     }
 
     #[test]
-    fn test_simulate_split_route_direct_to_pair() {
+    fn test_simulate_multi_hop_path() {
         let mut querier = MockQuerier::new(&[]);
 
-        // Mock responses for PAIR A and PAIR B
-        let mock_response_a = external::SimulationResponse {
-            return_amount: Uint128::new(30000),
+        let mock_response_hop1 = external::SimulationResponse {
+            return_amount: Uint128::new(20000), // 1000 INJ -> 20000 USDT
             spread_amount: Uint128::zero(),
             commission_amount: Uint128::zero(),
         };
-        let mock_response_a_binary = to_json_binary(&mock_response_a).unwrap();
-
-        let mock_response_b = external::SimulationResponse {
-            return_amount: Uint128::new(45000),
+        let mock_response_hop2 = external::SimulationResponse {
+            return_amount: Uint128::new(5000), // 20000 USDT -> 5000 AUSD
             spread_amount: Uint128::zero(),
             commission_amount: Uint128::zero(),
         };
-        let mock_response_b_binary = to_json_binary(&mock_response_b).unwrap();
 
-        querier.update_wasm(
-            move |query: &WasmQuery| -> SystemResult<ContractResult<Binary>> {
-                match query {
-                    WasmQuery::Smart { contract_addr, msg } => {
-                        // Decode the new pair::QueryMsg to inspect the offer amount
-                        let decoded_query: external::QueryMsg = from_json(msg).unwrap();
-                        let external::QueryMsg::Simulation { offer_asset } = decoded_query;
-
-                        if contract_addr == FAKE_PAIR_CONTRACT_A {
-                            assert_eq!(offer_asset.amount, Uint128::new(500));
-                            SystemResult::Ok(ContractResult::Ok(mock_response_a_binary.clone()))
-                        } else if contract_addr == FAKE_PAIR_CONTRACT_B {
-                            assert_eq!(offer_asset.amount, Uint128::new(500));
-                            SystemResult::Ok(ContractResult::Ok(mock_response_b_binary.clone()))
-                        } else {
-                            panic!("Unexpected contract query to: {}", contract_addr);
-                        }
-                    }
-                    _ => panic!("Unsupported WasmQuery type"),
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart {
+                contract_addr, msg, ..
+            } => {
+                let decoded: external::QueryMsg = from_json(msg).unwrap();
+                if contract_addr == FAKE_POOL_A {
+                    let external::QueryMsg::Simulation { offer_asset } = decoded;
+                    assert_eq!(offer_asset.amount, Uint128::new(1000));
+                    SystemResult::Ok(ContractResult::Ok(
+                        to_json_binary(&mock_response_hop1).unwrap(),
+                    ))
+                } else if contract_addr == FAKE_POOL_B {
+                    let external::QueryMsg::Simulation { offer_asset } = decoded;
+                    assert_eq!(offer_asset.amount, Uint128::new(20000));
+                    SystemResult::Ok(ContractResult::Ok(
+                        to_json_binary(&mock_response_hop2).unwrap(),
+                    ))
+                } else {
+                    panic!("Unexpected query to {}", contract_addr);
                 }
-            },
-        );
+            }
+            _ => panic!("Unsupported query type"),
+        });
 
         let mut deps = mock_dependencies();
         deps.querier = querier;
 
-        let route = Route {
-            steps: vec![
-                Step {
-                    protocol_address: Addr::unchecked(FAKE_PAIR_CONTRACT_A),
-                    description: ActionDescription::AmmSwap {
-                        protocol: AmmProtocol::Choice,
+        let stages = vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![
+                    Operation::AmmSwap(AmmSwapOp {
+                        pool_address: FAKE_POOL_A.to_string(),
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: AssetInfo::Token {
-                            contract_addr: Addr::unchecked(FINAL_TOKEN).to_string(),
+                        ask_asset_info: AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
                         },
-                    },
-                    amount_in_percentage: 50,
-                    next_steps: vec![],
-                },
-                Step {
-                    protocol_address: Addr::unchecked(FAKE_PAIR_CONTRACT_B),
-                    description: ActionDescription::AmmSwap {
-                        protocol: AmmProtocol::DojoSwap,
+                    }),
+                    Operation::AmmSwap(AmmSwapOp {
+                        pool_address: FAKE_POOL_B.to_string(),
                         offer_asset_info: AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
+                            denom: "usdt".to_string(),
                         },
-                        ask_asset_info: AssetInfo::Token {
-                            contract_addr: Addr::unchecked(FINAL_TOKEN).to_string(),
+                        ask_asset_info: AssetInfo::NativeToken {
+                            denom: "ausd".to_string(),
                         },
-                    },
-                    amount_in_percentage: 50,
-                    next_steps: vec![],
-                },
-            ],
-        };
-
-        let result_binary =
-            simulate_route(deps.as_ref(), mock_env(), route, Coin::new(1000u128, "inj")).unwrap();
-        let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
-        assert_eq!(result.output_amount, Uint128::new(30000 + 45000));
-    }
-
-    #[test]
-    fn test_simulate_multi_step_split_route_with_different_protocols() {
-        use injective_math::FPDecimal;
-
-        let mut querier = MockQuerier::new(&[]);
-
-        // 1. Orderbook Response (Step 0): 100 USDT -> 200,000 INJ
-        let orderbook_response = orderbook::SwapEstimationResult {
-            expected_fees: vec![],
-            result_quantity: FPDecimal::from(200_000u128),
-        };
-        let orderbook_response_bin = to_json_binary(&orderbook_response).unwrap();
-
-        // 2. Pair A Response (Step 1): Takes its share of INJ, outputs 50,000 final tokens
-        let amm_a_response = external::SimulationResponse {
-            return_amount: Uint128::new(50_000),
-            spread_amount: Uint128::zero(),     // Dummy data
-            commission_amount: Uint128::zero(), // Dummy data
-        };
-        let amm_a_response_bin = to_json_binary(&amm_a_response).unwrap();
-
-        // 3. Pair B Response (Step 2): Takes its share of INJ, outputs 70,000 final tokens
-        let amm_b_response = external::SimulationResponse {
-            return_amount: Uint128::new(70_000),
-            spread_amount: Uint128::zero(),
-            commission_amount: Uint128::zero(),
-        };
-        let amm_b_response_bin = to_json_binary(&amm_b_response).unwrap();
-
-        // Teach the querier how to handle calls to all three distinct contract addresses
-        querier.update_wasm(
-            move |query: &WasmQuery| -> SystemResult<ContractResult<Binary>> {
-                match query {
-                    WasmQuery::Smart { contract_addr, msg } => {
-                        if contract_addr == FAKE_ORDERBOOK {
-                            // This is Step 0, just return the canned response
-                            SystemResult::Ok(ContractResult::Ok(orderbook_response_bin.clone()))
-                        } else if contract_addr == FAKE_PAIR_CONTRACT_A {
-                            // This is Step 1. It should receive a direct `Simulation` query.
-                            // Assert it received the correct 43% of the order book's output.
-                            // 200,000 * 0.43 = 86,000
-                            let decoded_query: external::QueryMsg = from_json(msg).unwrap();
-                            let external::QueryMsg::Simulation { offer_asset } = decoded_query;
-                            assert_eq!(offer_asset.amount, Uint128::new(86_000));
-                            SystemResult::Ok(ContractResult::Ok(amm_a_response_bin.clone()))
-                        } else if contract_addr == FAKE_PAIR_CONTRACT_B {
-                            // This is Step 2. It should receive a direct `Simulation` query.
-                            // Assert it received the correct 57% of the order book's output.
-                            // 200,000 * 0.57 = 114,000
-                            let decoded_query: external::QueryMsg = from_json(msg).unwrap();
-                            let external::QueryMsg::Simulation { offer_asset } = decoded_query;
-                            assert_eq!(offer_asset.amount, Uint128::new(114_000));
-                            SystemResult::Ok(ContractResult::Ok(amm_b_response_bin.clone()))
-                        } else {
-                            panic!("Unexpected contract query to {}", contract_addr)
-                        }
-                    }
-                    _ => panic!("Unsupported query type"),
-                }
-            },
-        );
-
-        let mut deps = mock_dependencies();
-        deps.querier = querier;
-
-        // --- Construct the Multi-Step Route with direct PAIR addresses ---
-        let route = Route {
-            steps: vec![
-                // Step 0: USDT -> INJ via Order Book, then splits to steps 1 and 2
-                Step {
-                    protocol_address: Addr::unchecked(FAKE_ORDERBOOK),
-                    description: ActionDescription::OrderbookSwap {
-                        source_denom: "peggy0xdAC...".to_string(), // Some USDT denom
-                        target_denom: "inj".to_string(),
-                    },
-                    amount_in_percentage: 100,
-                    next_steps: vec![1, 2], // Points to the next two steps
-                },
-                // Step 1: First AMM path (43% of INJ from step 0), uses PAIR_A
-                Step {
-                    protocol_address: Addr::unchecked(FAKE_PAIR_CONTRACT_A),
-                    description: ActionDescription::AmmSwap {
-                        protocol: AmmProtocol::Choice, // Protocol for context
-                        offer_asset_info: AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        ask_asset_info: AssetInfo::Token {
-                            // Not used in query, but good for route description
-                            contract_addr: Addr::unchecked(FINAL_TOKEN).to_string(),
-                        },
-                    },
-                    amount_in_percentage: 43,
-                    next_steps: vec![], // This is a leaf node
-                },
-                // Step 2: Second AMM path (57% of INJ from step 0), uses PAIR_B
-                Step {
-                    protocol_address: Addr::unchecked(FAKE_PAIR_CONTRACT_B),
-                    description: ActionDescription::AmmSwap {
-                        protocol: AmmProtocol::DojoSwap, // Protocol for context
-                        offer_asset_info: AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        ask_asset_info: AssetInfo::Token {
-                            contract_addr: Addr::unchecked(FINAL_TOKEN).to_string(),
-                        },
-                    },
-                    amount_in_percentage: 57,
-                    next_steps: vec![], // This is a leaf node
-                },
-            ],
-        };
+                    }),
+                ],
+            }],
+        }];
 
         let result_binary = simulate_route(
             deps.as_ref(),
             mock_env(),
-            route,
-            Coin::new(100u128, "peggy0xdAC..."),
+            stages,
+            Coin::new(1000u128, "inj"),
         )
         .unwrap();
-
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
+        assert_eq!(result.output_amount, Uint128::new(5000));
+    }
 
-        assert_eq!(result.output_amount, Uint128::new(50_000 + 70_000));
+    #[test]
+    fn test_simulate_multi_split_multi_stage() {
+        let mut querier = MockQuerier::new(&[]);
+
+        // Mock responses for all 4 swaps
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart {
+                contract_addr, msg, ..
+            } => {
+                let decoded: external::QueryMsg = from_json(msg).unwrap();
+                let external::QueryMsg::Simulation { offer_asset } = decoded;
+
+                let response_amount = match (contract_addr.as_str(), offer_asset.amount.u128()) {
+                    // Stage 1
+                    (FAKE_POOL_A, 500) => 10000, // 50% of 1000 INJ -> 10000 USDT
+                    (FAKE_POOL_B, 500) => 20000, // 50% of 1000 INJ -> 20000 AUSD
+                    // Stage 2 (Totals: 10k USDT, 20k AUSD)
+                    (FAKE_POOL_A, 10000) => 5000, // 10000 USDT -> 5000 SHROOM
+                    (FAKE_POOL_B, 20000) => 8000, // 20000 AUSD -> 8000 SHROOM
+                    _ => panic!(
+                        "Unexpected query: {} with amount {}",
+                        contract_addr, offer_asset.amount
+                    ),
+                };
+                let mock_response = external::SimulationResponse {
+                    return_amount: Uint128::new(response_amount),
+                    ..Default::default()
+                };
+                SystemResult::Ok(ContractResult::Ok(to_json_binary(&mock_response).unwrap()))
+            }
+            _ => panic!("Unsupported query type"),
+        });
+
+        let mut deps = mock_dependencies();
+        deps.querier = querier;
+
+        let stages = vec![
+            // Stage 1: INJ -> USDT / AUSD
+            Stage {
+                splits: vec![
+                    Split {
+                        percent: 50,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            pool_address: FAKE_POOL_A.to_string(),
+                            offer_asset_info: AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: AssetInfo::NativeToken {
+                                denom: "usdt".to_string(),
+                            },
+                        })],
+                    },
+                    Split {
+                        percent: 50,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            pool_address: FAKE_POOL_B.to_string(),
+                            offer_asset_info: AssetInfo::NativeToken {
+                                denom: "inj".to_string(),
+                            },
+                            ask_asset_info: AssetInfo::NativeToken {
+                                denom: "ausd".to_string(),
+                            },
+                        })],
+                    },
+                ],
+            },
+            // Stage 2: USDT / AUSD -> SHROOM
+            Stage {
+                splits: vec![
+                    Split {
+                        percent: 100,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            pool_address: FAKE_POOL_A.to_string(),
+                            offer_asset_info: AssetInfo::NativeToken {
+                                denom: "usdt".to_string(),
+                            },
+                            ask_asset_info: AssetInfo::NativeToken {
+                                denom: "shroom".to_string(),
+                            },
+                        })],
+                    },
+                    Split {
+                        percent: 100,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            pool_address: FAKE_POOL_B.to_string(),
+                            offer_asset_info: AssetInfo::NativeToken {
+                                denom: "ausd".to_string(),
+                            },
+                            ask_asset_info: AssetInfo::NativeToken {
+                                denom: "shroom".to_string(),
+                            },
+                        })],
+                    },
+                ],
+            },
+        ];
+
+        let result_binary = simulate_route(
+            deps.as_ref(),
+            mock_env(),
+            stages,
+            Coin::new(1000u128, "inj"),
+        )
+        .unwrap();
+        let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
+        // Final output is the sum of the shroom from both paths
+        assert_eq!(result.output_amount, Uint128::new(5000 + 8000));
     }
 }

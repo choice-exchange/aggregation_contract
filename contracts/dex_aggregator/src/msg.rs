@@ -94,6 +94,7 @@ pub mod external {
     }
 
     #[cw_serde]
+    #[derive(Default)]
     pub struct SimulationResponse {
         pub return_amount: Uint128,
         pub spread_amount: Uint128,
@@ -191,10 +192,6 @@ pub enum ExecuteMsg {
         minimum_receive: Option<String>,
     },
     Receive(Cw20ReceiveMsg),
-    ExecuteRoute {
-        route: Route,
-        minimum_receive: Option<Uint128>,
-    },
     UpdateAdmin {
         new_admin: String,
     },
@@ -216,7 +213,7 @@ pub enum ExecuteMsg {
 #[derive(QueryResponses)]
 pub enum QueryMsg {
     #[returns(SimulateRouteResponse)]
-    SimulateRoute { route: Route, amount_in: Coin },
+    SimulateRoute { stages: Vec<Stage>, amount_in: Coin },
     #[returns(Config)]
     Config {},
 }
@@ -224,52 +221,6 @@ pub enum QueryMsg {
 #[cw_serde]
 pub struct SimulateRouteResponse {
     pub output_amount: Uint128,
-}
-
-#[cw_serde]
-pub enum AssetType {
-    Cw20(Addr),
-    Bank(String),
-}
-
-// An enum to identify the protocol, so our contract knows which query/execute format to use.
-#[cw_serde]
-pub enum AmmProtocol {
-    Choice,
-    DojoSwap,
-    AstroSwap,
-    TerraSwap,
-}
-
-// This is a DESCRIPTION of the action, not the action itself.
-#[cw_serde]
-pub enum ActionDescription {
-    AmmSwap {
-        protocol: AmmProtocol,
-        offer_asset_info: external::AssetInfo,
-        ask_asset_info: external::AssetInfo,
-    },
-    OrderbookSwap {
-        source_denom: String,
-        target_denom: String,
-    },
-}
-
-#[cw_serde]
-pub struct Step {
-    // The address of the contract that will perform the action (e.g., the AMM Router address)
-    pub protocol_address: Addr,
-    // The description of what should happen at that address
-    pub description: ActionDescription,
-    pub amount_in_percentage: u8,
-    pub next_steps: Vec<usize>,
-}
-
-#[cw_serde]
-pub struct Route {
-    pub steps: Vec<Step>,
-    // Note: The `asset_in` on the route is descriptive, but the actual
-    // asset type for a given step comes from its `ActionDescription`.
 }
 
 #[cosmwasm_schema::cw_serde]

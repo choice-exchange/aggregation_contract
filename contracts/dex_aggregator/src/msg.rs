@@ -20,27 +20,29 @@ pub mod cw20_adapter {
 
     #[cw_serde]
     pub enum ExecuteMsg {
-        /// Registers a new CW-20 contract that will be handled by the adapter
-        RegisterCw20Contract { addr: Addr },
-        ///  Impl of Receiver CW-20 interface. Should be called by CW-20 contract only!! (never directly). Msg is ignored
+        RegisterCw20Contract {
+            addr: Addr,
+        },
         Receive {
             sender: String,
             amount: Uint128,
             msg: Binary,
         },
-        /// Called to redeem TF tokens. Will send CW-20 tokens to "recipient" address (or sender if not provided). Will use transfer method
-        RedeemAndTransfer { recipient: Option<String> },
-        /// Called to redeem TF tokens. Will call Send method of CW:20 to send CW-20 tokens to "recipient" address. Submessage will be passed to send method (can be empty)
-        RedeemAndSend { recipient: String, submsg: Binary },
-        /// Updates stored metadata
-        UpdateMetadata { addr: Addr },
+        RedeemAndTransfer {
+            recipient: Option<String>,
+        },
+        RedeemAndSend {
+            recipient: String,
+            submsg: Binary,
+        },
+        UpdateMetadata {
+            addr: Addr,
+        },
     }
 
     #[cw_serde]
     pub enum QueryMsg {
-        /// Return a list of registered CW-20 contracts
         RegisteredContracts {},
-        /// Returns a fee required to register a new token-factory denom
         NewDenomFee {},
     }
 }
@@ -89,7 +91,6 @@ pub mod external {
     #[cw_serde]
     pub enum QueryMsg {
         Simulation { offer_asset: Asset },
-        // ReverseSimulation { ask_asset: Asset },
     }
 
     #[cw_serde]
@@ -148,7 +149,7 @@ pub enum Operation {
 
 #[cw_serde]
 pub struct Split {
-    pub operation: Operation,
+    pub path: Vec<Operation>,
     pub percent: u8,
 }
 
@@ -157,13 +158,12 @@ pub struct Stage {
     pub splits: Vec<Split>,
 }
 
-#[cw_serde] // Add this if you plan to store it in state
+#[cw_serde]
 pub struct PlannedSwap {
     pub operation: Operation,
     pub amount: Uint128,
 }
 
-// The complete plan for a stage, produced by the planner.
 pub struct StagePlan {
     pub swaps_to_execute: Vec<PlannedSwap>,
     pub conversions_needed: Vec<(external::Asset, external::AssetInfo)>,

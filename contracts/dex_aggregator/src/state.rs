@@ -1,4 +1,4 @@
-use crate::msg::{external, PlannedSwap, Route};
+use crate::msg::{external, Operation, PlannedSwap, Route};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -17,11 +17,18 @@ pub enum Awaiting {
     Swaps,
     Conversions,
     FinalConversions,
+    PathConversion,
 }
 
 pub const CONFIG: Item<Config> = Item::new("config");
 pub const FEE_MAP: Map<&Addr, Decimal> = Map::new("fee_map");
 pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
+
+#[cw_serde]
+pub struct PendingPathOp {
+    pub operation: Operation,
+    pub amount: Uint128,
+}
 
 #[cw_serde]
 pub struct ReplyState {
@@ -34,6 +41,7 @@ pub struct ReplyState {
     pub accumulated_assets: Vec<external::Asset>,
     pub pending_swaps: Vec<PlannedSwap>,
     pub conversion_target_asset: Option<external::AssetInfo>,
+    pub pending_path_op: Option<PendingPathOp>,
 }
 
 pub const REPLY_STATES: Map<u64, ReplyState> = Map::new("reply_states");

@@ -1,4 +1,4 @@
-use crate::msg::{external, Operation, PlannedSwap, Route};
+use crate::msg::{external, Operation, PlannedSwap};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -22,7 +22,6 @@ pub enum Awaiting {
 
 pub const CONFIG: Item<Config> = Item::new("config");
 pub const FEE_MAP: Map<&Addr, Decimal> = Map::new("fee_map");
-pub const EXECUTION_STATE: Map<&Addr, Route> = Map::new("execution_state");
 
 #[cw_serde]
 pub struct PendingPathOp {

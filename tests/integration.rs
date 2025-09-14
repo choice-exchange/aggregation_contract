@@ -3115,11 +3115,13 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         &[funds_to_send.clone()],
         user,
     );
+
     assert!(
         res.is_ok(),
         "Execution with mid-path conversion failed: {:?}",
         res.unwrap_err()
     );
+    println!("Gas Used: {}", res.unwrap().gas_info.gas_used);
 
     // --- ASSERT FINAL BALANCE ---
     let final_inj_balance_response = bank

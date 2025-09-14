@@ -1,4 +1,4 @@
-use crate::msg::{external, Operation, PlannedSwap};
+use crate::msg::{external, Operation, PlannedSwap, Stage};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -30,19 +30,23 @@ pub struct PendingPathOp {
 }
 
 #[cw_serde]
-pub struct ReplyState {
+pub struct RoutePlan {
     pub sender: Addr,
     pub minimum_receive: Uint128,
-    pub stages: Vec<crate::msg::Stage>,
+    pub stages: Vec<Stage>,
+}
+
+#[cw_serde]
+pub struct ExecutionState {
     pub awaiting: Awaiting,
     pub current_stage_index: u64,
     pub replies_expected: u64,
     pub accumulated_assets: Vec<external::Asset>,
     pub pending_swaps: Vec<PlannedSwap>,
-    pub conversion_target_asset: Option<external::AssetInfo>,
     pub pending_path_op: Option<PendingPathOp>,
 }
 
-pub const REPLY_STATES: Map<u64, ReplyState> = Map::new("reply_states");
+pub const ROUTE_PLANS: Map<u64, RoutePlan> = Map::new("route_plans");
+pub const EXECUTION_STATES: Map<u64, ExecutionState> = Map::new("execution_states");
 
 pub const REPLY_ID_COUNTER: Item<u64> = Item::new("reply_id_counter");

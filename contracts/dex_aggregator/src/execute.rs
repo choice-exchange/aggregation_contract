@@ -10,7 +10,9 @@ use std::str::FromStr;
 use crate::error::ContractError;
 use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Stage};
 use crate::reply::proceed_to_next_step;
-use crate::state::{Awaiting, ReplyState, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
+use crate::state::{
+    Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, ROUTE_PLANS,
+};
 
 pub fn update_admin(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -64,20 +66,23 @@ pub fn execute_aggregate_swaps_internal(
         None => Uint128::zero(),
     };
 
-    let mut initial_state = ReplyState {
+    let plan = RoutePlan {
         sender: initiator.clone(),
         minimum_receive,
         stages,
+    };
+    ROUTE_PLANS.save(deps.storage, reply_id, &plan)?;
+
+    let mut initial_exec_state = ExecutionState {
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
         replies_expected: 0,
         accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
-        conversion_target_asset: None,
         pending_path_op: None,
     };
 
-    proceed_to_next_step(&mut deps, env, &mut initial_state, reply_id)
+    proceed_to_next_step(&mut deps, env, &mut initial_exec_state, &plan, reply_id)
 }
 
 pub fn create_swap_cosmos_msg(

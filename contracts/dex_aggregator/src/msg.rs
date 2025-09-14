@@ -52,34 +52,9 @@ pub mod external {
     use super::*;
 
     #[cw_serde]
-    pub enum SwapOperation {
-        Choice {
-            offer_asset_info: AssetInfo,
-            ask_asset_info: AssetInfo,
-        },
-        DojoSwap {
-            offer_asset_info: AssetInfo,
-            ask_asset_info: AssetInfo,
-        },
-        TerraSwap {
-            offer_asset_info: AssetInfo,
-            ask_asset_info: AssetInfo,
-        },
-        AstroSwap {
-            offer_asset_info: AssetInfo,
-            ask_asset_info: AssetInfo,
-        },
-    }
-
-    #[cw_serde]
     pub enum AssetInfo {
         Token { contract_addr: String },
         NativeToken { denom: String },
-    }
-
-    #[cw_serde]
-    pub struct SimulateSwapOperationsResponse {
-        pub amount: Uint128,
     }
 
     #[cw_serde]

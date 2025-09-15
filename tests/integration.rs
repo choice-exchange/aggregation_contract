@@ -6,7 +6,7 @@ use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    cw20_adapter, external, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
+    amm, cw20_adapter, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
     OrderbookSwapOp, QueryMsg, Split, Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
@@ -284,17 +284,17 @@ fn test_aggregate_swap_success() {
     // Split 3 (25%): 25 INJ -> OB   @ 30.0 = 750 USDT
     // Total Output: 330 + 840 + 750 = 1920 USDT
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![
                 Split {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -303,10 +303,10 @@ fn test_aggregate_swap_success() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -315,10 +315,10 @@ fn test_aggregate_swap_success() {
                     percent: 25,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: env.mock_ob_inj_usdt_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -393,7 +393,7 @@ fn test_multi_stage_aggregate_swap_success() {
     //   Split 2 (51%): 51,000 INJ -> AMM2 @ 20.0 = 1,020,000 USDT
     // Total Final Output: 490,000 + 1,020,000 = 1,510,000 USDT
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
             // Stage 1: 100% of USDT to the Orderbook to get INJ.
             Stage {
@@ -401,10 +401,10 @@ fn test_multi_stage_aggregate_swap_success() {
                     percent: 100,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
                     })],
@@ -417,10 +417,10 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 49,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_1_addr.clone(),
-                            ask_asset_info: external::AssetInfo::NativeToken {
+                            ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "usdt".to_string(),
                             },
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
                         })],
@@ -429,10 +429,10 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 51,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_2_addr.clone(),
-                            ask_asset_info: external::AssetInfo::NativeToken {
+                            ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "usdt".to_string(),
                             },
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
                         })],
@@ -970,7 +970,7 @@ fn test_full_normalization_route() {
 
     let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
             // Stage 1: INJ -> SHROOM (mixed native/cw20 output)
             Stage {
@@ -979,10 +979,10 @@ fn test_full_normalization_route() {
                         percent: 50,
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                             swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: external::AssetInfo::NativeToken {
+                            ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
                         })],
@@ -991,10 +991,10 @@ fn test_full_normalization_route() {
                         percent: 50,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: external::AssetInfo::Token {
+                            ask_asset_info: amm::AssetInfo::Token {
                                 contract_addr: setup.shroom_cw20_addr.clone(),
                             },
                         })],
@@ -1007,10 +1007,10 @@ fn test_full_normalization_route() {
                     percent: 100,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
-                        offer_asset_info: external::AssetInfo::Token {
+                        offer_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.shroom_cw20_addr.clone(),
                         },
-                        ask_asset_info: external::AssetInfo::Token {
+                        ask_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.sai_cw20_addr.clone(),
                         },
                     })],
@@ -1056,7 +1056,7 @@ fn test_multi_stage_with_final_normalization() {
 
     let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
             // Stage 1: 100% of USDT to the Orderbook to get INJ.
             Stage {
@@ -1064,10 +1064,10 @@ fn test_multi_stage_with_final_normalization() {
                     percent: 100,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: setup.mock_usdt_to_inj_ob.clone(),
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1080,10 +1080,10 @@ fn test_multi_stage_with_final_normalization() {
                         percent: 10, // 10% to CW20 SHROOM
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: external::AssetInfo::Token {
+                            ask_asset_info: amm::AssetInfo::Token {
                                 contract_addr: setup.shroom_cw20_addr.clone(),
                             },
                         })],
@@ -1092,10 +1092,10 @@ fn test_multi_stage_with_final_normalization() {
                         percent: 90, // 90% to Native SHROOM
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                             swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
-                            offer_asset_info: external::AssetInfo::NativeToken {
+                            offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: external::AssetInfo::NativeToken {
+                            ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
                         })],
@@ -1173,16 +1173,16 @@ fn test_cw20_entry_point_swap_success() {
     // --- Define the Swap ---
     // The user wants to swap 1,000 SHROOM for SAI.
     // The mock AMM rate is 0.1, so they expect 100 SAI in return.
-    let hook_msg = Cw20HookMsg::AggregateSwaps {
+    let hook_msg = Cw20HookMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
-                    offer_asset_info: external::AssetInfo::Token {
+                    offer_asset_info: amm::AssetInfo::Token {
                         contract_addr: setup.shroom_cw20_addr.clone(),
                     },
-                    ask_asset_info: external::AssetInfo::Token {
+                    ask_asset_info: amm::AssetInfo::Token {
                         contract_addr: setup.sai_cw20_addr.clone(),
                     },
                 })],
@@ -1248,7 +1248,7 @@ fn test_reverse_normalization_route() {
 
     let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
             // Stage 1: Get CW20 SHROOM
             Stage {
@@ -1256,10 +1256,10 @@ fn test_reverse_normalization_route() {
                     percent: 100,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: external::AssetInfo::Token {
+                        ask_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.shroom_cw20_addr.clone(),
                         },
                     })],
@@ -1272,10 +1272,10 @@ fn test_reverse_normalization_route() {
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
                         // This is the key part of the test: the offer asset is NATIVE
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: native_shroom_denom.clone(),
                         },
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
                     })],
@@ -1340,17 +1340,17 @@ fn test_failure_if_minimum_receive_not_met() {
         .unwrap();
     let initial_inj_amount = Uint128::from_str(&initial_inj_balance.amount).unwrap();
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![
                 Split {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1359,10 +1359,10 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1371,10 +1371,10 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 25,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                         swap_contract: env.mock_ob_inj_usdt_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1433,17 +1433,17 @@ fn test_failure_on_invalid_percentage_sum() {
         .unwrap();
     let initial_inj_amount = Uint128::from_str(&initial_inj_balance.amount).unwrap();
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![
                 Split {
                     percent: 50, // 50%
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1452,10 +1452,10 @@ fn test_failure_on_invalid_percentage_sum() {
                     percent: 49, // + 49% = 99% (Invalid!)
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: external::AssetInfo::NativeToken {
+                        ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
-                        offer_asset_info: external::AssetInfo::NativeToken {
+                        offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     })],
@@ -1519,13 +1519,13 @@ fn test_mixed_input_unified_output_reconciliation() {
     //  - TOTAL: 460 USDT
 
     // Asset definitions
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = external::AssetInfo::NativeToken {
+    let native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = external::AssetInfo::NativeToken {
+    let usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
 
@@ -1535,7 +1535,7 @@ fn test_mixed_input_unified_output_reconciliation() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
-                offer_asset_info: external::AssetInfo::NativeToken {
+                offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
                 ask_asset_info: cw20_shroom_info.clone(),
@@ -1567,7 +1567,7 @@ fn test_mixed_input_unified_output_reconciliation() {
         ],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some("459000000".to_string()), // Min 459 USDT (Target is 460)
         stages: vec![stage1, stage2],
     };
@@ -1642,13 +1642,13 @@ fn test_cw20_input_with_initial_reconciliation() {
     .unwrap();
 
     // Asset definitions for the stage
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = external::AssetInfo::NativeToken {
+    let native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = external::AssetInfo::NativeToken {
+    let usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
 
@@ -1676,7 +1676,7 @@ fn test_cw20_input_with_initial_reconciliation() {
     };
 
     // The hook message sent with the CW20 token
-    let hook_msg = Cw20HookMsg::AggregateSwaps {
+    let hook_msg = Cw20HookMsg::ExecuteRoute {
         minimum_receive: Some("469000000".to_string()), // Min 469 USDT (Target is 470)
         stages: vec![stage1],
     };
@@ -1742,16 +1742,16 @@ fn test_complex_reconciliation_mixed_to_mixed() {
     //  - TOTAL: 425 USDT
 
     // Asset definitions for clarity
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = external::AssetInfo::NativeToken {
+    let native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = external::AssetInfo::NativeToken {
+    let usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
-    let inj_info = external::AssetInfo::NativeToken {
+    let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
 
@@ -1803,7 +1803,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
         ],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some("424000000".to_string()), // Min 424 USDT (Target is 425)
         stages: vec![stage1, stage2],
     };
@@ -1858,13 +1858,13 @@ fn test_final_output_is_cw20_token() {
     // Stage 2: 1000 CW20 SHROOM -> 100 CW20 SAI
 
     // Asset definitions for clarity
-    let inj_info = external::AssetInfo::NativeToken {
+    let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = external::AssetInfo::Token {
+    let cw20_sai_info = amm::AssetInfo::Token {
         contract_addr: setup.sai_cw20_addr.clone(),
     };
 
@@ -1890,7 +1890,7 @@ fn test_final_output_is_cw20_token() {
         }],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
         stages: vec![stage1, stage2],
     };
@@ -1948,10 +1948,10 @@ fn test_native_input_with_initial_cw20_requirement() {
 
     // Asset definitions
     let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = external::AssetInfo::Token {
+    let cw20_sai_info = amm::AssetInfo::Token {
         contract_addr: setup.sai_cw20_addr.clone(),
     };
 
@@ -2007,7 +2007,7 @@ fn test_native_input_with_initial_cw20_requirement() {
         }],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
         stages: vec![stage1],
     };
@@ -2061,10 +2061,10 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2073,10 +2073,10 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_2_addr.clone(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2084,7 +2084,7 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
         ],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
         minimum_receive: None, // We don't care about the output amount, only that it doesn't fail.
     };
@@ -2140,10 +2140,10 @@ fn test_stage_with_single_hundred_percent_split() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: env.mock_amm_1_addr.clone(),
-                ask_asset_info: external::AssetInfo::NativeToken {
+                ask_asset_info: amm::AssetInfo::NativeToken {
                     denom: "usdt".to_string(),
                 },
-                offer_asset_info: external::AssetInfo::NativeToken {
+                offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
             })],
@@ -2155,17 +2155,17 @@ fn test_stage_with_single_hundred_percent_split() {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                 swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                ask_asset_info: external::AssetInfo::NativeToken {
+                ask_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
-                offer_asset_info: external::AssetInfo::NativeToken {
+                offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "usdt".to_string(),
                 },
             })],
         }],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
         minimum_receive: Some("99000000000000000000".to_string()), // Min 99 INJ
     };
@@ -2233,10 +2233,10 @@ fn test_intermediate_swap_failure_reverts_transaction() {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
                 swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                ask_asset_info: external::AssetInfo::NativeToken {
+                ask_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
-                offer_asset_info: external::AssetInfo::NativeToken {
+                offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "usdt".to_string(),
                 },
             })],
@@ -2251,10 +2251,10 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2264,10 +2264,10 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: "inj1invalidcontractaddressxxxxxxxxxxxxxx".to_string(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2275,7 +2275,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
         ],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
         minimum_receive: None, // Not relevant, as the transaction should fail.
     };
@@ -2338,16 +2338,16 @@ fn test_fee_collection_on_single_swap() {
     // Fee: 1,000 USDT * 0.3% = 3 USDT.
     // Net Output to User: 1000 - 3 = 997 USDT.
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2477,17 +2477,17 @@ fn test_fee_collection_on_cw20_output() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: fee_pool_address,
-                ask_asset_info: external::AssetInfo::Token {
+                ask_asset_info: amm::AssetInfo::Token {
                     contract_addr: setup.shroom_cw20_addr.clone(),
                 },
-                offer_asset_info: external::AssetInfo::NativeToken {
+                offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
             })],
         }],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
         minimum_receive: Some("984000000".to_string()), // Min 984 SHROOM
     };
@@ -2616,16 +2616,16 @@ fn test_full_admin_fee_lifecycle() {
     .unwrap();
 
     // --- 2. User swaps, fee goes to ORIGINAL collector ---
-    let swap_msg = ExecuteMsg::AggregateSwaps {
+    let swap_msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2773,10 +2773,10 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 40,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: taxed_pool,
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2786,10 +2786,10 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 60,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: untaxed_pool,
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -2797,7 +2797,7 @@ fn test_multi_split_with_mixed_fees() {
         ],
     };
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
         minimum_receive: Some("1595000000".to_string()), // Min 1595 USDT
     };
@@ -2885,16 +2885,16 @@ fn test_fee_truncates_to_zero() {
     // Fee Calculation: 100,000 * 0.000001 = 0.1, which truncates to 0.
     let input_amount = Uint128::new(10_000_000_000_000_000u128); // 10^16
 
-    let swap_msg = ExecuteMsg::AggregateSwaps {
+    let swap_msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address,
-                    ask_asset_info: external::AssetInfo::NativeToken {
+                    ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    offer_asset_info: external::AssetInfo::NativeToken {
+                    offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
                 })],
@@ -3050,16 +3050,16 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     // match the required input of Hop 2 (Native SHROOM), forcing a conversion.
 
     // Asset definitions for clarity
-    let inj_info = external::AssetInfo::NativeToken {
+    let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
-    let cw20_shroom_info = external::AssetInfo::Token {
+    let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = external::AssetInfo::NativeToken {
+    let native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = external::AssetInfo::NativeToken {
+    let usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
 
@@ -3085,7 +3085,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         }),
     ];
 
-    let msg = ExecuteMsg::AggregateSwaps {
+    let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
@@ -3115,11 +3115,13 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         &[funds_to_send.clone()],
         user,
     );
+
     assert!(
         res.is_ok(),
         "Execution with mid-path conversion failed: {:?}",
         res.unwrap_err()
     );
+    println!("Gas Used: {}", res.unwrap().gas_info.gas_used);
 
     // --- ASSERT FINAL BALANCE ---
     let final_inj_balance_response = bank
@@ -3146,4 +3148,150 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         final_inj_amount > initial_inj_amount,
         "Final balance should be greater than initial after a profitable swap"
     );
+}
+
+#[test]
+fn test_emergency_withdraw() {
+    // 1. --- SETUP ---
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let bank = Bank::new(&setup.env.app);
+    let admin = &setup.env.admin;
+    let unauthorized_user = &setup.env.user;
+    let aggregator_addr = &setup.env.aggregator_addr;
+    let shroom_cw20_addr = &setup.shroom_cw20_addr;
+
+    // 2. --- ARRANGE: Fund the aggregator contract with assets to withdraw ---
+    let native_inj_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
+    let cw20_shroom_to_send = Uint128::new(500_000_000); // 500 SHROOM
+
+    // Admin sends 100 INJ to the aggregator contract
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: aggregator_addr.clone(),
+            amount: vec![ProtoCoin {
+                denom: native_inj_to_send.denom.clone(),
+                amount: native_inj_to_send.amount.to_string(),
+            }],
+        },
+        admin,
+    )
+    .unwrap();
+
+    // Admin mints and sends 500 SHROOM to the aggregator contract
+    wasm.execute(
+        shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: aggregator_addr.clone(),
+            amount: cw20_shroom_to_send,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+
+    // 3. --- ACT & ASSERT ---
+
+    // Test Case 1: Fails if called by an unauthorized user
+    let msg_unauthorized = ExecuteMsg::EmergencyWithdraw {
+        asset_info: amm::AssetInfo::NativeToken {
+            denom: "inj".to_string(),
+        },
+    };
+    let res_unauthorized = wasm.execute(aggregator_addr, &msg_unauthorized, &[], unauthorized_user);
+    assert!(res_unauthorized.is_err());
+    assert!(res_unauthorized
+        .unwrap_err()
+        .to_string()
+        .contains("Unauthorized"));
+
+    // Test Case 2: Admin successfully withdraws the native INJ
+    let admin_inj_balance_before = bank
+        .query_balance(&QueryBalanceRequest {
+            address: admin.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap()
+        .amount
+        .parse::<u128>()
+        .unwrap();
+
+    let msg_inj = ExecuteMsg::EmergencyWithdraw {
+        asset_info: amm::AssetInfo::NativeToken {
+            denom: "inj".to_string(),
+        },
+    };
+    wasm.execute(aggregator_addr, &msg_inj, &[], admin).unwrap();
+
+    let admin_inj_balance_after = bank
+        .query_balance(&QueryBalanceRequest {
+            address: admin.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap()
+        .amount
+        .parse::<u128>()
+        .unwrap();
+
+    // Admin's balance should increase by (exactly 100 INJ - gas fees)
+    // A simple check is to ensure it increased significantly.
+    assert!(admin_inj_balance_after > admin_inj_balance_before);
+
+    // Contract's INJ balance should now be zero
+    let contract_inj_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: aggregator_addr.clone(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance;
+    assert!(contract_inj_balance.is_none() || contract_inj_balance.unwrap().amount == "0");
+
+    // Test Case 3: Admin successfully withdraws the CW20 SHROOM
+    let admin_shroom_balance_before: BalanceResponse = wasm
+        .query(
+            shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: admin.address(),
+            },
+        )
+        .unwrap();
+
+    let msg_shroom = ExecuteMsg::EmergencyWithdraw {
+        asset_info: amm::AssetInfo::Token {
+            contract_addr: shroom_cw20_addr.clone(),
+        },
+    };
+    wasm.execute(aggregator_addr, &msg_shroom, &[], admin)
+        .unwrap();
+
+    let admin_shroom_balance_after: BalanceResponse = wasm
+        .query(
+            shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: admin.address(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        admin_shroom_balance_after.balance,
+        admin_shroom_balance_before.balance + cw20_shroom_to_send
+    );
+
+    // Contract's SHROOM balance should now be zero
+    let contract_shroom_balance: BalanceResponse = wasm
+        .query(
+            shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: aggregator_addr.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(contract_shroom_balance.balance, Uint128::zero());
 }

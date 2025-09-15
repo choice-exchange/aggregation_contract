@@ -5,7 +5,7 @@ use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
-use crate::msg::{external, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{Config, CONFIG};
 use cw20::Cw20ReceiveMsg;
 
@@ -44,7 +44,7 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     match msg {
-        ExecuteMsg::AggregateSwaps {
+        ExecuteMsg::ExecuteRoute {
             stages,
             minimum_receive,
         } => {
@@ -52,8 +52,8 @@ pub fn execute(
             if info.funds.len() != 1 {
                 return Err(ContractError::InvalidFunds {});
             }
-            let offer_asset = external::Asset {
-                info: external::AssetInfo::NativeToken {
+            let offer_asset = amm::Asset {
+                info: amm::AssetInfo::NativeToken {
                     denom: info.funds[0].denom.clone(),
                 },
                 amount: info.funds[0].amount,
@@ -76,12 +76,12 @@ pub fn execute(
             if let Ok(hook_msg) = cosmwasm_std::from_json::<Cw20HookMsg>(&msg) {
                 // This is a user-initiated swap starting with a CW20 token.
                 match hook_msg {
-                    Cw20HookMsg::AggregateSwaps {
+                    Cw20HookMsg::ExecuteRoute {
                         stages,
                         minimum_receive,
                     } => {
-                        let offer_asset = external::Asset {
-                            info: external::AssetInfo::Token {
+                        let offer_asset = amm::Asset {
+                            info: amm::AssetInfo::Token {
                                 contract_addr: info.sender.to_string(),
                             },
                             amount,
@@ -120,6 +120,9 @@ pub fn execute(
         ExecuteMsg::UpdateFeeCollector { new_fee_collector } => {
             update_fee_collector(deps, info, new_fee_collector)
         }
+        ExecuteMsg::EmergencyWithdraw { asset_info } => {
+            crate::execute::emergency_withdraw(deps, env, info, asset_info)
+        }
     }
 }
 
@@ -130,6 +133,12 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
             crate::query::simulate_route(deps, env, stages, amount_in)
         }
         QueryMsg::Config {} => crate::query::query_config(deps),
+        QueryMsg::FeeForPool { pool_address } => {
+            crate::query::query_fee_for_pool(deps, pool_address)
+        }
+        QueryMsg::AllFees { start_after, limit } => {
+            crate::query::query_all_fees(deps, start_after, limit)
+        }
     }
 }
 

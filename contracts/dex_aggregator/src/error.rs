@@ -15,9 +15,6 @@ pub enum ContractError {
     #[error("Route cannot be empty")]
     EmptyRoute {},
 
-    #[error("Execution state not found for sender")]
-    ExecutionStateNotFound {},
-
     #[error("Input amount must be greater than zero")]
     ZeroAmount {},
 

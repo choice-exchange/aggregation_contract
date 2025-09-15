@@ -1,16 +1,18 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response, StdError,
-    Uint128, WasmMsg,
+    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response,
+    StdError, Uint128, WasmMsg,
 };
-use cw20::Cw20ExecuteMsg;
+use cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 use injective_math::FPDecimal;
 use std::str::FromStr;
 
 use crate::error::ContractError;
-use crate::msg::{self, external, AmmPairExecuteMsg, Operation, OrderbookExecuteMsg, Stage};
+use crate::msg::{self, amm, orderbook, Operation, Stage};
 use crate::reply::proceed_to_next_step;
-use crate::state::{Awaiting, ReplyState, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
+use crate::state::{
+    Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, ROUTE_PLANS,
+};
 
 pub fn update_admin(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -40,7 +42,7 @@ pub fn execute_aggregate_swaps_internal(
     _info: MessageInfo,
     stages: Vec<Stage>,
     minimum_receive_str: Option<String>,
-    offer_asset: external::Asset,
+    offer_asset: amm::Asset,
     initiator: Addr,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if offer_asset.amount.is_zero() {
@@ -64,26 +66,29 @@ pub fn execute_aggregate_swaps_internal(
         None => Uint128::zero(),
     };
 
-    let mut initial_state = ReplyState {
+    let plan = RoutePlan {
         sender: initiator.clone(),
         minimum_receive,
         stages,
+    };
+    ROUTE_PLANS.save(deps.storage, reply_id, &plan)?;
+
+    let mut initial_exec_state = ExecutionState {
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
         replies_expected: 0,
         accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
-        conversion_target_asset: None,
         pending_path_op: None,
     };
 
-    proceed_to_next_step(&mut deps, env, &mut initial_state, reply_id)
+    proceed_to_next_step(&mut deps, env, &mut initial_exec_state, &plan, reply_id)
 }
 
 pub fn create_swap_cosmos_msg(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     operation: &Operation,
-    offer_asset_info: &external::AssetInfo,
+    offer_asset_info: &amm::AssetInfo,
     amount: Uint128,
     env: &Env,
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
@@ -91,8 +96,8 @@ pub fn create_swap_cosmos_msg(
 
     let cosmos_msg = match operation {
         Operation::AmmSwap(amm_op) => {
-            let amm_swap_msg = AmmPairExecuteMsg::Swap {
-                offer_asset: external::Asset {
+            let amm_swap_msg = amm::AmmPairExecuteMsg::Swap {
+                offer_asset: amm::Asset {
                     info: offer_asset_info.clone(),
                     amount,
                 },
@@ -103,7 +108,7 @@ pub fn create_swap_cosmos_msg(
             };
 
             match offer_asset_info {
-                external::AssetInfo::NativeToken { denom } => CosmosMsg::Wasm(WasmMsg::Execute {
+                amm::AssetInfo::NativeToken { denom } => CosmosMsg::Wasm(WasmMsg::Execute {
                     contract_addr: amm_op.pool_address.clone(),
                     msg: to_json_binary(&amm_swap_msg)?,
                     funds: vec![Coin {
@@ -111,7 +116,7 @@ pub fn create_swap_cosmos_msg(
                         amount,
                     }],
                 }),
-                external::AssetInfo::Token { contract_addr } => {
+                amm::AssetInfo::Token { contract_addr } => {
                     let cw20_send_msg = Cw20ExecuteMsg::Send {
                         contract: amm_op.pool_address.clone(),
                         amount,
@@ -129,14 +134,14 @@ pub fn create_swap_cosmos_msg(
         Operation::OrderbookSwap(ob_op) => {
             let offer_denom =
                 match &ob_op.offer_asset_info {
-                    external::AssetInfo::NativeToken { denom } => denom.clone(),
+                    amm::AssetInfo::NativeToken { denom } => denom.clone(),
                     _ => return Err(ContractError::Std(StdError::generic_err(
                         "This OrderbookSwapOp implementation only supports native token inputs.",
                     ))),
                 };
 
             let target_denom = match &ob_op.ask_asset_info {
-                external::AssetInfo::NativeToken { denom } => denom.clone(),
+                amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
                     return Err(ContractError::Std(StdError::generic_err(
                         "Orderbook swaps only support native token (bank) outputs.",
@@ -155,14 +160,14 @@ pub fn create_swap_cosmos_msg(
             let expected_output_fp = simulation_response.result_quantity;
             let slippage = FPDecimal::from_str("0.005")?;
             let min_output_fp = expected_output_fp * (FPDecimal::ONE - slippage);
-            let swap_msg = OrderbookExecuteMsg::SwapMinOutput {
+            let swap_msg = orderbook::OrderbookExecuteMsg::SwapMinOutput {
                 target_denom,
                 min_output_quantity: min_output_fp,
             };
 
             let funds = vec![Coin {
                 denom: match &ob_op.offer_asset_info {
-                    external::AssetInfo::NativeToken { denom } => denom.clone(),
+                    amm::AssetInfo::NativeToken { denom } => denom.clone(),
                     _ => unreachable!(),
                 },
                 amount,
@@ -244,4 +249,73 @@ pub fn update_fee_collector(
     Ok(Response::new()
         .add_attribute("action", "update_fee_collector")
         .add_attribute("new_fee_collector", new_collector_addr))
+}
+
+pub fn emergency_withdraw(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    info: MessageInfo,
+    asset_info: amm::AssetInfo,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    // 1. Authorization Check
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let (amount_to_withdraw, send_msg) = match asset_info.clone() {
+        amm::AssetInfo::NativeToken { denom } => {
+            // 2a. Query the contract's native token balance
+            let balance = deps.querier.query_balance(&env.contract.address, denom)?;
+
+            if balance.amount.is_zero() {
+                // Return success but do nothing if balance is zero
+                (balance.amount, None)
+            } else {
+                // 3a. Create a BankMsg to send the full balance to the admin
+                let msg = CosmosMsg::Bank(BankMsg::Send {
+                    to_address: info.sender.to_string(),
+                    amount: vec![balance.clone()],
+                });
+                (balance.amount, Some(msg))
+            }
+        }
+        amm::AssetInfo::Token { contract_addr } => {
+            // 2b. Query the contract's CW20 token balance
+            let balance_response: BalanceResponse = deps.querier.query_wasm_smart(
+                contract_addr.clone(),
+                &Cw20QueryMsg::Balance {
+                    address: env.contract.address.to_string(),
+                },
+            )?;
+
+            if balance_response.balance.is_zero() {
+                // Return success but do nothing if balance is zero
+                (balance_response.balance, None)
+            } else {
+                // 3b. Create a WasmMsg to transfer the full balance to the admin
+                let msg = CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr,
+                    msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                        recipient: info.sender.to_string(),
+                        amount: balance_response.balance,
+                    })?,
+                    funds: vec![],
+                });
+                (balance_response.balance, Some(msg))
+            }
+        }
+    };
+
+    let mut response = Response::new()
+        .add_attribute("action", "emergency_withdraw")
+        .add_attribute("recipient", info.sender.to_string())
+        .add_attribute("asset", format!("{:?}", asset_info))
+        .add_attribute("withdrawn_amount", amount_to_withdraw.to_string());
+
+    if let Some(msg) = send_msg {
+        response = response.add_message(msg);
+    }
+
+    Ok(response)
 }

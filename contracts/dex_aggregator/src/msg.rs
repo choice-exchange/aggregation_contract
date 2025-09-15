@@ -3,12 +3,10 @@ use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
 use cw20::Cw20ReceiveMsg;
-use injective_math::FPDecimal;
 
 pub mod cw20_adapter {
-    use cosmwasm_std::Binary;
-
     use super::*;
+    use cosmwasm_std::Binary;
 
     #[cw_serde]
     pub struct InstantiateMsg {}
@@ -47,8 +45,7 @@ pub mod cw20_adapter {
     }
 }
 
-pub mod external {
-
+pub mod amm {
     use super::*;
 
     #[cw_serde]
@@ -74,6 +71,17 @@ pub mod external {
         pub return_amount: Uint128,
         pub spread_amount: Uint128,
         pub commission_amount: Uint128,
+    }
+
+    #[cw_serde]
+    pub enum AmmPairExecuteMsg {
+        Swap {
+            offer_asset: amm::Asset,
+            belief_price: Option<Decimal>,
+            max_spread: Option<Decimal>,
+            to: Option<String>,
+            deadline: Option<u64>,
+        },
     }
 }
 
@@ -101,20 +109,28 @@ pub mod orderbook {
         pub expected_fees: Vec<FPCoin>,
         pub result_quantity: FPDecimal,
     }
+
+    #[cw_serde]
+    pub enum OrderbookExecuteMsg {
+        SwapMinOutput {
+            target_denom: String,
+            min_output_quantity: FPDecimal,
+        },
+    }
 }
 
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
-    pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
+    pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: amm::AssetInfo,
 }
 
 #[cw_serde]
 pub struct OrderbookSwapOp {
     pub swap_contract: String,
-    pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
+    pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: amm::AssetInfo,
 }
 
 #[cw_serde]
@@ -142,12 +158,12 @@ pub struct PlannedSwap {
 
 pub struct StagePlan {
     pub swaps_to_execute: Vec<PlannedSwap>,
-    pub conversions_needed: Vec<(external::Asset, external::AssetInfo)>,
+    pub conversions_needed: Vec<(amm::Asset, amm::AssetInfo)>,
 }
 
 #[cw_serde]
 pub enum Cw20HookMsg {
-    AggregateSwaps {
+    ExecuteRoute {
         stages: Vec<Stage>,
         minimum_receive: Option<String>,
     },
@@ -162,11 +178,12 @@ pub struct InstantiateMsg {
 
 #[cw_serde]
 pub enum ExecuteMsg {
-    AggregateSwaps {
+    ExecuteRoute {
         stages: Vec<Stage>,
         minimum_receive: Option<String>,
     },
     Receive(Cw20ReceiveMsg),
+    // Admin-only
     UpdateAdmin {
         new_admin: String,
     },
@@ -174,14 +191,31 @@ pub enum ExecuteMsg {
         pool_address: String,
         fee_percent: Decimal,
     },
-    /// Admin-only. Removes the fee configuration for a specific pool.
     RemoveFee {
         pool_address: String,
     },
-    /// Admin-only. Updates the address where fees are sent.
     UpdateFeeCollector {
         new_fee_collector: String,
     },
+    EmergencyWithdraw {
+        asset_info: amm::AssetInfo,
+    },
+}
+
+#[cw_serde]
+pub struct FeeInfo {
+    pub pool_address: String,
+    pub fee_percent: Decimal,
+}
+
+#[cw_serde]
+pub struct FeeResponse {
+    pub fee: Option<Decimal>,
+}
+
+#[cw_serde]
+pub struct AllFeesResponse {
+    pub fees: Vec<FeeInfo>,
 }
 
 #[cw_serde]
@@ -191,29 +225,16 @@ pub enum QueryMsg {
     SimulateRoute { stages: Vec<Stage>, amount_in: Coin },
     #[returns(Config)]
     Config {},
+    #[returns(FeeResponse)]
+    FeeForPool { pool_address: String },
+    #[returns(AllFeesResponse)]
+    AllFees {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
 }
 
 #[cw_serde]
 pub struct SimulateRouteResponse {
     pub output_amount: Uint128,
-}
-
-#[cosmwasm_schema::cw_serde]
-pub enum AmmPairExecuteMsg {
-    Swap {
-        offer_asset: external::Asset,
-        belief_price: Option<Decimal>,
-        max_spread: Option<Decimal>,
-        to: Option<String>,
-        deadline: Option<u64>,
-    },
-}
-
-/// The ExecuteMsg format for the Orderbook swap contract.
-#[cosmwasm_schema::cw_serde]
-pub enum OrderbookExecuteMsg {
-    SwapMinOutput {
-        target_denom: String,
-        min_output_quantity: FPDecimal,
-    },
 }

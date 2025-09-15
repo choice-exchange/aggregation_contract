@@ -1,4 +1,4 @@
-use crate::msg::{external, Operation, PlannedSwap, Stage};
+use crate::msg::{amm, Operation, PlannedSwap, Stage};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Decimal, Uint128};
 use cw_storage_plus::{Item, Map};
@@ -41,7 +41,7 @@ pub struct ExecutionState {
     pub awaiting: Awaiting,
     pub current_stage_index: u64,
     pub replies_expected: u64,
-    pub accumulated_assets: Vec<external::Asset>,
+    pub accumulated_assets: Vec<amm::Asset>,
     pub pending_swaps: Vec<PlannedSwap>,
     pub pending_path_op: Option<PendingPathOp>,
 }

@@ -1,6 +1,6 @@
 use crate::error::ContractError;
 use crate::execute::create_swap_cosmos_msg;
-use crate::msg::{cw20_adapter, external, Operation, PlannedSwap, Stage, StagePlan};
+use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
 use crate::state::{
     Awaiting, Config, ExecutionState, PendingPathOp, RoutePlan, CONFIG, EXECUTION_STATES, FEE_MAP,
     ROUTE_PLANS,
@@ -165,7 +165,7 @@ fn handle_swap_reply(
 
     if let Some(next_op) = replied_path.get(op_index + 1) {
         let required_input_info = get_operation_input(next_op)?;
-        let offer_asset_for_next_op = external::Asset {
+        let offer_asset_for_next_op = amm::Asset {
             info: received_asset_info,
             amount: received_amount,
         };
@@ -208,7 +208,7 @@ fn handle_swap_reply(
             None => Uint128::zero(),
         };
         let amount_after_fee = received_amount.checked_sub(fee).map_err(StdError::from)?;
-        exec_state.accumulated_assets.push(external::Asset {
+        exec_state.accumulated_assets.push(amm::Asset {
             // Mutate exec_state
             info: received_asset_info.clone(),
             amount: amount_after_fee,
@@ -237,20 +237,18 @@ fn handle_swap_reply(
 // A helper to create the final transfer message.
 fn create_send_msg(
     recipient: &Addr,
-    asset_info: &external::AssetInfo,
+    asset_info: &amm::AssetInfo,
     amount: Uint128,
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
     match asset_info {
-        external::AssetInfo::NativeToken { denom } => {
-            Ok(CosmosMsg::Bank(cosmwasm_std::BankMsg::Send {
-                to_address: recipient.to_string(),
-                amount: vec![Coin {
-                    denom: denom.clone(),
-                    amount,
-                }],
-            }))
-        }
-        external::AssetInfo::Token { contract_addr } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+        amm::AssetInfo::NativeToken { denom } => Ok(CosmosMsg::Bank(cosmwasm_std::BankMsg::Send {
+            to_address: recipient.to_string(),
+            amount: vec![Coin {
+                denom: denom.clone(),
+                amount,
+            }],
+        })),
+        amm::AssetInfo::Token { contract_addr } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: contract_addr.clone(),
             msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
                 recipient: recipient.to_string(),
@@ -320,7 +318,7 @@ fn handle_final_stage(
         // SCENARIO B: Conversions are needed. Set up the exec_state for the final reply.
         exec_state.awaiting = Awaiting::FinalConversions;
         exec_state.replies_expected = conversion_submsgs.len() as u64;
-        exec_state.accumulated_assets = vec![external::Asset {
+        exec_state.accumulated_assets = vec![amm::Asset {
             info: target_asset_info,
             amount: ready_amount,
         }];
@@ -412,13 +410,13 @@ fn handle_conversion_reply(
 }
 
 fn create_conversion_msg(
-    from: &external::Asset,
+    from: &amm::Asset,
     config: &Config,
     env: &Env,
 ) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
     match &from.info {
         // Convert CW20 -> Native
-        external::AssetInfo::Token { contract_addr } => {
+        amm::AssetInfo::Token { contract_addr } => {
             // This flow uses Cw20::Send which calls the adapter's `Receive` hook.
             let send_msg = Cw20ExecuteMsg::Send {
                 contract: config.cw20_adapter_address.to_string(),
@@ -434,7 +432,7 @@ fn create_conversion_msg(
             }))
         }
         // Convert Native -> CW20
-        external::AssetInfo::NativeToken { denom } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+        amm::AssetInfo::NativeToken { denom } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: config.cw20_adapter_address.to_string(),
             msg: to_json_binary(&cw20_adapter::ExecuteMsg::RedeemAndTransfer {
                 recipient: Some(env.contract.address.to_string()),
@@ -447,7 +445,7 @@ fn create_conversion_msg(
     }
 }
 
-fn get_operation_output(op: &Operation) -> Result<external::AssetInfo, ContractError> {
+fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError> {
     Ok(match op {
         Operation::AmmSwap(o) => o.ask_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.ask_asset_info.clone(),
@@ -545,22 +543,22 @@ fn parse_amount_from_conversion_reply(msg: &Reply, env: &Env) -> Result<Uint128,
 }
 
 fn plan_next_stage(
-    accumulated_assets: &[external::Asset],
+    accumulated_assets: &[amm::Asset],
     next_stage: &Stage,
 ) -> Result<StagePlan, ContractError> {
-    let mut native_info: Option<external::AssetInfo> = None;
-    let mut cw20_info: Option<external::AssetInfo> = None;
+    let mut native_info: Option<amm::AssetInfo> = None;
+    let mut cw20_info: Option<amm::AssetInfo> = None;
 
     for split in &next_stage.splits {
         let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
         let offer_info = get_operation_input(first_op)?;
         match offer_info {
-            external::AssetInfo::NativeToken { .. } => {
+            amm::AssetInfo::NativeToken { .. } => {
                 if native_info.is_none() {
                     native_info = Some(offer_info);
                 }
             }
-            external::AssetInfo::Token { .. } => {
+            amm::AssetInfo::Token { .. } => {
                 if cw20_info.is_none() {
                     cw20_info = Some(offer_info);
                 }
@@ -572,10 +570,10 @@ fn plan_next_stage(
     let mut cw20_have = Uint128::zero();
     for asset in accumulated_assets {
         match &asset.info {
-            external::AssetInfo::NativeToken { .. } => {
+            amm::AssetInfo::NativeToken { .. } => {
                 native_have += asset.amount;
             }
-            external::AssetInfo::Token { .. } => {
+            amm::AssetInfo::Token { .. } => {
                 cw20_have += asset.amount;
             }
         }
@@ -589,17 +587,17 @@ fn plan_next_stage(
         let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
         let offer_info = get_operation_input(first_op)?;
         match offer_info {
-            external::AssetInfo::NativeToken { .. } => total_native_needs += amount_for_split,
-            external::AssetInfo::Token { .. } => total_cw20_needs += amount_for_split,
+            amm::AssetInfo::NativeToken { .. } => total_native_needs += amount_for_split,
+            amm::AssetInfo::Token { .. } => total_cw20_needs += amount_for_split,
         }
     }
 
-    let mut conversions_needed: Vec<(external::Asset, external::AssetInfo)> = vec![];
+    let mut conversions_needed: Vec<(amm::Asset, amm::AssetInfo)> = vec![];
     if native_have > total_native_needs {
         if let Some(target_info) = &cw20_info {
             let native_asset_to_convert_info = accumulated_assets
                 .iter()
-                .find(|a| matches!(a.info, external::AssetInfo::NativeToken { .. }))
+                .find(|a| matches!(a.info, amm::AssetInfo::NativeToken { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
                     StdError::generic_err(
@@ -608,7 +606,7 @@ fn plan_next_stage(
                 })?;
 
             conversions_needed.push((
-                external::Asset {
+                amm::Asset {
                     info: native_asset_to_convert_info,
                     amount: native_have - total_native_needs,
                 },
@@ -620,7 +618,7 @@ fn plan_next_stage(
         if let Some(target_info) = &native_info {
             let cw20_asset_to_convert_info = accumulated_assets
                 .iter()
-                .find(|a| matches!(a.info, external::AssetInfo::Token { .. }))
+                .find(|a| matches!(a.info, amm::AssetInfo::Token { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
                     StdError::generic_err(
@@ -629,7 +627,7 @@ fn plan_next_stage(
                 })?;
 
             conversions_needed.push((
-                external::Asset {
+                amm::Asset {
                     info: cw20_asset_to_convert_info,
                     amount: cw20_have - total_cw20_needs,
                 },
@@ -653,8 +651,8 @@ fn plan_next_stage(
                 .map_err(StdError::from)?
         };
         match offer_info {
-            external::AssetInfo::NativeToken { .. } => native_allocated += amount_for_split,
-            external::AssetInfo::Token { .. } => cw20_allocated += amount_for_split,
+            amm::AssetInfo::NativeToken { .. } => native_allocated += amount_for_split,
+            amm::AssetInfo::Token { .. } => cw20_allocated += amount_for_split,
         }
         swaps_to_execute.push(PlannedSwap {
             operation: first_op.clone(),
@@ -668,7 +666,7 @@ fn plan_next_stage(
     })
 }
 
-fn get_operation_input(op: &Operation) -> Result<external::AssetInfo, ContractError> {
+fn get_operation_input(op: &Operation) -> Result<amm::AssetInfo, ContractError> {
     Ok(match op {
         Operation::AmmSwap(o) => o.offer_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.offer_asset_info.clone(),

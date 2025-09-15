@@ -1,5 +1,11 @@
 # Choice Aggregation Contract
 
+## Mainnet Deployment
+
+Code Id: 1817
+
+Address: `inj1m4xetr87wenaffq0ehhjewxpl9l7detuxtxduv`
+
 ## Getting Started
 
 ### Prerequisites

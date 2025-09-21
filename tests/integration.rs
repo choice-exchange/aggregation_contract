@@ -321,6 +321,7 @@ fn test_aggregate_swap_success() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
                     })],
                 },
             ],
@@ -407,6 +408,7 @@ fn test_multi_stage_aggregate_swap_success() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
+                        min_quantity_tick_size: Uint128::new(10000),
                     })],
                 }],
             },
@@ -985,6 +987,7 @@ fn test_full_normalization_route() {
                             ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
+                            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
                         })],
                     },
                     Split {
@@ -1070,6 +1073,7 @@ fn test_multi_stage_with_final_normalization() {
                         ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        min_quantity_tick_size: Uint128::new(10000),
                     })],
                 }],
             },
@@ -1098,6 +1102,7 @@ fn test_multi_stage_with_final_normalization() {
                             ask_asset_info: amm::AssetInfo::NativeToken {
                                 denom: native_shroom_denom.clone(),
                             },
+                            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
                         })],
                     },
                 ],
@@ -1278,6 +1283,7 @@ fn test_reverse_normalization_route() {
                         ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
+                        min_quantity_tick_size: Uint128::new(10000),
                     })],
                 }],
             },
@@ -1377,6 +1383,7 @@ fn test_failure_if_minimum_receive_not_met() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
                     })],
                 },
             ],
@@ -1553,6 +1560,7 @@ fn test_mixed_input_unified_output_reconciliation() {
                     swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
+                    min_quantity_tick_size: Uint128::new(10000),
                 })],
             },
             Split {
@@ -1661,6 +1669,7 @@ fn test_cw20_input_with_initial_reconciliation() {
                     swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
+                    min_quantity_tick_size: Uint128::new(10000),
                 })],
             },
             Split {
@@ -1765,6 +1774,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                     swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
                     offer_asset_info: inj_info.clone(),
                     ask_asset_info: native_shroom_info.clone(),
+                    min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
                 })],
             },
             Split {
@@ -1789,6 +1799,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                     swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
+                    min_quantity_tick_size: Uint128::new(10000),
                 })],
             },
             Split {
@@ -2161,6 +2172,7 @@ fn test_stage_with_single_hundred_percent_split() {
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "usdt".to_string(),
                 },
+                min_quantity_tick_size: Uint128::new(10000),
             })],
         }],
     };
@@ -2239,6 +2251,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "usdt".to_string(),
                 },
+                min_quantity_tick_size: Uint128::new(10000),
             })],
         }],
     };
@@ -3076,12 +3089,14 @@ fn test_multi_hop_path_with_mid_path_conversion() {
             swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
             offer_asset_info: native_shroom_info.clone(),
             ask_asset_info: usdt_info.clone(),
+            min_quantity_tick_size: Uint128::new(10000),
         }),
         // Hop 3: USDT -> INJ
         Operation::OrderbookSwap(OrderbookSwapOp {
             swap_contract: setup.mock_usdt_to_inj_ob.clone(),
             offer_asset_info: usdt_info.clone(),
             ask_asset_info: inj_info.clone(),
+            min_quantity_tick_size: Uint128::new(10000),
         }),
     ];
 

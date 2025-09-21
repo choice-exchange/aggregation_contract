@@ -460,7 +460,7 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
         .map_err(|e| ContractError::SubmessageResultError { error: e })?
         .events;
 
-    let amount_str_opt = events // Changed to an Option
+    let amount_str_opt = events 
         .iter()
         .find_map(|event| {
             if !event.ty.starts_with("wasm") {
@@ -479,9 +479,18 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
         });
 
     match amount_str_opt {
-        Some(amount_str) => amount_str
-            .parse::<Uint128>()
-            .map_err(|_| ContractError::MalformedAmountInReply { value: amount_str }),
+        Some(amount_str) => {
+            let integer_part_str = if let Some(period_pos) = amount_str.find('.') {
+                &amount_str[..period_pos]
+            } else {
+                &amount_str
+            };
+
+            integer_part_str
+                .parse::<Uint128>()
+                .map_err(|_| ContractError::MalformedAmountInReply { value: amount_str })
+            
+        }
         None => Ok(Uint128::zero()),
     }
 }

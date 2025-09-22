@@ -135,11 +135,11 @@ pub fn create_swap_cosmos_msg(
             let tick_size_atomic = ob_op.min_quantity_tick_size;
 
             if tick_size_atomic.is_zero() {
-                 return Err(ContractError::Std(StdError::generic_err(
+                return Err(ContractError::Std(StdError::generic_err(
                     "min_quantity_tick_size cannot be zero",
                 )));
             }
-            
+
             let ratio = amount / tick_size_atomic;
             let rounded_atomic_amount = ratio * tick_size_atomic;
 
@@ -152,7 +152,7 @@ pub fn create_swap_cosmos_msg(
             }
 
             let quantity_for_query_fp = FPDecimal::from(rounded_atomic_amount);
-            
+
             let offer_denom =
                 match &ob_op.offer_asset_info {
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
@@ -194,7 +194,7 @@ pub fn create_swap_cosmos_msg(
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
                     _ => unreachable!(),
                 },
-                amount: rounded_atomic_amount, 
+                amount: rounded_atomic_amount,
             }];
 
             CosmosMsg::Wasm(WasmMsg::Execute {

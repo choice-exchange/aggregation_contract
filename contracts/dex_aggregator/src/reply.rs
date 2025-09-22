@@ -460,23 +460,21 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
         .map_err(|e| ContractError::SubmessageResultError { error: e })?
         .events;
 
-    let amount_str_opt = events 
-        .iter()
-        .find_map(|event| {
-            if !event.ty.starts_with("wasm") {
-                return None;
-            }
-            let key = if event.ty == "wasm-atomic_swap_execution" {
-                "swap_final_amount"
-            } else {
-                "return_amount"
-            };
-            event
-                .attributes
-                .iter()
-                .find(|attr| attr.key == key)
-                .map(|attr| attr.value.clone())
-        });
+    let amount_str_opt = events.iter().find_map(|event| {
+        if !event.ty.starts_with("wasm") {
+            return None;
+        }
+        let key = if event.ty == "wasm-atomic_swap_execution" {
+            "swap_final_amount"
+        } else {
+            "return_amount"
+        };
+        event
+            .attributes
+            .iter()
+            .find(|attr| attr.key == key)
+            .map(|attr| attr.value.clone())
+    });
 
     match amount_str_opt {
         Some(amount_str) => {
@@ -489,7 +487,6 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
             integer_part_str
                 .parse::<Uint128>()
                 .map_err(|_| ContractError::MalformedAmountInReply { value: amount_str })
-            
         }
         None => Ok(Uint128::zero()),
     }

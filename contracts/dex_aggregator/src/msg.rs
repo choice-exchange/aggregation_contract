@@ -131,6 +131,7 @@ pub struct OrderbookSwapOp {
     pub swap_contract: String,
     pub offer_asset_info: amm::AssetInfo,
     pub ask_asset_info: amm::AssetInfo,
+    pub min_quantity_tick_size: Uint128,
 }
 
 #[cw_serde]

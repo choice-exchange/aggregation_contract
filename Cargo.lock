@@ -1751,7 +1751,6 @@ dependencies = [
  "cosmwasm-schema",
  "cosmwasm-std",
  "cw-storage-plus",
- "cw2",
  "cw20",
  "cw20-base",
  "hex",
@@ -1763,7 +1762,6 @@ dependencies = [
  "serde-json-wasm",
  "serde_json",
  "serde_repr",
- "thiserror 2.0.16",
 ]
 
 [[package]]

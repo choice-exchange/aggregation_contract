@@ -132,6 +132,27 @@ pub fn create_swap_cosmos_msg(
             }
         }
         Operation::OrderbookSwap(ob_op) => {
+            let tick_size_atomic = ob_op.min_quantity_tick_size;
+
+            if tick_size_atomic.is_zero() {
+                return Err(ContractError::Std(StdError::generic_err(
+                    "min_quantity_tick_size cannot be zero",
+                )));
+            }
+
+            let ratio = amount / tick_size_atomic;
+            let rounded_atomic_amount = ratio * tick_size_atomic;
+
+            if rounded_atomic_amount.is_zero() {
+                return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: env.contract.address.to_string(),
+                    msg: to_json_binary(&{})?,
+                    funds: vec![],
+                }));
+            }
+
+            let quantity_for_query_fp = FPDecimal::from(rounded_atomic_amount);
+
             let offer_denom =
                 match &ob_op.offer_asset_info {
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
@@ -150,7 +171,7 @@ pub fn create_swap_cosmos_msg(
             };
 
             let simulate_msg = msg::orderbook::QueryMsg::GetOutputQuantity {
-                from_quantity: amount.into(),
+                from_quantity: quantity_for_query_fp,
                 source_denom: offer_denom,
                 target_denom: target_denom.clone(),
             };
@@ -159,10 +180,13 @@ pub fn create_swap_cosmos_msg(
                 .query_wasm_smart(&ob_op.swap_contract, &simulate_msg)?;
             let expected_output_fp = simulation_response.result_quantity;
             let slippage = FPDecimal::from_str("0.005")?;
-            let min_output_fp = expected_output_fp * (FPDecimal::ONE - slippage);
+
+            let min_output_with_slippage_fp = expected_output_fp * (FPDecimal::ONE - slippage);
+            let floored_min_output_fp = min_output_with_slippage_fp.int();
+
             let swap_msg = orderbook::OrderbookExecuteMsg::SwapMinOutput {
                 target_denom,
-                min_output_quantity: min_output_fp,
+                min_output_quantity: floored_min_output_fp,
             };
 
             let funds = vec![Coin {
@@ -170,7 +194,7 @@ pub fn create_swap_cosmos_msg(
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
                     _ => unreachable!(),
                 },
-                amount,
+                amount: rounded_atomic_amount,
             }];
 
             CosmosMsg::Wasm(WasmMsg::Execute {

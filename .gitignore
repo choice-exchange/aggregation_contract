@@ -3,3 +3,5 @@ deploy_testnet.sh
 deploy_mainnet.sh
 
 .env
+
+scripts/

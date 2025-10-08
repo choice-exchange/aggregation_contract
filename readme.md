@@ -2,17 +2,17 @@
 
 ## Mainnet Deployment
 
-Code Id: 1817
+Code Id: 1860
 
-Address: `inj1m4xetr87wenaffq0ehhjewxpl9l7detuxtxduv`
+Address: `inj1g5nuy2c6up2f2z0dqf4qayl9seeg7enq3xxaks`
 
 ## Getting Started
 
 ### Prerequisites
 
--   [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
--   `rustup` target for Wasm: `rustup target add wasm32-unknown-unknown`
--   [Docker](https://www.docker.com/get-started/) for reproducible production builds.
+- [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
+- `rustup` target for Wasm: `rustup target add wasm32-unknown-unknown`
+- [Docker](https://www.docker.com/get-started/) for reproducible production builds.
 
 ---
 
@@ -185,6 +185,7 @@ pub struct OrderbookSwapOp {
     pub swap_contract: String,
     pub offer_asset_info: external::AssetInfo,
     pub ask_asset_info: external::AssetInfo,
+    pub min_quantity_tick_size: Uint128,
 }
 ```
 
@@ -214,7 +215,8 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
                 "orderbook_swap": {
                   "swap_contract": "inj1...",
                   "offer_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
-                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } }
+                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } },
+                  "min_quantity_tick_size": 100000000
                 }
               }
             ]

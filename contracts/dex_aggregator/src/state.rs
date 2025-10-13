@@ -46,7 +46,14 @@ pub struct ExecutionState {
     pub pending_path_op: Option<PendingPathOp>,
 }
 
+#[cw_serde]
+pub struct SubmsgReplyState {
+    pub master_reply_id: u64,
+    pub split_index: usize,
+    pub op_index: usize,
+}
+
 pub const ROUTE_PLANS: Map<u64, RoutePlan> = Map::new("route_plans");
 pub const EXECUTION_STATES: Map<u64, ExecutionState> = Map::new("execution_states");
-
+pub const SUBMSG_REPLY_STATES: Map<u64, SubmsgReplyState> = Map::new("submsg_reply_states");
 pub const REPLY_ID_COUNTER: Item<u64> = Item::new("reply_id_counter");

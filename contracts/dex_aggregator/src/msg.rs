@@ -155,6 +155,8 @@ pub struct Stage {
 pub struct PlannedSwap {
     pub operation: Operation,
     pub amount: Uint128,
+    pub split_index: usize,
+    pub op_index: usize,
 }
 
 pub struct StagePlan {

@@ -168,7 +168,7 @@ pub struct StagePlan {
 pub enum Cw20HookMsg {
     ExecuteRoute {
         stages: Vec<Stage>,
-        minimum_receive: Option<String>,
+        minimum_receive: Option<Uint128>,
     },
 }
 
@@ -183,7 +183,7 @@ pub struct InstantiateMsg {
 pub enum ExecuteMsg {
     ExecuteRoute {
         stages: Vec<Stage>,
-        minimum_receive: Option<String>,
+        minimum_receive: Option<Uint128>,
     },
     Receive(Cw20ReceiveMsg),
     // Admin-only

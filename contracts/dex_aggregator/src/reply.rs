@@ -12,6 +12,8 @@ use cosmwasm_std::{
 use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
+const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
+
 pub fn handle_reply(
     deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
@@ -215,14 +217,8 @@ fn handle_swap_reply(
     } else {
         let replying_pool_addr = deps.api.addr_validate(get_operation_address(replied_op))?;
 
-        let fee = match FEE_MAP.may_load(deps.storage, &replying_pool_addr)? {
-            Some(fee_percent) => {
-                received_amount.multiply_ratio(fee_percent.atomics(), 1_000_000_000_000_000_000u128)
-            }
-            None => Uint128::zero(),
-        };
+        let (amount_after_fee, fee) = apply_fee(&deps, &replying_pool_addr, received_amount)?;
 
-        let amount_after_fee = received_amount.checked_sub(fee).map_err(StdError::from)?;
         exec_state.accumulated_assets.push(amm::Asset {
             info: received_asset_info.clone(),
             amount: amount_after_fee,
@@ -248,6 +244,20 @@ fn handle_swap_reply(
         }
         Ok(response)
     }
+}
+
+fn apply_fee(
+    deps: &DepsMut<InjectiveQueryWrapper>,
+    pool_addr: &Addr,
+    amount: Uint128,
+) -> Result<(Uint128, Uint128), StdError> {
+    let fee = match FEE_MAP.may_load(deps.storage, pool_addr)? {
+        Some(fee_percent) => amount.multiply_ratio(fee_percent.atomics(), DECIMAL_FRACTIONAL),
+        None => Uint128::zero(),
+    };
+
+    let amount_after_fee = amount.checked_sub(fee)?;
+    Ok((amount_after_fee, fee))
 }
 
 // A helper to create the final transfer message.

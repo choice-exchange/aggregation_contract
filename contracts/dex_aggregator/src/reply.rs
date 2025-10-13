@@ -104,13 +104,27 @@ fn handle_swap_reply(
     submsg_state: SubmsgReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let master_reply_id = submsg_state.master_reply_id;
+    let split_index = submsg_state.split_index;
+    let op_index = submsg_state.op_index;
 
-    let events = &msg
-        .result
-        .clone()
-        .into_result()
-        .map_err(|e| ContractError::SubmessageResultError { error: e })?
-        .events;
+    let current_stage = plan
+        .stages
+        .get(exec_state.current_stage_index as usize)
+        .ok_or(ContractError::EmptyRoute {})?;
+
+    let replied_op = &current_stage.splits[split_index].path[op_index];
+
+    let events = &match msg.result.into_result() {
+        Ok(response) => response.events,
+        Err(e) => {
+            return Err(ContractError::SubmessageFailed {
+                split_index,
+                op_index,
+                contract_addr: get_operation_address(replied_op).to_string(),
+                error: e,
+            });
+        }
+    };
 
     let swap_event_opt = events.iter().rev().find(|e| {
         e.ty.starts_with("wasm")
@@ -131,17 +145,7 @@ fn handle_swap_reply(
         }
     }
 
-    let split_index = submsg_state.split_index;
-    let op_index = submsg_state.op_index;
-
-    let current_stage = plan
-        .stages
-        .get(exec_state.current_stage_index as usize)
-        .ok_or(ContractError::EmptyRoute {})?;
-
-    let replied_op = &current_stage.splits[split_index].path[op_index];
-
-    let received_amount = parse_amount_from_swap_reply(&msg)?;
+    let received_amount = parse_amount_from_swap_reply(events)?;
     let received_asset_info = get_operation_output(replied_op)?;
 
     let replied_path = &current_stage.splits[split_index].path;
@@ -280,9 +284,11 @@ fn handle_final_stage(
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if exec_state.accumulated_assets.is_empty() {
         if !plan.minimum_receive.is_zero() {
-            return Err(ContractError::MinimumReceiveNotMet {});
+            return Err(ContractError::MinimumReceiveNotMet {
+                minimum_receive: plan.minimum_receive,
+                actual_receive: Uint128::zero(),
+            });
         }
-        // CLEANUP HERE
         EXECUTION_STATES.remove(deps.storage, reply_id);
         ROUTE_PLANS.remove(deps.storage, reply_id);
         return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty"));
@@ -309,7 +315,10 @@ fn handle_final_stage(
         let total_final_amount = ready_amount;
         // Check against minimum_receive from the immutable plan
         if total_final_amount < plan.minimum_receive {
-            return Err(ContractError::MinimumReceiveNotMet {});
+            return Err(ContractError::MinimumReceiveNotMet {
+                minimum_receive: plan.minimum_receive,
+                actual_receive: total_final_amount,
+            });
         }
 
         let mut response = Response::new();
@@ -351,8 +360,16 @@ fn handle_final_conversion_reply(
     exec_state: &mut ExecutionState,
     plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if msg.result.is_err() {
+        return Err(ContractError::ConversionFailed {
+            awaiting_state: "FinalConversions".to_string(),
+            error: msg.result.unwrap_err(),
+        });
+    }
+
     let reply_id = msg.id;
-    let converted_amount = parse_amount_from_conversion_reply(&msg, &env)?;
+    let events = &msg.result.into_result().unwrap().events;
+    let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let running_total_asset = exec_state.accumulated_assets.get_mut(0).ok_or_else(|| {
         StdError::generic_err("Final conversion state is invalid: no accumulated asset found")
@@ -372,7 +389,10 @@ fn handle_final_conversion_reply(
     let final_asset_info = running_total_asset.info.clone();
 
     if total_final_amount < plan.minimum_receive {
-        return Err(ContractError::MinimumReceiveNotMet {});
+        return Err(ContractError::MinimumReceiveNotMet {
+            minimum_receive: plan.minimum_receive,
+            actual_receive: total_final_amount,
+        });
     }
 
     let mut response = Response::new();
@@ -385,7 +405,6 @@ fn handle_final_conversion_reply(
     EXECUTION_STATES.remove(deps.storage, reply_id);
     ROUTE_PLANS.remove(deps.storage, reply_id);
 
-    // State cleanup is now handled in the main `handle_reply` function
     Ok(response
         .add_attribute("action", "aggregate_swap_complete")
         .add_attribute("final_received", total_final_amount.to_string()))
@@ -398,11 +417,17 @@ fn handle_conversion_reply(
     exec_state: &mut ExecutionState,
     plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if msg.result.is_err() {
+        return Err(ContractError::ConversionFailed {
+            awaiting_state: "Conversions".to_string(),
+            error: msg.result.unwrap_err(),
+        });
+    }
+
     let master_reply_id = msg.id;
-    exec_state.replies_expected -= 1; // Mutate exec_state
+    exec_state.replies_expected -= 1;
 
     if exec_state.replies_expected > 0 {
-        // Save the small, mutated exec_state
         EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
         return Ok(Response::new().add_attribute("action", "accumulating_conversion_outputs"));
     }
@@ -464,14 +489,7 @@ fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError>
     })
 }
 
-fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
-    let events = msg
-        .result
-        .clone()
-        .into_result()
-        .map_err(|e| ContractError::SubmessageResultError { error: e })?
-        .events;
-
+fn parse_amount_from_swap_reply(events: &[cosmwasm_std::Event]) -> Result<Uint128, ContractError> {
     let amount_str_opt = events.iter().find_map(|event| {
         if !event.ty.starts_with("wasm") {
             return None;
@@ -504,14 +522,10 @@ fn parse_amount_from_swap_reply(msg: &Reply) -> Result<Uint128, ContractError> {
     }
 }
 
-fn parse_amount_from_conversion_reply(msg: &Reply, env: &Env) -> Result<Uint128, ContractError> {
-    let events = &msg
-        .result
-        .clone()
-        .into_result()
-        .map_err(|e| ContractError::SubmessageResultError { error: e })?
-        .events;
-
+fn parse_amount_from_conversion_reply(
+    events: &[cosmwasm_std::Event],
+    env: &Env,
+) -> Result<Uint128, ContractError> {
     if let Some(transfer_event) = events.iter().find(|e| {
         e.ty == "transfer"
             && e.attributes
@@ -760,8 +774,16 @@ fn handle_path_conversion_reply(
     exec_state: &mut ExecutionState,
     plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if msg.result.is_err() {
+        return Err(ContractError::ConversionFailed {
+            awaiting_state: "PathConversion".to_string(),
+            error: msg.result.unwrap_err(),
+        });
+    }
+
     let master_reply_id = msg.id;
-    let converted_amount = parse_amount_from_conversion_reply(&msg, &env)?;
+    let events = &msg.result.into_result().unwrap().events;
+    let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let pending_op_details = exec_state.pending_path_op.take().ok_or_else(|| {
         StdError::generic_err("Path conversion state is invalid: no pending operation found")

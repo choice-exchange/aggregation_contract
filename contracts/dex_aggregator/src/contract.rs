@@ -50,7 +50,9 @@ pub fn execute(
         } => {
             // This is the entry point for NATIVE token swaps
             if info.funds.len() != 1 {
-                return Err(ContractError::InvalidFunds {});
+                return Err(ContractError::InvalidFunds {
+                    sent: info.funds.len(),
+                });
             }
             let offer_asset = amm::Asset {
                 info: amm::AssetInfo::NativeToken {

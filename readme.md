@@ -150,7 +150,7 @@ pub struct ExecuteMsg::AggregateSwaps {
 
     /// The minimum amount of the *final* output token the user is willing to receive.
     /// If the final balance held by the contract is less than this, the transaction reverts.
-    pub minimum_receive: Option<String>,
+    pub minimum_receive: Option<Uint128>,
 }
 
 pub struct Stage {

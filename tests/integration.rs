@@ -326,7 +326,7 @@ fn test_aggregate_swap_success() {
                 },
             ],
         }],
-        minimum_receive: Some("1910000000".to_string()), // Min 1910 USDT
+        minimum_receive: Some(Uint128::new(1910000000)), // Min 1910 USDT
     };
 
     let res = wasm.execute(
@@ -443,7 +443,7 @@ fn test_multi_stage_aggregate_swap_success() {
             },
         ],
         // The minimum we expect from summing the Stage 2 outputs.
-        minimum_receive: Some("1500000000000".to_string()), // 1,500,000 USDT
+        minimum_receive: Some(Uint128::new(1500000000000)), // 1,500,000 USDT
     };
 
     // The initial funds for this route are 1,000,000 USDT
@@ -1020,7 +1020,7 @@ fn test_full_normalization_route() {
                 }],
             },
         ],
-        minimum_receive: Some("97000000".to_string()), // 97 SAI
+        minimum_receive: Some(Uint128::new(97000000)), // 97 SAI
     };
 
     let res = wasm.execute(
@@ -1109,7 +1109,7 @@ fn test_multi_stage_with_final_normalization() {
             },
         ],
         // The final expected output is unified CW20 SHROOM
-        minimum_receive: Some("9900000000".to_string()), // Min 9,900 CW20 SHROOM
+        minimum_receive: Some(Uint128::new(9900000000)), // Min 9,900 CW20 SHROOM
     };
 
     // The user initiates the swap with 1,000 USDT
@@ -1193,7 +1193,7 @@ fn test_cw20_entry_point_swap_success() {
                 })],
             }],
         }],
-        minimum_receive: Some("99000000".to_string()), // Min 99 SAI
+        minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI
     };
 
     let res = wasm.execute(
@@ -1288,7 +1288,7 @@ fn test_reverse_normalization_route() {
                 }],
             },
         ],
-        minimum_receive: Some("495000000".to_string()), // Min 495 USDT
+        minimum_receive: Some(Uint128::new(495000000)), // Min 495 USDT
     };
 
     let initial_balance = bank
@@ -1389,7 +1389,7 @@ fn test_failure_if_minimum_receive_not_met() {
             ],
         }],
 
-        minimum_receive: Some("1920000001".to_string()),
+        minimum_receive: Some(Uint128::new(1920000001)),
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
@@ -1576,7 +1576,7 @@ fn test_mixed_input_unified_output_reconciliation() {
     };
 
     let msg = ExecuteMsg::ExecuteRoute {
-        minimum_receive: Some("459000000".to_string()), // Min 459 USDT (Target is 460)
+        minimum_receive: Some(Uint128::new(459000000)), // Min 459 USDT (Target is 460)
         stages: vec![stage1, stage2],
     };
 
@@ -1686,7 +1686,7 @@ fn test_cw20_input_with_initial_reconciliation() {
 
     // The hook message sent with the CW20 token
     let hook_msg = Cw20HookMsg::ExecuteRoute {
-        minimum_receive: Some("469000000".to_string()), // Min 469 USDT (Target is 470)
+        minimum_receive: Some(Uint128::new(469000000)), // Min 469 USDT (Target is 470)
         stages: vec![stage1],
     };
 
@@ -1815,7 +1815,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
     };
 
     let msg = ExecuteMsg::ExecuteRoute {
-        minimum_receive: Some("424000000".to_string()), // Min 424 USDT (Target is 425)
+        minimum_receive: Some(Uint128::new(424000000)), // Min 424 USDT (Target is 425)
         stages: vec![stage1, stage2],
     };
 
@@ -1902,7 +1902,7 @@ fn test_final_output_is_cw20_token() {
     };
 
     let msg = ExecuteMsg::ExecuteRoute {
-        minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
+        minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI (Target is 100)
         stages: vec![stage1, stage2],
     };
 
@@ -2019,7 +2019,7 @@ fn test_native_input_with_initial_cw20_requirement() {
     };
 
     let msg = ExecuteMsg::ExecuteRoute {
-        minimum_receive: Some("99000000".to_string()), // Min 99 SAI (Target is 100)
+        minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI (Target is 100)
         stages: vec![stage1],
     };
 
@@ -2179,7 +2179,7 @@ fn test_stage_with_single_hundred_percent_split() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
-        minimum_receive: Some("99000000000000000000".to_string()), // Min 99 INJ
+        minimum_receive: Some(Uint128::new(99000000000000000000)), // Min 99 INJ
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
@@ -2366,7 +2366,7 @@ fn test_fee_collection_on_single_swap() {
                 })],
             }],
         }],
-        minimum_receive: Some("996000000".to_string()), // Min 996 USDT
+        minimum_receive: Some(Uint128::new(996000000)), // Min 996 USDT
     };
 
     let initial_collector_balance_res = bank
@@ -2502,7 +2502,7 @@ fn test_fee_collection_on_cw20_output() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
-        minimum_receive: Some("984000000".to_string()), // Min 984 SHROOM
+        minimum_receive: Some(Uint128::new(984000000)), // Min 984 SHROOM
     };
 
     // Execute the transaction
@@ -2812,7 +2812,7 @@ fn test_multi_split_with_mixed_fees() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
-        minimum_receive: Some("1595000000".to_string()), // Min 1595 USDT
+        minimum_receive: Some(Uint128::new(1595000000)), // Min 1595 USDT
     };
 
     // Execute the transaction
@@ -3107,7 +3107,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
                 path, // Use the complex path
             }],
         }],
-        minimum_receive: Some("49000000000000000000".to_string()), // Min 49 INJ
+        minimum_receive: Some(Uint128::new(49000000000000000000)), // Min 49 INJ
     };
 
     let funds_to_send = Coin::new(10_000_000_000_000_000_000u128, "inj"); // 10 INJ
@@ -3309,4 +3309,241 @@ fn test_emergency_withdraw() {
         )
         .unwrap();
     assert_eq!(contract_shroom_balance.balance, Uint128::zero());
+}
+
+#[test]
+fn test_multi_split_to_same_orderbook_contract() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // --- SCENARIO ---
+    // This test ensures the aggregator can correctly handle a route where multiple
+    // parallel operations (splits) are sent to the exact same contract address.
+    //
+    // ROUTE:
+    // Input: 100 INJ
+    // Split 1 (40%): 40 INJ -> Mock OB @ 30.0 = 1,200 USDT
+    // Split 2 (60%): 60 INJ -> Mock OB @ 30.0 = 1,800 USDT
+    // Total Expected Output: 3,000 USDT
+
+    // Define the single orderbook contract that both splits will use.
+    let shared_orderbook_contract = env.mock_ob_inj_usdt_addr.clone();
+
+    // Define the message for the route execution.
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 40,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        swap_contract: shared_orderbook_contract.clone(),
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        // Tick size from the generic setup
+                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                    })],
+                },
+                Split {
+                    percent: 60,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        swap_contract: shared_orderbook_contract.clone(),
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                    })],
+                },
+            ],
+        }],
+        minimum_receive: Some(Uint128::new(2990_000_000)), // Min 2990 USDT
+    };
+
+    // Get user's initial USDT balance for final assertion.
+    let initial_usdt_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_usdt_amount = Uint128::from_str(&initial_usdt_balance.amount).unwrap();
+
+    // Execute the transaction with 100 INJ.
+    let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[funds_to_send],
+        &env.user,
+    );
+
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+    let response = res.unwrap();
+
+    // --- ASSERTIONS ---
+
+    // 1. Assert the total received amount from the event log.
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event in reply");
+
+    let total_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // Assert the total expected output is 3000 USDT (3000 * 10^6).
+    let expected_total_output = "3000000000";
+    assert_eq!(total_received_attr.value, expected_total_output);
+
+    // 2. Assert the user's final bank balance is correct.
+    let final_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_balance = final_balance_response.balance.unwrap();
+
+    let expected_final_balance = initial_usdt_amount + Uint128::from_str(expected_total_output).unwrap();
+    let final_amount = Uint128::from_str(&final_balance.amount).unwrap();
+    
+    assert_eq!(final_amount, expected_final_balance);
+    assert_eq!(final_balance.denom, "usdt");
+}
+
+#[test]
+fn test_multi_hop_consecutive_orderbook_swaps() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // --- SCENARIO ---
+    // Hop 1: 100 INJ -> Mock OB 1 (rate 30.0) = 3,000 USDT
+    // Hop 2: 3,000 USDT -> Mock OB 2 (rate 0.1) = 300 INJ
+    // Final Expected Output: 300 INJ.
+
+    let path = vec![
+        Operation::OrderbookSwap(OrderbookSwapOp {
+            swap_contract: env.mock_ob_inj_usdt_addr.clone(),
+            ask_asset_info: amm::AssetInfo::NativeToken {
+                denom: "usdt".to_string(),
+            },
+            offer_asset_info: amm::AssetInfo::NativeToken {
+                denom: "inj".to_string(),
+            },
+            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+        }),
+        Operation::OrderbookSwap(OrderbookSwapOp {
+            swap_contract: env.mock_ob_usdt_inj_addr.clone(),
+            ask_asset_info: amm::AssetInfo::NativeToken {
+                denom: "inj".to_string(),
+            },
+            offer_asset_info: amm::AssetInfo::NativeToken {
+                denom: "usdt".to_string(),
+            },
+            min_quantity_tick_size: Uint128::new(10000),
+        }),
+    ];
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path,
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(299_000_000_000_000_000_000u128)),
+    };
+
+    let initial_inj_balance = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    let initial_inj_amount = Uint128::from_str(&initial_inj_balance.amount).unwrap();
+
+    let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[funds_to_send.clone()],
+        &env.user,
+    );
+    assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
+    let response = res.unwrap(); // Keep the response to check events
+
+    // --- ASSERTIONS ---
+
+    // 1. Assert the event log for the correct, deterministic output amount.
+    // This confirms the contract's logic is correct, regardless of gas fees.
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find final aggregate_swap_complete event");
+
+    let final_received_attr = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    let expected_swap_output = Uint128::new(300_000_000_000_000_000_000u128); // 300 INJ
+    assert_eq!(final_received_attr.value, expected_swap_output.to_string());
+
+    // 2. Assert the user's final bank balance, accounting for gas fees.
+    let final_inj_balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "inj".to_string(),
+        })
+        .unwrap();
+    let final_inj_balance = final_inj_balance_response.balance.unwrap();
+    let final_amount = Uint128::from_str(&final_inj_balance.amount).unwrap();
+
+    // Calculate the "perfect world" final balance (without gas costs).
+    let expected_final_amount_sans_gas = initial_inj_amount
+        .checked_sub(funds_to_send.amount)
+        .unwrap()
+        .checked_add(expected_swap_output)
+        .unwrap();
+
+    // The actual final amount must be less than the perfect amount because of gas.
+    assert!(
+        final_amount < expected_final_amount_sans_gas,
+        "Final amount should be less than the ideal amount due to gas fees"
+    );
+
+    // As a sanity check, ensure the balance still increased overall as this was a profitable swap.
+    // The net gain was 200 INJ, so the final balance should be well above the initial.
+    assert!(
+        final_amount > initial_inj_amount,
+        "Final amount should be greater than the initial amount for this profitable swap"
+    );
 }

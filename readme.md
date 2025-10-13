@@ -2,9 +2,9 @@
 
 ## Mainnet Deployment
 
-Code Id: 1860
+Code Id: 1865
 
-Address: `inj1g5nuy2c6up2f2z0dqf4qayl9seeg7enq3xxaks`
+Address: `inj186xc3ge5mvn8995063v30f8we5ncncpujcv28w`
 
 ## Getting Started
 
@@ -150,7 +150,7 @@ pub struct ExecuteMsg::AggregateSwaps {
 
     /// The minimum amount of the *final* output token the user is willing to receive.
     /// If the final balance held by the contract is less than this, the transaction reverts.
-    pub minimum_receive: Option<String>,
+    pub minimum_receive: Option<Uint128>,
 }
 
 pub struct Stage {

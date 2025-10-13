@@ -1,13 +1,13 @@
 use cosmwasm_std::{
     entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdResult,
 };
+use cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
 use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::{Config, CONFIG};
-use cw20::Cw20ReceiveMsg;
+use crate::state::{Config, CONFIG, REPLY_ID_COUNTER};
 
 pub const CONTRACT_NAME: &str = "crates.io:dex-aggregator";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,13 +25,13 @@ pub fn instantiate(
     let adapter_addr = deps.api.addr_validate(&msg.cw20_adapter_address)?;
     let fee_collector_addr = deps.api.addr_validate(&msg.fee_collector_address)?;
 
-    // Save the full config
     let config = Config {
         admin: admin_addr,
         cw20_adapter_address: adapter_addr,
         fee_collector: fee_collector_addr,
     };
     CONFIG.save(deps.storage, &config)?;
+    REPLY_ID_COUNTER.save(deps.storage, &0u64)?;
 
     Ok(Response::new().add_attribute("method", "instantiate"))
 }
@@ -50,7 +50,9 @@ pub fn execute(
         } => {
             // This is the entry point for NATIVE token swaps
             if info.funds.len() != 1 {
-                return Err(ContractError::InvalidFunds {});
+                return Err(ContractError::InvalidFunds {
+                    sent: info.funds.len(),
+                });
             }
             let offer_asset = amm::Asset {
                 info: amm::AssetInfo::NativeToken {
@@ -61,7 +63,6 @@ pub fn execute(
             execute::execute_aggregate_swaps_internal(
                 deps,
                 env,
-                info.clone(),
                 stages,
                 minimum_receive,
                 offer_asset,
@@ -90,7 +91,6 @@ pub fn execute(
                         execute::execute_aggregate_swaps_internal(
                             deps,
                             env,
-                            info,
                             stages,
                             minimum_receive,
                             offer_asset,

@@ -1,13 +1,13 @@
 use cosmwasm_std::{
     entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdResult,
 };
+use cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
 use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
 use crate::state::{Config, CONFIG, REPLY_ID_COUNTER};
-use cw20::Cw20ReceiveMsg;
 
 pub const CONTRACT_NAME: &str = "crates.io:dex-aggregator";
 pub const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,7 +25,6 @@ pub fn instantiate(
     let adapter_addr = deps.api.addr_validate(&msg.cw20_adapter_address)?;
     let fee_collector_addr = deps.api.addr_validate(&msg.fee_collector_address)?;
 
-    // Save the full config
     let config = Config {
         admin: admin_addr,
         cw20_adapter_address: adapter_addr,

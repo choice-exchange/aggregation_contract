@@ -1,16 +1,17 @@
-use crate::error::ContractError;
-use crate::execute::create_swap_cosmos_msg;
-use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
-use crate::state::{
-    Awaiting, Config, ExecutionState, PendingPathOp, RoutePlan, SubmsgReplyState, CONFIG,
-    EXECUTION_STATES, FEE_MAP, REPLY_ID_COUNTER, ROUTE_PLANS, SUBMSG_REPLY_STATES,
-};
 use cosmwasm_std::{
     to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg,
     Uint128, WasmMsg,
 };
 use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
+
+use crate::error::ContractError;
+use crate::execute::create_swap_cosmos_msg;
+use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
+use crate::state::{
+    Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, ACTIVE_ROUTES, CONFIG,
+    FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES,
+};
 
 const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
 
@@ -21,25 +22,21 @@ pub fn handle_reply(
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if let Ok(submsg_state) = SUBMSG_REPLY_STATES.load(deps.storage, msg.id) {
         let master_reply_id = submsg_state.master_reply_id;
-        let mut exec_state = EXECUTION_STATES.load(deps.storage, master_reply_id)?;
-        let plan = ROUTE_PLANS.load(deps.storage, master_reply_id)?;
+        let mut exec_state = ACTIVE_ROUTES.load(deps.storage, master_reply_id)?;
         SUBMSG_REPLY_STATES.remove(deps.storage, msg.id);
 
-        handle_swap_reply(deps, env, msg, &mut exec_state, &plan, submsg_state)
+        handle_swap_reply(deps, env, msg, &mut exec_state, submsg_state)
     } else {
         let master_reply_id = msg.id;
-        let mut exec_state = EXECUTION_STATES.load(deps.storage, master_reply_id)?;
-        let plan = ROUTE_PLANS.load(deps.storage, master_reply_id)?;
+        let mut exec_state = ACTIVE_ROUTES.load(deps.storage, master_reply_id)?;
 
         match exec_state.awaiting {
-            Awaiting::Conversions => {
-                handle_conversion_reply(deps, env, msg, &mut exec_state, &plan)
-            }
+            Awaiting::Conversions => handle_conversion_reply(deps, env, msg, &mut exec_state),
             Awaiting::FinalConversions => {
-                handle_final_conversion_reply(deps, env, msg, &mut exec_state, &plan)
+                handle_final_conversion_reply(deps, env, msg, &mut exec_state)
             }
             Awaiting::PathConversion => {
-                handle_path_conversion_reply(deps, env, msg, &mut exec_state, &plan)
+                handle_path_conversion_reply(deps, env, msg, &mut exec_state)
             }
             Awaiting::Swaps => Err(ContractError::Std(StdError::generic_err(format!(
                 "Unregistered swap reply ID received: {}",
@@ -53,14 +50,13 @@ pub(crate) fn proceed_to_next_step(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
     master_reply_id: u64,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    if exec_state.current_stage_index as usize >= plan.stages.len() {
-        return handle_final_stage(deps, env, master_reply_id, exec_state, plan);
+    if exec_state.current_stage_index as usize >= exec_state.plan.stages.len() {
+        return handle_final_stage(deps, env, master_reply_id, exec_state);
     }
-
-    let next_stage_to_execute = plan
+    let next_stage_to_execute = exec_state
+        .plan
         .stages
         .get(exec_state.current_stage_index as usize)
         .unwrap();
@@ -73,13 +69,12 @@ pub(crate) fn proceed_to_next_step(
             deps,
             env,
             exec_state,
-            plan,
             master_reply_id,
-            stage_plan.swaps_to_execute,
+            &stage_plan.swaps_to_execute,
         )
     } else {
         let config = CONFIG.load(deps.storage)?;
-        let mut conversion_submsgs = vec![];
+        let mut conversion_submsgs = Vec::with_capacity(stage_plan.conversions_needed.len());
         for (asset_to_convert, _target_info) in &stage_plan.conversions_needed {
             let msg = create_conversion_msg(asset_to_convert, &config, &env)?;
             conversion_submsgs.push(SubMsg::reply_on_success(msg, master_reply_id));
@@ -89,7 +84,7 @@ pub(crate) fn proceed_to_next_step(
         exec_state.replies_expected = conversion_submsgs.len() as u64;
         exec_state.pending_swaps = stage_plan.swaps_to_execute;
 
-        EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+        ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
         Ok(Response::new()
             .add_submessages(conversion_submsgs)
@@ -102,14 +97,14 @@ fn handle_swap_reply(
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
     submsg_state: SubmsgReplyState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let master_reply_id = submsg_state.master_reply_id;
     let split_index = submsg_state.split_index;
     let op_index = submsg_state.op_index;
 
-    let current_stage = plan
+    let current_stage = exec_state
+        .plan
         .stages
         .get(exec_state.current_stage_index as usize)
         .ok_or(ContractError::EmptyRoute {})?;
@@ -138,9 +133,9 @@ fn handle_swap_reply(
         exec_state.replies_expected -= 1;
         if exec_state.replies_expected == 0 {
             exec_state.current_stage_index += 1;
-            return proceed_to_next_step(&mut deps, env, exec_state, plan, master_reply_id);
+            return proceed_to_next_step(&mut deps, env, exec_state, master_reply_id);
         } else {
-            EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+            ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
             return Ok(Response::new()
                 .add_attribute("action", "accumulating_path_outputs")
                 .add_attribute("info", "zero_value_path_completed"));
@@ -172,9 +167,8 @@ fn handle_swap_reply(
             let config = CONFIG.load(deps.storage)?;
             let conversion_msg = create_conversion_msg(&offer_asset_for_next_op, &config, &env)?;
 
-            // The reply for this conversion will use the master_reply_id
             let sub_msg = SubMsg::reply_on_success(conversion_msg, master_reply_id);
-            EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+            ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
             return Ok(Response::new()
                 .add_submessage(sub_msg)
@@ -207,7 +201,7 @@ fn handle_swap_reply(
 
         let sub_msg = SubMsg::reply_on_success(next_msg, next_submsg_id);
 
-        EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+        ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
         Ok(Response::new()
             .add_submessage(sub_msg)
@@ -227,11 +221,11 @@ fn handle_swap_reply(
 
         let mut response;
         if exec_state.replies_expected > 0 {
-            EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+            ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
             response = Response::new().add_attribute("action", "accumulating_path_outputs");
         } else {
             exec_state.current_stage_index += 1;
-            response = proceed_to_next_step(&mut deps, env, exec_state, plan, master_reply_id)?;
+            response = proceed_to_next_step(&mut deps, env, exec_state, master_reply_id)?;
         }
 
         if !fee.is_zero() {
@@ -290,24 +284,22 @@ fn handle_final_stage(
     env: Env,
     reply_id: u64,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if exec_state.accumulated_assets.is_empty() {
-        if !plan.minimum_receive.is_zero() {
+        if !exec_state.plan.minimum_receive.is_zero() {
             return Err(ContractError::MinimumReceiveNotMet {
-                minimum_receive: plan.minimum_receive,
+                minimum_receive: exec_state.plan.minimum_receive,
                 actual_receive: Uint128::zero(),
             });
         }
-        EXECUTION_STATES.remove(deps.storage, reply_id);
-        ROUTE_PLANS.remove(deps.storage, reply_id);
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
         return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty"));
     }
 
     // The target asset for normalization is the type of the first asset in the final list.
     let target_asset_info = exec_state.accumulated_assets[0].info.clone();
 
-    let mut conversion_submsgs = vec![];
+    let mut conversion_submsgs = Vec::with_capacity(exec_state.accumulated_assets.len());
     let mut ready_amount = Uint128::zero();
     let config = CONFIG.load(deps.storage)?;
 
@@ -324,9 +316,9 @@ fn handle_final_stage(
         // SCENARIO A: All assets were already the same type. We are done.
         let total_final_amount = ready_amount;
         // Check against minimum_receive from the immutable plan
-        if total_final_amount < plan.minimum_receive {
+        if total_final_amount < exec_state.plan.minimum_receive {
             return Err(ContractError::MinimumReceiveNotMet {
-                minimum_receive: plan.minimum_receive,
+                minimum_receive: exec_state.plan.minimum_receive,
                 actual_receive: total_final_amount,
             });
         }
@@ -334,14 +326,16 @@ fn handle_final_stage(
         let mut response = Response::new();
         if !total_final_amount.is_zero() {
             // Use the sender address from the immutable plan
-            let send_msg = create_send_msg(&plan.sender, &target_asset_info, total_final_amount)?;
+            let send_msg = create_send_msg(
+                &exec_state.plan.sender,
+                &target_asset_info,
+                total_final_amount,
+            )?;
             response = response.add_message(send_msg);
         }
 
-        EXECUTION_STATES.remove(deps.storage, reply_id);
-        ROUTE_PLANS.remove(deps.storage, reply_id);
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
 
-        // State cleanup is now handled in the main `handle_reply` function
         Ok(response
             .add_attribute("action", "aggregate_swap_complete")
             .add_attribute("final_received", total_final_amount.to_string()))
@@ -354,8 +348,7 @@ fn handle_final_stage(
             amount: ready_amount,
         }];
 
-        // Save the small, mutated exec_state
-        EXECUTION_STATES.save(deps.storage, reply_id, exec_state)?;
+        ACTIVE_ROUTES.save(deps.storage, reply_id, exec_state)?;
 
         Ok(Response::new()
             .add_submessages(conversion_submsgs)
@@ -368,7 +361,6 @@ fn handle_final_conversion_reply(
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if msg.result.is_err() {
         return Err(ContractError::ConversionFailed {
@@ -389,8 +381,8 @@ fn handle_final_conversion_reply(
     exec_state.replies_expected -= 1;
 
     if exec_state.replies_expected > 0 {
-        // Still waiting for more conversions to finish. Save the updated exec_state.
-        EXECUTION_STATES.save(deps.storage, reply_id, exec_state)?;
+        // Still waiting for more conversions to finish.
+        ACTIVE_ROUTES.save(deps.storage, reply_id, exec_state)?;
         return Ok(Response::new().add_attribute("action", "accumulating_final_conversions"));
     }
 
@@ -398,22 +390,24 @@ fn handle_final_conversion_reply(
     let total_final_amount = running_total_asset.amount;
     let final_asset_info = running_total_asset.info.clone();
 
-    if total_final_amount < plan.minimum_receive {
+    if total_final_amount < exec_state.plan.minimum_receive {
         return Err(ContractError::MinimumReceiveNotMet {
-            minimum_receive: plan.minimum_receive,
+            minimum_receive: exec_state.plan.minimum_receive,
             actual_receive: total_final_amount,
         });
     }
 
     let mut response = Response::new();
     if !total_final_amount.is_zero() {
-        // Get the sender address from the immutable plan
-        let send_msg = create_send_msg(&plan.sender, &final_asset_info, total_final_amount)?;
+        let send_msg = create_send_msg(
+            &exec_state.plan.sender,
+            &final_asset_info,
+            total_final_amount,
+        )?;
         response = response.add_message(send_msg);
     }
 
-    EXECUTION_STATES.remove(deps.storage, reply_id);
-    ROUTE_PLANS.remove(deps.storage, reply_id);
+    ACTIVE_ROUTES.remove(deps.storage, reply_id);
 
     Ok(response
         .add_attribute("action", "aggregate_swap_complete")
@@ -425,7 +419,6 @@ fn handle_conversion_reply(
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if msg.result.is_err() {
         return Err(ContractError::ConversionFailed {
@@ -438,21 +431,18 @@ fn handle_conversion_reply(
     exec_state.replies_expected -= 1;
 
     if exec_state.replies_expected > 0 {
-        EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+        ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
         return Ok(Response::new().add_attribute("action", "accumulating_conversion_outputs"));
     }
 
-    // Take pending_swaps from the mutated exec_state
     let swaps_to_execute = std::mem::take(&mut exec_state.pending_swaps);
 
-    // Call the updated execute_planned_swaps with both state objects
     execute_planned_swaps(
         &mut deps,
         env,
         exec_state,
-        plan,
         master_reply_id,
-        swaps_to_execute,
+        &swaps_to_execute,
     )
 }
 
@@ -721,17 +711,13 @@ fn execute_planned_swaps(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
     exec_state: &mut ExecutionState,
-    _plan: &RoutePlan,
     master_reply_id: u64,
-    swaps: Vec<PlannedSwap>,
+    swaps: &[PlannedSwap],
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
-    let mut submessages = vec![];
-    let filtered_swaps: Vec<PlannedSwap> =
-        swaps.into_iter().filter(|s| !s.amount.is_zero()).collect();
-
+    let mut submessages = Vec::with_capacity(swaps.len());
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
 
-    for swap in &filtered_swaps {
+    for swap in swaps.iter().filter(|s| !s.amount.is_zero()) {
         reply_id_counter += 1;
         let submsg_id = reply_id_counter;
 
@@ -756,13 +742,13 @@ fn execute_planned_swaps(
 
     if submessages.is_empty() {
         exec_state.current_stage_index += 1;
-        return proceed_to_next_step(deps, env, exec_state, _plan, master_reply_id);
+        return proceed_to_next_step(deps, env, exec_state, master_reply_id);
     }
 
     exec_state.awaiting = Awaiting::Swaps;
     exec_state.replies_expected = submessages.len() as u64;
 
-    EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+    ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
     Ok(Response::new()
         .add_submessages(submessages)
@@ -782,7 +768,6 @@ fn handle_path_conversion_reply(
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
-    plan: &RoutePlan,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if msg.result.is_err() {
         return Err(ContractError::ConversionFailed {
@@ -799,7 +784,8 @@ fn handle_path_conversion_reply(
         StdError::generic_err("Path conversion state is invalid: no pending operation found")
     })?;
 
-    let current_stage = plan
+    let current_stage = exec_state
+        .plan
         .stages
         .get(exec_state.current_stage_index as usize)
         .unwrap();
@@ -844,7 +830,7 @@ fn handle_path_conversion_reply(
     let sub_msg = SubMsg::reply_on_success(swap_msg, submsg_id);
 
     exec_state.awaiting = Awaiting::Swaps;
-    EXECUTION_STATES.save(deps.storage, master_reply_id, exec_state)?;
+    ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
     Ok(Response::new()
         .add_submessage(sub_msg)

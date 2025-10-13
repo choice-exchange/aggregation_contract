@@ -1,5 +1,6 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg
+    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response,
+    StdError, StdResult, Uint128, WasmMsg,
 };
 use cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -9,9 +10,7 @@ use std::str::FromStr;
 use crate::error::ContractError;
 use crate::msg::{self, amm, orderbook, Operation, Stage};
 use crate::reply::proceed_to_next_step;
-use crate::state::{
-    Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, ROUTE_PLANS,
-};
+use crate::state::{Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
 
 pub fn update_admin(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -56,9 +55,7 @@ pub fn execute_aggregate_swaps_internal(
         return Err(ContractError::InvalidPercentageSum {});
     }
 
-    let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> {
-        Ok(id + 1)
-    })?;
+    let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> { Ok(id + 1) })?;
 
     let minimum_receive = minimum_receive.unwrap_or_default();
 
@@ -67,9 +64,9 @@ pub fn execute_aggregate_swaps_internal(
         minimum_receive,
         stages,
     };
-    ROUTE_PLANS.save(deps.storage, reply_id, &plan)?;
 
     let mut initial_exec_state = ExecutionState {
+        plan,
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
         replies_expected: 0,
@@ -78,7 +75,7 @@ pub fn execute_aggregate_swaps_internal(
         pending_path_op: None,
     };
 
-    proceed_to_next_step(&mut deps, env, &mut initial_exec_state, &plan, reply_id)
+    proceed_to_next_step(&mut deps, env, &mut initial_exec_state, reply_id)
 }
 
 pub fn create_swap_cosmos_msg(

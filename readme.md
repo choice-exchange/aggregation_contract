@@ -2,9 +2,9 @@
 
 ## Mainnet Deployment
 
-Code Id: 1865
+Code Id: 1873
 
-Address: `inj186xc3ge5mvn8995063v30f8we5ncncpujcv28w`
+Address: `inj102zk4v9d3r60t2q7jnmt6mp4y7fvpywkwlnekk`
 
 ## Getting Started
 

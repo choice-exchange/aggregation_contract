@@ -18,7 +18,7 @@ fn main() {
     export_schema_with_title(&schema_for!(ExecuteMsg), &out_dir, "ExecuteMsg");
     export_schema_with_title(&schema_for!(QueryMsg), &out_dir, "QueryMsg");
     export_schema(&schema_for!(SimulateRouteResponse), &out_dir);
-    export_schema(&schema_for!(Config), &out_dir); 
+    export_schema(&schema_for!(Config), &out_dir);
     export_schema(&schema_for!(FeeResponse), &out_dir);
     export_schema(&schema_for!(AllFeesResponse), &out_dir);
 

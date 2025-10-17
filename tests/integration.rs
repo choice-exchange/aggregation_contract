@@ -3379,12 +3379,7 @@ fn test_multi_split_to_same_orderbook_contract() {
 
     // Execute the transaction with 100 INJ.
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
-    let res = wasm.execute(
-        &env.aggregator_addr,
-        &msg,
-        &[funds_to_send],
-        &env.user,
-    );
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[funds_to_send], &env.user);
 
     assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());
     let response = res.unwrap();
@@ -3422,9 +3417,10 @@ fn test_multi_split_to_same_orderbook_contract() {
         .unwrap();
     let final_balance = final_balance_response.balance.unwrap();
 
-    let expected_final_balance = initial_usdt_amount + Uint128::from_str(expected_total_output).unwrap();
+    let expected_final_balance =
+        initial_usdt_amount + Uint128::from_str(expected_total_output).unwrap();
     let final_amount = Uint128::from_str(&final_balance.amount).unwrap();
-    
+
     assert_eq!(final_amount, expected_final_balance);
     assert_eq!(final_balance.denom, "usdt");
 }
@@ -3465,10 +3461,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
-            splits: vec![Split {
-                percent: 100,
-                path,
-            }],
+            splits: vec![Split { percent: 100, path }],
         }],
         minimum_receive: Some(Uint128::new(299_000_000_000_000_000_000u128)),
     };

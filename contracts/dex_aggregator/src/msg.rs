@@ -80,7 +80,6 @@ pub mod amm {
             belief_price: Option<Decimal>,
             max_spread: Option<Decimal>,
             to: Option<String>,
-            deadline: Option<u64>,
         },
     }
 }

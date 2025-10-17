@@ -97,7 +97,6 @@ pub fn create_swap_cosmos_msg(
                 belief_price: None,
                 max_spread: None,
                 to: Some(recipient),
-                deadline: None,
             };
 
             match offer_asset_info {

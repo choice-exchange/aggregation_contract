@@ -1394,7 +1394,12 @@ fn test_failure_if_minimum_receive_not_met() {
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
-    let res = wasm.execute(&env.aggregator_addr, &msg, slice::from_ref(&funds_to_send), user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&funds_to_send),
+        user,
+    );
 
     assert!(
         res.is_err(),
@@ -2186,7 +2191,12 @@ fn test_stage_with_single_hundred_percent_split() {
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
 
     // Execute the transaction
-    let res = wasm.execute(&env.aggregator_addr, &msg, slice::from_ref(&funds_to_send), user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&funds_to_send),
+        user,
+    );
     assert!(
         res.is_ok(),
         "Execution with single-split stage failed: {:?}",
@@ -2295,7 +2305,12 @@ fn test_intermediate_swap_failure_reverts_transaction() {
     };
 
     // Execute the transaction
-    let res = wasm.execute(&env.aggregator_addr, &msg, slice::from_ref(&initial_funds), user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&initial_funds),
+        user,
+    );
 
     // --- ASSERT FAILURE AND ROLLBACK ---
 

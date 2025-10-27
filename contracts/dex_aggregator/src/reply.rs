@@ -142,7 +142,7 @@ fn handle_swap_reply(
         }
     }
 
-    let received_amount = parse_amount_from_swap_reply(events)?;
+    let received_amount = parse_amount_from_swap_reply(events, &env)?;
     let received_asset_info = get_operation_output(replied_op)?;
 
     let replied_path = &current_stage.splits[split_index].path;
@@ -510,10 +510,21 @@ fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError>
     })
 }
 
-fn parse_amount_from_swap_reply(events: &[cosmwasm_std::Event]) -> Result<Uint128, ContractError> {
+fn parse_amount_from_swap_reply(
+    events: &[cosmwasm_std::Event],
+    env: &Env,
+) -> Result<Uint128, ContractError> {
     // Check for `post_tax_amount` from a tax token's transfer event.
     for event in events.iter().rev() {
-        if event.ty == "wasm" {
+        if event.ty != "wasm" {
+            continue;
+        }
+        let is_recipient_self = event
+            .attributes
+            .iter()
+            .any(|attr| attr.key == "to" && attr.value == env.contract.address.to_string());
+
+        if is_recipient_self {
             if let Some(amount_attr) = event
                 .attributes
                 .iter()

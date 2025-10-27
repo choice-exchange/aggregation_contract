@@ -156,6 +156,50 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "description": "Registers a new tax token that requires special handling.",
+      "type": "object",
+      "required": [
+        "register_tax_token"
+      ],
+      "properties": {
+        "register_tax_token": {
+          "type": "object",
+          "required": [
+            "contract_addr"
+          ],
+          "properties": {
+            "contract_addr": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Removes a tax token from the registry.",
+      "type": "object",
+      "required": [
+        "deregister_tax_token"
+      ],
+      "properties": {
+        "deregister_tax_token": {
+          "type": "object",
+          "required": [
+            "contract_addr"
+          ],
+          "properties": {
+            "contract_addr": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   ],
   "definitions": {

@@ -10,7 +10,9 @@ use std::str::FromStr;
 use crate::error::ContractError;
 use crate::msg::{self, amm, orderbook, Operation, Stage};
 use crate::reply::proceed_to_next_step;
-use crate::state::{Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER};
+use crate::state::{
+    Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
+};
 
 pub fn update_admin(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -109,17 +111,33 @@ pub fn create_swap_cosmos_msg(
                     }],
                 }),
                 amm::AssetInfo::Token { contract_addr } => {
-                    let cw20_send_msg = Cw20ExecuteMsg::Send {
-                        contract: amm_op.pool_address.clone(),
-                        amount,
-                        msg: to_json_binary(&amm_swap_msg)?,
-                    };
-
-                    CosmosMsg::Wasm(WasmMsg::Execute {
-                        contract_addr: contract_addr.clone(),
-                        msg: to_json_binary(&cw20_send_msg)?,
-                        funds: vec![],
-                    })
+                    let token_addr = deps.api.addr_validate(contract_addr)?;
+                    if TAX_TOKEN_REGISTRY.has(deps.storage, &token_addr) {
+                        // It's a tax token. We must use its tax-exempt send function.
+                        CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: contract_addr.clone(),
+                            msg: to_json_binary(
+                                &crate::msg::reflection::ExecuteMsg::TaxExemptSend {
+                                    contract: amm_op.pool_address.clone(),
+                                    amount,
+                                    msg: to_json_binary(&amm_swap_msg)?,
+                                },
+                            )?,
+                            funds: vec![],
+                        })
+                    } else {
+                        // It's a standard token. Use the normal Cw20::Send.
+                        let cw20_send_msg = Cw20ExecuteMsg::Send {
+                            contract: amm_op.pool_address.clone(),
+                            amount,
+                            msg: to_json_binary(&amm_swap_msg)?,
+                        };
+                        CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: contract_addr.clone(),
+                            msg: to_json_binary(&cw20_send_msg)?,
+                            funds: vec![],
+                        })
+                    }
                 }
             }
         }
@@ -327,4 +345,36 @@ pub fn emergency_withdraw(
     response = response.add_attribute("withdrawn_amount", amount_to_withdraw.to_string());
 
     Ok(response)
+}
+
+pub fn register_tax_token(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    contract_addr: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    let addr = deps.api.addr_validate(&contract_addr)?;
+    TAX_TOKEN_REGISTRY.save(deps.storage, &addr, &true)?;
+    Ok(Response::new()
+        .add_attribute("action", "register_tax_token")
+        .add_attribute("token_addr", addr))
+}
+
+pub fn deregister_tax_token(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    contract_addr: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    let addr = deps.api.addr_validate(&contract_addr)?;
+    TAX_TOKEN_REGISTRY.remove(deps.storage, &addr);
+    Ok(Response::new()
+        .add_attribute("action", "deregister_tax_token")
+        .add_attribute("token_addr", addr))
 }

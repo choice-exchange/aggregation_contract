@@ -118,6 +118,24 @@ pub mod orderbook {
     }
 }
 
+pub mod reflection {
+    use super::*;
+    use cosmwasm_std::Binary;
+
+    #[cw_serde]
+    pub enum ExecuteMsg {
+        TaxExemptTransfer {
+            recipient: String,
+            amount: Uint128,
+        },
+        TaxExemptSend {
+            contract: String,
+            amount: Uint128,
+            msg: Binary,
+        },
+    }
+}
+
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
@@ -201,6 +219,14 @@ pub enum ExecuteMsg {
     },
     EmergencyWithdraw {
         asset_info: amm::AssetInfo,
+    },
+    /// Registers a new tax token that requires special handling.
+    RegisterTaxToken {
+        contract_addr: String,
+    },
+    /// Removes a tax token from the registry.
+    DeregisterTaxToken {
+        contract_addr: String,
     },
 }
 

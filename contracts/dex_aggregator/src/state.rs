@@ -57,3 +57,8 @@ pub struct SubmsgReplyState {
 pub const ACTIVE_ROUTES: Map<u64, ExecutionState> = Map::new("execution_states");
 pub const SUBMSG_REPLY_STATES: Map<u64, SubmsgReplyState> = Map::new("submsg_reply_states");
 pub const REPLY_ID_COUNTER: Item<u64> = Item::new("reply_id_counter");
+
+/// A registry of known tax tokens that require special handling.
+/// The key is the token's contract address.
+/// The value is a simple boolean `true` to indicate it's registered.
+pub const TAX_TOKEN_REGISTRY: Map<&Addr, bool> = Map::new("tax_tokens");

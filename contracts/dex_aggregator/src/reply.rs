@@ -10,7 +10,7 @@ use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
 use crate::state::{
     Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, ACTIVE_ROUTES, CONFIG,
-    FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES,
+    FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
 };
 
 const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
@@ -230,7 +230,8 @@ fn handle_swap_reply(
 
         if !fee.is_zero() {
             let config = CONFIG.load(deps.storage)?;
-            let fee_send_msg = create_send_msg(&config.fee_collector, &received_asset_info, fee)?;
+            let fee_send_msg =
+                create_send_msg(&deps, &config.fee_collector, &received_asset_info, fee)?;
             response = response
                 .add_message(fee_send_msg)
                 .add_attribute("fee_collected", fee.to_string())
@@ -256,6 +257,7 @@ fn apply_fee(
 
 // A helper to create the final transfer message.
 fn create_send_msg(
+    deps: &DepsMut<InjectiveQueryWrapper>,
     recipient: &Addr,
     asset_info: &amm::AssetInfo,
     amount: Uint128,
@@ -268,14 +270,31 @@ fn create_send_msg(
                 amount,
             }],
         })),
-        amm::AssetInfo::Token { contract_addr } => Ok(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: contract_addr.clone(),
-            msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
-                recipient: recipient.to_string(),
-                amount,
-            })?,
-            funds: vec![],
-        })),
+        amm::AssetInfo::Token { contract_addr } => {
+            let token_addr = deps.api.addr_validate(contract_addr)?;
+            // Check if we are dealing with a registered tax token.
+            if TAX_TOKEN_REGISTRY.has(deps.storage, &token_addr) {
+                // Use the new tax-exempt message.
+                Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: contract_addr.clone(),
+                    msg: to_json_binary(&crate::msg::reflection::ExecuteMsg::TaxExemptTransfer {
+                        recipient: recipient.to_string(),
+                        amount,
+                    })?,
+                    funds: vec![],
+                }))
+            } else {
+                // Use a standard CW20 Transfer for all other tokens.
+                Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: contract_addr.clone(),
+                    msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                        recipient: recipient.to_string(),
+                        amount,
+                    })?,
+                    funds: vec![],
+                }))
+            }
+        }
     }
 }
 
@@ -327,6 +346,7 @@ fn handle_final_stage(
         if !total_final_amount.is_zero() {
             // Use the sender address from the immutable plan
             let send_msg = create_send_msg(
+                deps,
                 &exec_state.plan.sender,
                 &target_asset_info,
                 total_final_amount,
@@ -400,6 +420,7 @@ fn handle_final_conversion_reply(
     let mut response = Response::new();
     if !total_final_amount.is_zero() {
         let send_msg = create_send_msg(
+            &deps,
             &exec_state.plan.sender,
             &final_asset_info,
             total_final_amount,
@@ -490,6 +511,24 @@ fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError>
 }
 
 fn parse_amount_from_swap_reply(events: &[cosmwasm_std::Event]) -> Result<Uint128, ContractError> {
+    // Check for `post_tax_amount` from a tax token's transfer event.
+    for event in events.iter().rev() {
+        if event.ty == "wasm" {
+            if let Some(amount_attr) = event
+                .attributes
+                .iter()
+                .find(|attr| attr.key == "post_tax_amount")
+            {
+                return amount_attr.value.parse::<Uint128>().map_err(|_| {
+                    ContractError::MalformedAmountInReply {
+                        value: amount_attr.value.clone(),
+                    }
+                });
+            }
+        }
+    }
+
+    // 2. Fallback to original logic for standard, non-taxable tokens.
     let amount_str_opt = events.iter().find_map(|event| {
         if !event.ty.starts_with("wasm") {
             return None;
@@ -513,12 +552,11 @@ fn parse_amount_from_swap_reply(events: &[cosmwasm_std::Event]) -> Result<Uint12
             } else {
                 &amount_str
             };
-
             integer_part_str
                 .parse::<Uint128>()
                 .map_err(|_| ContractError::MalformedAmountInReply { value: amount_str })
         }
-        None => Ok(Uint128::zero()),
+        None => Ok(Uint128::zero()), // Return zero if no relevant amount is found.
     }
 }
 

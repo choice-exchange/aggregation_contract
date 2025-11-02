@@ -123,6 +123,12 @@ pub fn execute(
         ExecuteMsg::EmergencyWithdraw { asset_info } => {
             crate::execute::emergency_withdraw(deps, env, info, asset_info)
         }
+        ExecuteMsg::RegisterTaxToken { contract_addr } => {
+            crate::execute::register_tax_token(deps, info, contract_addr)
+        }
+        ExecuteMsg::DeregisterTaxToken { contract_addr } => {
+            crate::execute::deregister_tax_token(deps, info, contract_addr)
+        }
     }
 }
 

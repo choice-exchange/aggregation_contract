@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use std::slice;
 use std::str::FromStr;
 
 use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
@@ -71,23 +72,23 @@ fn setup() -> TestEnv {
 
     // Store codes
     let aggregator_code_id = wasm
-        .store_code(&get_wasm_byte_code("dex_aggregator.wasm"), None, &admin)
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &admin)
         .unwrap()
         .data
         .code_id;
     let mock_swap_code_id = wasm
-        .store_code(&get_wasm_byte_code("mock_swap.wasm"), None, &admin)
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &admin)
         .unwrap()
         .data
         .code_id;
 
     let _cw20_code_id = wasm
-        .store_code(&get_wasm_byte_code("cw20_base.wasm"), None, &admin)
+        .store_code(get_wasm_byte_code("cw20_base.wasm"), None, &admin)
         .unwrap()
         .data
         .code_id;
     let cw20_adapter_code_id = wasm
-        .store_code(&get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
+        .store_code(get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
         .unwrap()
         .data
         .code_id;
@@ -260,8 +261,8 @@ fn setup() -> TestEnv {
 
     TestEnv {
         app,
-        admin: admin,
-        user: user,
+        admin,
+        user,
         fee_collector: fee_collector_account,
         aggregator_addr,
         mock_amm_1_addr,
@@ -452,7 +453,7 @@ fn test_multi_stage_aggregate_swap_success() {
     let res = wasm.execute(
         &env.aggregator_addr,
         &msg,
-        &[initial_funds.clone()],
+        slice::from_ref(&initial_funds),
         &env.user,
     );
 
@@ -647,7 +648,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         &cw20_adapter::ExecuteMsg::RegisterCw20Contract {
             addr: Addr::unchecked(shroom_cw20_addr.clone()),
         },
-        &[total_fee.clone()],
+        slice::from_ref(&total_fee),
         &admin,
     )
     .unwrap();
@@ -656,7 +657,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         &cw20_adapter::ExecuteMsg::RegisterCw20Contract {
             addr: Addr::unchecked(sai_cw20_addr.clone()),
         },
-        &[total_fee.clone()],
+        slice::from_ref(&total_fee),
         &admin,
     )
     .unwrap();
@@ -1393,7 +1394,12 @@ fn test_failure_if_minimum_receive_not_met() {
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
-    let res = wasm.execute(&env.aggregator_addr, &msg, &[funds_to_send.clone()], user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&funds_to_send),
+        user,
+    );
 
     assert!(
         res.is_err(),
@@ -1977,7 +1983,7 @@ fn test_native_input_with_initial_cw20_requirement() {
             amount: amount_to_test,
         },
         &[],
-        &admin,
+        admin,
     )
     .unwrap();
     wasm.execute(
@@ -1989,7 +1995,7 @@ fn test_native_input_with_initial_cw20_requirement() {
             msg: to_json_binary(&"{}").unwrap(),
         },
         &[],
-        &admin,
+        admin,
     )
     .unwrap();
     bank.send(
@@ -2002,7 +2008,7 @@ fn test_native_input_with_initial_cw20_requirement() {
                 amount: amount_to_test.to_string(),
             }],
         },
-        &admin,
+        admin,
     )
     .unwrap();
 
@@ -2185,7 +2191,12 @@ fn test_stage_with_single_hundred_percent_split() {
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
 
     // Execute the transaction
-    let res = wasm.execute(&env.aggregator_addr, &msg, &[funds_to_send.clone()], user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&funds_to_send),
+        user,
+    );
     assert!(
         res.is_ok(),
         "Execution with single-split stage failed: {:?}",
@@ -2294,7 +2305,12 @@ fn test_intermediate_swap_failure_reverts_transaction() {
     };
 
     // Execute the transaction
-    let res = wasm.execute(&env.aggregator_addr, &msg, &[initial_funds.clone()], user);
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        slice::from_ref(&initial_funds),
+        user,
+    );
 
     // --- ASSERT FAILURE AND ROLLBACK ---
 
@@ -2849,7 +2865,7 @@ fn test_multi_split_with_mixed_fees() {
         .find(|a| a.key == "final_received")
         .unwrap();
 
-    let expected_net_output = Uint128::new(1596_000_000u128); // 396 + 1200 = 1596 USDT
+    let expected_net_output = Uint128::new(1_596_000_000_u128); // 396 + 1200 = 1596 USDT
     assert_eq!(final_received_attr.value, expected_net_output.to_string());
 
     // Assertion B: Check the fee collector's final balance
@@ -3127,7 +3143,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     let res = wasm.execute(
         &setup.env.aggregator_addr,
         &msg,
-        &[funds_to_send.clone()],
+        slice::from_ref(&funds_to_send),
         user,
     );
 
@@ -3363,7 +3379,7 @@ fn test_multi_split_to_same_orderbook_contract() {
                 },
             ],
         }],
-        minimum_receive: Some(Uint128::new(2990_000_000)), // Min 2990 USDT
+        minimum_receive: Some(Uint128::new(2_990_000_000)), // Min 2990 USDT
     };
 
     // Get user's initial USDT balance for final assertion.
@@ -3480,7 +3496,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
     let res = wasm.execute(
         &env.aggregator_addr,
         &msg,
-        &[funds_to_send.clone()],
+        slice::from_ref(&funds_to_send),
         &env.user,
     );
     assert!(res.is_ok(), "Execution failed: {:?}", res.unwrap_err());

@@ -323,10 +323,8 @@ pub fn query(
                 ));
             }
 
-            let offer_decimal =
-                Decimal::from_atomics(amount_in, config.input_decimals as u32).map_err(|_| {
-                    StdError::generic_err("Failed to create decimal from amount_in")
-                })?;
+            let offer_decimal = Decimal::from_atomics(amount_in, config.input_decimals as u32)
+                .map_err(|_| StdError::generic_err("Failed to create decimal from amount_in"))?;
             let rate_decimal = Decimal::from_str(&config.rate)?;
             let return_decimal = offer_decimal * rate_decimal;
             let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.output_decimals as u32);

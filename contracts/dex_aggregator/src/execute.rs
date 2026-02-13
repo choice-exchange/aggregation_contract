@@ -232,9 +232,7 @@ pub fn create_swap_cosmos_msg(
             }
 
             // Apply 0.5% slippage
-            let minimum_amount_out = quote_response
-                .amount_out
-                .multiply_ratio(995u128, 1000u128);
+            let minimum_amount_out = quote_response.amount_out.multiply_ratio(995u128, 1000u128);
 
             let clmm_swap_msg = clmm::ClmmPoolExecuteMsg::SwapExactInput {
                 minimum_amount_out,

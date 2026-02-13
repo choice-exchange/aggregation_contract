@@ -1,6 +1,6 @@
 use crate::msg::{
-    amm, clmm, orderbook, AllFeesResponse, FeeInfo, FeeResponse, Operation,
-    SimulateRouteResponse, Stage,
+    amm, clmm, orderbook, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse,
+    Stage,
 };
 use crate::state::{Config, FEE_MAP};
 use cosmwasm_std::{

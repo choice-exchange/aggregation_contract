@@ -5,3 +5,5 @@ deploy_mainnet.sh
 .env
 
 scripts/
+
+.claude/

@@ -8,7 +8,7 @@ use injective_math::FPDecimal;
 use std::str::FromStr;
 
 use crate::error::ContractError;
-use crate::msg::{self, amm, orderbook, Operation, Stage};
+use crate::msg::{self, amm, clmm, orderbook, Operation, Stage};
 use crate::reply::proceed_to_next_step;
 use crate::state::{
     Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
@@ -212,6 +212,78 @@ pub fn create_swap_cosmos_msg(
                 msg: to_json_binary(&swap_msg)?,
                 funds,
             })
+        }
+        Operation::ClmmSwap(clmm_op) => {
+            // Query the pool for expected output
+            let quote_query = clmm::ClmmPoolQueryMsg::Quote {
+                token_in: offer_asset_info.clone(),
+                amount_in: amount,
+            };
+            let quote_response: clmm::QuoteResponse = deps
+                .querier
+                .query_wasm_smart(&clmm_op.pool_address, &quote_query)?;
+
+            if quote_response.amount_out.is_zero() {
+                return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: env.contract.address.to_string(),
+                    msg: to_json_binary(&{})?,
+                    funds: vec![],
+                }));
+            }
+
+            // Apply 0.5% slippage
+            let minimum_amount_out = quote_response
+                .amount_out
+                .multiply_ratio(995u128, 1000u128);
+
+            let clmm_swap_msg = clmm::ClmmPoolExecuteMsg::SwapExactInput {
+                minimum_amount_out,
+                recipient: Some(recipient),
+                deadline: None,
+            };
+
+            match offer_asset_info {
+                amm::AssetInfo::NativeToken { denom } => CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: clmm_op.pool_address.clone(),
+                    msg: to_json_binary(&clmm_swap_msg)?,
+                    funds: vec![Coin {
+                        denom: denom.clone(),
+                        amount,
+                    }],
+                }),
+                amm::AssetInfo::Token { contract_addr } => {
+                    let token_addr = deps.api.addr_validate(contract_addr)?;
+                    let hook_msg = clmm::Cw20HookMsg::SwapExactInput {
+                        minimum_amount_out,
+                        recipient: Some(env.contract.address.to_string()),
+                        deadline: None,
+                    };
+                    if TAX_TOKEN_REGISTRY.has(deps.storage, &token_addr) {
+                        CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: contract_addr.clone(),
+                            msg: to_json_binary(
+                                &crate::msg::reflection::ExecuteMsg::TaxExemptSend {
+                                    contract: clmm_op.pool_address.clone(),
+                                    amount,
+                                    msg: to_json_binary(&hook_msg)?,
+                                },
+                            )?,
+                            funds: vec![],
+                        })
+                    } else {
+                        let cw20_send_msg = Cw20ExecuteMsg::Send {
+                            contract: clmm_op.pool_address.clone(),
+                            amount,
+                            msg: to_json_binary(&hook_msg)?,
+                        };
+                        CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: contract_addr.clone(),
+                            msg: to_json_binary(&cw20_send_msg)?,
+                            funds: vec![],
+                        })
+                    }
+                }
+            }
         }
     };
 

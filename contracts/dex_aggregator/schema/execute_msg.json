@@ -273,6 +273,26 @@
       "description": "Binary is a wrapper around Vec<u8> to add base64 de/serialization with serde. It also adds some helper methods to help encode inline.\n\nThis is only needed as serde-json-{core,wasm} has a horrible encoding for Vec<u8>. See also <https://github.com/CosmWasm/cosmwasm/blob/main/docs/MESSAGE_TYPES.md>.",
       "type": "string"
     },
+    "ClmmSwapOp": {
+      "type": "object",
+      "required": [
+        "ask_asset_info",
+        "offer_asset_info",
+        "pool_address"
+      ],
+      "properties": {
+        "ask_asset_info": {
+          "$ref": "#/definitions/AssetInfo"
+        },
+        "offer_asset_info": {
+          "$ref": "#/definitions/AssetInfo"
+        },
+        "pool_address": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "Cw20ReceiveMsg": {
       "description": "Cw20ReceiveMsg should be de/serialized under `Receive()` variant in a ExecuteMsg",
       "type": "object",
@@ -320,6 +340,18 @@
           "properties": {
             "orderbook_swap": {
               "$ref": "#/definitions/OrderbookSwapOp"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "clmm_swap"
+          ],
+          "properties": {
+            "clmm_swap": {
+              "$ref": "#/definitions/ClmmSwapOp"
             }
           },
           "additionalProperties": false

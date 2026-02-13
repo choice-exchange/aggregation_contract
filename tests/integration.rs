@@ -7,7 +7,7 @@ use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    amm, cw20_adapter, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
+    amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
     OrderbookSwapOp, QueryMsg, Split, Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
@@ -40,6 +40,7 @@ pub struct TestEnv {
     pub mock_amm_2_addr: String,
     pub mock_ob_inj_usdt_addr: String,
     pub mock_ob_usdt_inj_addr: String,
+    pub mock_clmm_inj_usdt_addr: String,
 }
 
 /// Sets up the test environment, deploying the aggregator and three mock swap contracts.
@@ -229,6 +230,32 @@ fn setup() -> TestEnv {
         .data
         .address;
 
+    let mock_clmm_inj_usdt_addr = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "15.0".to_string(),
+                    protocol_type: ProtocolType::Clmm,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("mock-clmm-inj-usdt"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
     let bank = Bank::new(&app);
     let funds_to_send = vec![
         ProtoCoin {
@@ -241,12 +268,13 @@ fn setup() -> TestEnv {
         },
     ];
 
-    // Fund all three mock contracts from the admin account.
+    // Fund all mock contracts from the admin account.
     for addr in [
         &mock_amm_1_addr,
         &mock_amm_2_addr,
         &mock_ob_inj_usdt_addr,
         &mock_ob_usdt_inj_addr,
+        &mock_clmm_inj_usdt_addr,
     ] {
         bank.send(
             MsgSend {
@@ -269,6 +297,7 @@ fn setup() -> TestEnv {
         mock_amm_2_addr,
         mock_ob_inj_usdt_addr,
         mock_ob_usdt_inj_addr,
+        mock_clmm_inj_usdt_addr,
     }
 }
 
@@ -948,6 +977,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             mock_amm_2_addr: "".to_string(),
             mock_ob_inj_usdt_addr: "".to_string(),
             mock_ob_usdt_inj_addr: "".to_string(),
+            mock_clmm_inj_usdt_addr: "".to_string(),
         },
         shroom_cw20_addr,
         sai_cw20_addr,
@@ -3555,4 +3585,231 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
         final_amount > initial_inj_amount,
         "Final amount should be greater than the initial amount for this profitable swap"
     );
+}
+
+#[test]
+fn test_clmm_single_hop_swap() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // Input: 10 INJ (10 * 10^18)
+    // CLMM pool rate: 15.0 -> 10 INJ = 150 USDT (150 * 10^6)
+    // The aggregator queries Quote first, gets amount_out=150_000_000,
+    // then applies 0.5% slippage for minimum_amount_out.
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    ask_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(149_000_000)), // 149 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+
+    assert!(res.is_ok(), "CLMM swap failed: {:?}", res.unwrap_err());
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 10 INJ * 15.0 = 150 USDT = 150_000_000 (6 decimals)
+    assert_eq!(total_received.value, "150000000");
+
+    // Verify user's USDT balance increased
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_balance = Uint128::from_str(&balance_response.balance.unwrap().amount).unwrap();
+    // Initial: 1_000_000_000_000 + swap output: 150_000_000
+    assert_eq!(final_balance, Uint128::new(1_000_150_000_000));
+}
+
+#[test]
+fn test_clmm_mixed_with_amm_split() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Input: 100 INJ
+    // Split 1 (50%): 50 INJ -> AMM1 @ 10.0 = 500 USDT
+    // Split 2 (50%): 50 INJ -> CLMM @ 15.0 = 750 USDT
+    // Total: 1250 USDT
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 50,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_1_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 50,
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                        pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                    })],
+                },
+            ],
+        }],
+        minimum_receive: Some(Uint128::new(1_200_000_000)), // 1200 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "Mixed AMM+CLMM swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 50 INJ * 10 = 500 USDT + 50 INJ * 15 = 750 USDT = 1250 USDT
+    assert_eq!(total_received.value, "1250000000");
+}
+
+#[test]
+fn test_clmm_multi_hop() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Multi-hop: USDT -> OB (rate 0.1) -> INJ -> CLMM (rate 15.0) -> USDT
+    // Stage 1: 1000 USDT -> OB @ 0.1 = 100 INJ
+    // Stage 2: 100 INJ -> CLMM @ 15.0 = 1500 USDT
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        swap_contract: env.mock_ob_usdt_inj_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        min_quantity_tick_size: Uint128::new(1_000_000),
+                    })],
+                }],
+            },
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                        pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        ask_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                    })],
+                }],
+            },
+        ],
+        minimum_receive: Some(Uint128::new(1_400_000_000)), // 1400 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(1_000_000_000u128, "usdt")], // 1000 USDT
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "Multi-hop CLMM swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 1000 USDT * 0.1 = 100 INJ, 100 INJ * 15 = 1500 USDT
+    assert_eq!(total_received.value, "1500000000");
 }

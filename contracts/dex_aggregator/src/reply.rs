@@ -126,7 +126,8 @@ fn handle_swap_reply(
     let swap_event_opt = events.iter().rev().find(|e| {
         e.ty.starts_with("wasm")
             && (e.attributes.iter().any(|a| a.key == "return_amount")
-                || e.attributes.iter().any(|a| a.key == "swap_final_amount"))
+                || e.attributes.iter().any(|a| a.key == "swap_final_amount")
+                || e.attributes.iter().any(|a| a.key == "amount_out"))
     });
 
     if swap_event_opt.is_none() {
@@ -507,6 +508,7 @@ fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError>
     Ok(match op {
         Operation::AmmSwap(o) => o.ask_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.ask_asset_info.clone(),
+        Operation::ClmmSwap(o) => o.ask_asset_info.clone(),
     })
 }
 
@@ -544,16 +546,21 @@ fn parse_amount_from_swap_reply(
         if !event.ty.starts_with("wasm") {
             return None;
         }
-        let key = if event.ty == "wasm-atomic_swap_execution" {
-            "swap_final_amount"
+        if event.ty == "wasm-atomic_swap_execution" {
+            // Orderbook
+            event
+                .attributes
+                .iter()
+                .find(|attr| attr.key == "swap_final_amount")
+                .map(|attr| attr.value.clone())
         } else {
-            "return_amount"
-        };
-        event
-            .attributes
-            .iter()
-            .find(|attr| attr.key == key)
-            .map(|attr| attr.value.clone())
+            // AMM ("return_amount") or CLMM ("amount_out")
+            event
+                .attributes
+                .iter()
+                .find(|attr| attr.key == "return_amount" || attr.key == "amount_out")
+                .map(|attr| attr.value.clone())
+        }
     });
 
     match amount_str_opt {
@@ -753,6 +760,7 @@ fn get_operation_input(op: &Operation) -> Result<amm::AssetInfo, ContractError> 
     Ok(match op {
         Operation::AmmSwap(o) => o.offer_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.offer_asset_info.clone(),
+        Operation::ClmmSwap(o) => o.offer_asset_info.clone(),
     })
 }
 
@@ -809,6 +817,7 @@ fn get_operation_address(op: &Operation) -> &String {
     match op {
         Operation::AmmSwap(o) => &o.pool_address,
         Operation::OrderbookSwap(o) => &o.swap_contract,
+        Operation::ClmmSwap(o) => &o.pool_address,
     }
 }
 

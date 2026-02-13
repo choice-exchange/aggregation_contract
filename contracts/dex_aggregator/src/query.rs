@@ -1,5 +1,6 @@
 use crate::msg::{
-    amm, orderbook, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse, Stage,
+    amm, clmm, orderbook, AllFeesResponse, FeeInfo, FeeResponse, Operation,
+    SimulateRouteResponse, Stage,
 };
 use crate::state::{Config, FEE_MAP};
 use cosmwasm_std::{
@@ -170,6 +171,26 @@ fn simulate_single_operation(
                 amount: sim_response.result_quantity.into(),
             })
         }
+        Operation::ClmmSwap(op) => {
+            let quote_query = clmm::ClmmPoolQueryMsg::Quote {
+                token_in: offer_asset.info.clone(),
+                amount_in: offer_asset.amount,
+            };
+            let contract_addr = op.pool_address.to_string();
+
+            let quote_response: clmm::QuoteResponse = querier.query(
+                &WasmQuery::Smart {
+                    contract_addr,
+                    msg: to_json_binary(&quote_query)?,
+                }
+                .into(),
+            )?;
+
+            Ok(amm::Asset {
+                info: op.ask_asset_info.clone(),
+                amount: quote_response.amount_out,
+            })
+        }
     }
 }
 
@@ -180,6 +201,7 @@ fn get_path_start_info(path: &[Operation]) -> StdResult<amm::AssetInfo> {
     Ok(match first_op {
         Operation::AmmSwap(op) => op.offer_asset_info.clone(),
         Operation::OrderbookSwap(op) => op.offer_asset_info.clone(),
+        Operation::ClmmSwap(op) => op.offer_asset_info.clone(),
     })
 }
 

@@ -89,7 +89,7 @@ AGGREGATION_CONTRACT/
 │   │       └── state.rs        # State definitions and storage management.
 │   │
 │   ├── mock_swap/          # A mock DEX contract used for integration testing. It simulates
-│   │                       # both AMM and Orderbook behavior with predictable rates.
+│   │                       # AMM, Orderbook, and CLMM behavior with predictable rates.
 │   │
 │   ├── cw20_adapter/       # A utility contract to handle conversions between native
 │   │                       # Injective tokenfactory denoms and their CW20 equivalents.
@@ -172,6 +172,8 @@ pub enum Operation {
     AmmSwap(AmmSwapOp),
     /// A swap on an orderbook-style DEX.
     OrderbookSwap(OrderbookSwapOp),
+    /// A swap on a concentrated liquidity (CLMM) DEX.
+    ClmmSwap(ClmmSwapOp),
 }
 
 // These structs define the specific details for each operation type.
@@ -187,13 +189,19 @@ pub struct OrderbookSwapOp {
     pub ask_asset_info: external::AssetInfo,
     pub min_quantity_tick_size: Uint128,
 }
+
+pub struct ClmmSwapOp {
+    pub pool_address: String,
+    pub offer_asset_info: external::AssetInfo,
+    pub ask_asset_info: external::AssetInfo,
+}
 ```
 
 ### Example Usage
 
 Here is an example of a complex route that showcases the multi-hop `Path` functionality.
 
-**Route:** Start with `INJ`. Split the funds 50/50 into two parallel, multi-hop paths that use different intermediate assets (`USDT` and `AUSD`) but both end up with `SHROOM`.
+**Route:** Start with `INJ`. Split the funds into three parallel paths using AMM, Orderbook, and CLMM pools, all ending up with `USDT`.
 
 ```json
 {
@@ -202,7 +210,7 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
       {
         "splits": [
           {
-            "percent": 50,
+            "percent": 33,
             "path": [
               {
                 "amm_swap": {
@@ -210,32 +218,30 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
                   "offer_asset_info": { "native_token": { "denom": "inj" } },
                   "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
                 }
-              },
+              }
+            ]
+          },
+          {
+            "percent": 34,
+            "path": [
               {
                 "orderbook_swap": {
                   "swap_contract": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
-                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } },
-                  "min_quantity_tick_size": 100000000
+                  "offer_asset_info": { "native_token": { "denom": "inj" } },
+                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
+                  "min_quantity_tick_size": "1000000000000000"
                 }
               }
             ]
           },
           {
-            "percent": 50,
+            "percent": 33,
             "path": [
               {
-                "amm_swap": {
+                "clmm_swap": {
                   "pool_address": "inj1...",
                   "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...ausd" } }
-                }
-              },
-              {
-                "amm_swap": {
-                  "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "peggy0x...ausd" } },
-                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } }
+                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
                 }
               }
             ]

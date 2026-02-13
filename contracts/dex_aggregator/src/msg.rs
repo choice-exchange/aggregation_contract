@@ -136,6 +136,43 @@ pub mod reflection {
     }
 }
 
+pub mod clmm {
+    use super::*;
+
+    #[cw_serde]
+    pub enum ClmmPoolExecuteMsg {
+        SwapExactInput {
+            minimum_amount_out: Uint128,
+            recipient: Option<String>,
+            deadline: Option<u64>,
+        },
+    }
+
+    #[cw_serde]
+    pub enum Cw20HookMsg {
+        SwapExactInput {
+            minimum_amount_out: Uint128,
+            recipient: Option<String>,
+            deadline: Option<u64>,
+        },
+    }
+
+    #[cw_serde]
+    pub enum ClmmPoolQueryMsg {
+        Quote {
+            token_in: amm::AssetInfo,
+            amount_in: Uint128,
+        },
+    }
+
+    #[cw_serde]
+    pub struct QuoteResponse {
+        pub amount_out: Uint128,
+        pub amount_in_consumed: Uint128,
+        pub fee_amount: Uint128,
+    }
+}
+
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
@@ -152,9 +189,17 @@ pub struct OrderbookSwapOp {
 }
 
 #[cw_serde]
+pub struct ClmmSwapOp {
+    pub pool_address: String,
+    pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: amm::AssetInfo,
+}
+
+#[cw_serde]
 pub enum Operation {
     AmmSwap(AmmSwapOp),
     OrderbookSwap(OrderbookSwapOp),
+    ClmmSwap(ClmmSwapOp),
 }
 
 #[cw_serde]

@@ -3,6 +3,7 @@ pub mod cw20;
 pub mod error;
 pub mod execute;
 pub mod msg;
+pub mod orderbook_exec;
 pub mod query;
 pub mod reply;
 pub mod state;

@@ -1,0 +1,498 @@
+//! Native Injective spot-orderbook execution, ported from the standalone
+//! `inj-orderbook-swap-contract` (`queries.rs` / `helpers.rs` / `types.rs`).
+//!
+//! Scope (see docs/orderbook_merge_plan.md): only the **single-market, from-source
+//! input-quantity** estimation path is kept. The standalone contract's multi-market
+//! routes (`SwapRoute`/`steps_from`), exact-output / `*_from_target` estimators,
+//! `SwapQuantityMode`, and cross-step `SWAP_*` state are all dropped — each merged
+//! `OrderbookSwapOp` is exactly one market = one order = one reply.
+//!
+//! Adaptations from the original:
+//! - The aggregator is always its own fee recipient (self-relayer), so the fee
+//!   discount is always applied — no `Config`/`fee_recipient` lookup.
+//! - cosmwasm-std 3.0: `generic_err` -> `msg`; `Coin.amount` is `Uint256`
+//!   (`FPDecimal: From<Uint256>` exists, so balance reads still `.into()` cleanly).
+
+use cosmwasm_std::{Addr, Deps, StdError, StdResult};
+use injective_cosmwasm::{
+    InjectiveQuerier, InjectiveQueryWrapper, MarketId, OrderSide, PriceLevel, SpotMarket,
+};
+use injective_math::utils::round_to_min_tick;
+use injective_math::FPDecimal;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+/// An `FPDecimal`-denominated coin. Orderbook quantities/prices are `FPDecimal`,
+/// distinct from the `Uint128` used everywhere else in the aggregator.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FPCoin {
+    pub amount: FPDecimal,
+    pub denom: String,
+}
+
+/// Result of estimating (or sizing, for execution) a single-market orderbook hop.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepExecutionEstimate {
+    /// Worst acceptable price across the consumed levels — used as the atomic
+    /// order's price bound. Conservative; the route-level `minimum_receive` is the
+    /// real net.
+    pub worst_price: FPDecimal,
+    /// Denom produced by this hop.
+    pub result_denom: String,
+    /// Expected output quantity (base for a buy, quote-minus-fee for a sell).
+    pub result_quantity: FPDecimal,
+    pub is_buy_order: bool,
+    /// Trading fee taken by the exchange, always in the quote denom.
+    pub fee_estimate: Option<FPCoin>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers (ported from helpers.rs)
+// ---------------------------------------------------------------------------
+
+/// Scale an `FPDecimal` by `10^digits` (negative to descale).
+pub trait Scaled {
+    fn scaled(self, digits: i32) -> Self;
+}
+
+impl Scaled for FPDecimal {
+    fn scaled(self, digits: i32) -> Self {
+        self * FPDecimal::from(10i128).pow(FPDecimal::from(digits as i128)).unwrap()
+    }
+}
+
+/// `10^18`, the exchange-module scale factor.
+pub fn dec_scale_factor() -> FPDecimal {
+    FPDecimal::ONE.scaled(18)
+}
+
+/// Round `num` UP to the nearest multiple of `min_tick` (never below `min_tick`).
+pub fn round_up_to_min_tick(num: FPDecimal, min_tick: FPDecimal) -> FPDecimal {
+    if num < min_tick {
+        return min_tick;
+    }
+
+    let remainder = FPDecimal::from(num.num % min_tick.num);
+
+    if remainder.num.is_zero() {
+        return num;
+    }
+
+    FPDecimal::from(num.num - remainder.num + min_tick.num)
+}
+
+// ---------------------------------------------------------------------------
+// Orderbook walk / pricing (ported from queries.rs, from-source only)
+// ---------------------------------------------------------------------------
+
+/// Walk price levels until `total` (in the unit produced by `calc`) is covered,
+/// taking a partial slice of the last level. Errors if the book lacks liquidity.
+pub fn get_minimum_liquidity_levels(
+    levels: &[PriceLevel],
+    total: FPDecimal,
+    calc: fn(&PriceLevel) -> FPDecimal,
+    min_quantity_tick_size: FPDecimal,
+) -> StdResult<Vec<PriceLevel>> {
+    let mut sum = FPDecimal::ZERO;
+    let mut orders: Vec<PriceLevel> = Vec::new();
+
+    for level in levels {
+        let value = calc(level);
+        assert_ne!(
+            value,
+            FPDecimal::ZERO,
+            "Price level with zero value, this should not happen"
+        );
+
+        let order_to_add = if sum + value > total {
+            let excess = value + sum - total;
+
+            // we only take a part of this price level
+            let raw_quantity = ((value - excess) / value) * level.q;
+            let rounded_quantity = round_up_to_min_tick(raw_quantity, min_quantity_tick_size);
+
+            PriceLevel {
+                p: level.p,
+                q: rounded_quantity,
+            }
+        } else {
+            level.clone() // take fully
+        };
+
+        sum += value;
+        orders.push(order_to_add);
+
+        if sum >= total {
+            break;
+        }
+    }
+
+    if sum < total {
+        return Err(StdError::msg("Not enough liquidity to fulfill order"));
+    }
+
+    Ok(orders)
+}
+
+/// Quantity-weighted average price across the consumed levels. `is_rounding_up`
+/// biases the estimate to the worse side for the trader (up for buys, down for sells).
+fn get_average_price_from_orders(
+    levels: &[PriceLevel],
+    min_price_tick_size: FPDecimal,
+    is_rounding_up: bool,
+) -> FPDecimal {
+    let (total_quantity, total_notional) = levels
+        .iter()
+        .fold((FPDecimal::ZERO, FPDecimal::ZERO), |acc, pl| {
+            (acc.0 + pl.q, acc.1 + pl.p * pl.q)
+        });
+
+    assert_ne!(
+        total_quantity,
+        FPDecimal::ZERO,
+        "total_quantity was zero and would result in division by zero"
+    );
+    let average_price = total_notional / total_quantity;
+
+    if is_rounding_up {
+        round_up_to_min_tick(average_price, min_price_tick_size)
+    } else {
+        round_to_min_tick(average_price, min_price_tick_size)
+    }
+}
+
+/// The worst (last consumed) price level. Used as the atomic order's price bound.
+fn get_worst_price_from_orders(levels: &[PriceLevel]) -> FPDecimal {
+    levels.last().unwrap().p // assume there's at least one element
+}
+
+/// Fee discount applied because the aggregator self-relays. The standalone
+/// contract gated this on `fee_recipient == contract`; the merged aggregator is
+/// always its own fee recipient, so this is always the full relayer-fee share.
+fn get_effective_fee_discount_rate(market: &SpotMarket, is_self_relayer: bool) -> FPDecimal {
+    if !is_self_relayer {
+        FPDecimal::ZERO
+    } else {
+        market.relayer_fee_share_rate
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-market estimators (from-source only)
+// ---------------------------------------------------------------------------
+
+/// Estimate / size a single-market orderbook hop where the caller supplies the
+/// **input** quantity (`input`, in either the market's base or quote denom).
+///
+/// `is_simulation = true` for the on-chain `SimulateRoute` quote; `false` during
+/// execution, where the contract already holds the input funds (the buy-side
+/// margin check accounts for that). The aggregator self-relays, so the fee
+/// discount is always applied.
+pub fn estimate_single_swap_execution(
+    deps: &Deps<InjectiveQueryWrapper>,
+    contract_address: &Addr,
+    market_id: &MarketId,
+    input: FPCoin,
+    is_simulation: bool,
+) -> StdResult<StepExecutionEstimate> {
+    let querier = InjectiveQuerier::new(&deps.querier);
+
+    let market = querier
+        .query_spot_market(market_id)?
+        .market
+        .expect("market should be available");
+
+    let has_invalid_denom =
+        input.denom != market.quote_denom && input.denom != market.base_denom;
+    if has_invalid_denom {
+        return Err(StdError::msg("Invalid swap denom - neither base nor quote"));
+    }
+
+    // Merged aggregator is always its own fee recipient.
+    let is_self_relayer = true;
+
+    let fee_multiplier = querier
+        .query_market_atomic_execution_fee_multiplier(market_id)?
+        .multiplier;
+
+    let fee_percent = market.taker_fee_rate
+        * fee_multiplier
+        * (FPDecimal::ONE - get_effective_fee_discount_rate(&market, is_self_relayer));
+
+    // from-source: paying quote => buying base; paying base => selling.
+    let is_buy = input.denom != market.base_denom;
+
+    if is_buy {
+        estimate_execution_buy_from_source(
+            deps,
+            &querier,
+            contract_address,
+            &market,
+            input.amount,
+            fee_percent,
+            is_simulation,
+        )
+    } else {
+        estimate_execution_sell_from_source(&querier, &market, input.amount, fee_percent)
+    }
+}
+
+/// Buy base with a known quote input. Overestimates price (rounds avg up) so the
+/// sizing is conservative. Verifies the contract holds enough quote margin.
+fn estimate_execution_buy_from_source(
+    deps: &Deps<InjectiveQueryWrapper>,
+    querier: &InjectiveQuerier,
+    contract_address: &Addr,
+    market: &SpotMarket,
+    input_quote_quantity: FPDecimal,
+    fee_percent: FPDecimal,
+    is_simulation: bool,
+) -> StdResult<StepExecutionEstimate> {
+    let available_swap_quote_funds = input_quote_quantity / (FPDecimal::ONE + fee_percent);
+
+    let orders = querier.query_spot_market_orderbook(
+        &market.market_id,
+        OrderSide::Sell,
+        None,
+        Some(available_swap_quote_funds),
+    )?;
+    let top_orders = get_minimum_liquidity_levels(
+        &orders.sells_price_level,
+        available_swap_quote_funds,
+        |l| l.q * l.p,
+        market.min_quantity_tick_size,
+    )?;
+
+    // overestimate for buys => round average price up => higher (worse) buy price
+    let average_price = get_average_price_from_orders(&top_orders, market.min_price_tick_size, true);
+    let worst_price = get_worst_price_from_orders(&top_orders);
+
+    let expected_base_quantity = available_swap_quote_funds / average_price;
+    let result_quantity = round_to_min_tick(expected_base_quantity, market.min_quantity_tick_size);
+    let fee_estimate = input_quote_quantity - available_swap_quote_funds;
+
+    // check the contract holds enough quote to create the order
+    let required_funds = worst_price * expected_base_quantity * (FPDecimal::ONE + fee_percent);
+    let funds_in_contract: FPDecimal = deps
+        .querier
+        .query_balance(contract_address, &market.quote_denom)
+        .expect("query own balance should not fail")
+        .amount
+        .into();
+
+    let funds_for_margin = match is_simulation {
+        // in execution mode funds_in_contract already include the user's input,
+        // so we must not count it twice
+        false => funds_in_contract,
+        true => funds_in_contract + available_swap_quote_funds,
+    };
+
+    if required_funds > funds_for_margin {
+        return Err(StdError::msg(format!(
+            "Swap amount too high, required funds: {required_funds}, available funds: {funds_for_margin}",
+        )));
+    }
+
+    Ok(StepExecutionEstimate {
+        worst_price,
+        result_quantity,
+        result_denom: market.base_denom.to_string(),
+        is_buy_order: true,
+        fee_estimate: Some(FPCoin {
+            denom: market.quote_denom.clone(),
+            amount: fee_estimate,
+        }),
+    })
+}
+
+/// Sell a known base input for quote. Underestimates price (rounds avg down) so
+/// the sizing is conservative. No margin check (the base is already in hand).
+fn estimate_execution_sell_from_source(
+    querier: &InjectiveQuerier,
+    market: &SpotMarket,
+    input_base_quantity: FPDecimal,
+    fee_percent: FPDecimal,
+) -> StdResult<StepExecutionEstimate> {
+    let orders = querier.query_spot_market_orderbook(
+        &market.market_id,
+        OrderSide::Buy,
+        Some(input_base_quantity),
+        None,
+    )?;
+
+    let top_orders = get_minimum_liquidity_levels(
+        &orders.buys_price_level,
+        input_base_quantity,
+        |l| l.q,
+        market.min_quantity_tick_size,
+    )?;
+
+    // overestimate for sells => round average price down => lower (worse) sell price
+    let average_price =
+        get_average_price_from_orders(&top_orders, market.min_price_tick_size, false);
+    let worst_price = get_worst_price_from_orders(&top_orders);
+
+    let expected_exchange_quantity = input_base_quantity * average_price;
+    let fee_estimate = expected_exchange_quantity * fee_percent;
+    let expected_quantity = expected_exchange_quantity - fee_estimate;
+
+    Ok(StepExecutionEstimate {
+        worst_price,
+        result_quantity: expected_quantity,
+        result_denom: market.quote_denom.to_string(),
+        is_buy_order: false,
+        fee_estimate: Some(FPCoin {
+            denom: market.quote_denom.clone(),
+            amount: fee_estimate,
+        }),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_price_level(p: u128, q: u128) -> PriceLevel {
+        PriceLevel {
+            p: FPDecimal::from(p),
+            q: FPDecimal::from(q),
+        }
+    }
+
+    #[test]
+    fn test_average_price_simple() {
+        let levels = vec![
+            create_price_level(1, 200),
+            create_price_level(2, 200),
+            create_price_level(3, 200),
+        ];
+
+        let avg = get_average_price_from_orders(&levels, FPDecimal::must_from_str("0.01"), false);
+        assert_eq!(avg, FPDecimal::from(2u128));
+    }
+
+    #[test]
+    fn test_average_price_round_down() {
+        let levels = vec![
+            create_price_level(1, 300),
+            create_price_level(2, 200),
+            create_price_level(3, 100),
+        ];
+
+        let avg = get_average_price_from_orders(&levels, FPDecimal::must_from_str("0.01"), false);
+        assert_eq!(avg, FPDecimal::must_from_str("1.66")); // round down
+    }
+
+    #[test]
+    fn test_average_price_round_up() {
+        let levels = vec![
+            create_price_level(1, 300),
+            create_price_level(2, 200),
+            create_price_level(3, 100),
+        ];
+
+        let avg = get_average_price_from_orders(&levels, FPDecimal::must_from_str("0.01"), true);
+        assert_eq!(avg, FPDecimal::must_from_str("1.67")); // round up
+    }
+
+    #[test]
+    fn test_worst_price() {
+        let levels = vec![
+            create_price_level(1, 100),
+            create_price_level(2, 200),
+            create_price_level(3, 300),
+        ];
+
+        assert_eq!(get_worst_price_from_orders(&levels), FPDecimal::from(3u128));
+    }
+
+    #[test]
+    fn test_min_liquidity_not_enough() {
+        let levels = vec![create_price_level(1, 100), create_price_level(2, 200)];
+
+        let result = get_minimum_liquidity_levels(
+            &levels,
+            FPDecimal::from(1000u128),
+            |l| l.q,
+            FPDecimal::must_from_str("0.01"),
+        );
+        assert!(result.is_err());
+        // StdError is opaque in cosmwasm-std 3.0 (not PartialEq); match the message.
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Not enough liquidity"));
+    }
+
+    #[test]
+    fn test_min_liquidity_with_gaps() {
+        let levels = vec![
+            create_price_level(1, 100),
+            create_price_level(3, 300),
+            create_price_level(5, 500),
+        ];
+
+        let min_orders = get_minimum_liquidity_levels(
+            &levels,
+            FPDecimal::from(800u128),
+            |l| l.q,
+            FPDecimal::must_from_str("0.01"),
+        )
+        .unwrap();
+        assert_eq!(min_orders.len(), 3);
+        assert_eq!(min_orders[0].p, FPDecimal::from(1u128));
+        assert_eq!(min_orders[1].p, FPDecimal::from(3u128));
+        assert_eq!(min_orders[2].p, FPDecimal::from(5u128));
+    }
+
+    #[test]
+    fn test_min_liquidity_partial_last_level() {
+        let levels = vec![
+            create_price_level(1, 100),
+            create_price_level(3, 300),
+            create_price_level(5, 500),
+        ];
+
+        let min_orders = get_minimum_liquidity_levels(
+            &levels,
+            FPDecimal::from(450u128),
+            |l| l.q,
+            FPDecimal::must_from_str("0.01"),
+        )
+        .unwrap();
+        assert_eq!(min_orders.len(), 3);
+        assert_eq!(min_orders[2].q, FPDecimal::from(50u128)); // partial slice
+    }
+
+    #[test]
+    fn test_round_up_to_min_tick() {
+        assert_eq!(
+            round_up_to_min_tick(FPDecimal::from(37u128), FPDecimal::from(10u128)),
+            FPDecimal::from(40u128)
+        );
+        assert_eq!(
+            round_up_to_min_tick(
+                FPDecimal::must_from_str("0.00000153"),
+                FPDecimal::must_from_str("0.000001")
+            ),
+            FPDecimal::must_from_str("0.000002")
+        );
+        // below one tick rounds up to exactly one tick
+        assert_eq!(
+            round_up_to_min_tick(
+                FPDecimal::must_from_str("0.0000001"),
+                FPDecimal::must_from_str("0.000001")
+            ),
+            FPDecimal::must_from_str("0.000001")
+        );
+    }
+
+    #[test]
+    fn test_dec_scale_factor_roundtrip() {
+        let val = FPDecimal::must_from_str("1000000000000000000");
+        assert_eq!(val.scaled(-18), FPDecimal::from(1u128));
+        assert_eq!(dec_scale_factor(), val);
+    }
+}

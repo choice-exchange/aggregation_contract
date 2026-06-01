@@ -2,7 +2,7 @@
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
-use cw20::Cw20ReceiveMsg;
+use crate::cw20::Cw20ReceiveMsg;
 
 pub mod cw20_adapter {
     use super::*;

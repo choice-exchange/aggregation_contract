@@ -3,13 +3,15 @@ use cosmwasm_std::{
     entry_point, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps,
     DepsMut, Env, Event, MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
-use cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
+use crate::cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cw_storage_plus::Item;
 use injective_cosmwasm::InjectiveQueryWrapper;
 use injective_math::FPDecimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+pub mod cw20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -156,7 +158,8 @@ pub fn execute(
             (offer_asset.amount, offer_asset.info)
         }
         ExecuteMsg::SwapMinOutput { .. } => (
-            info.funds[0].amount,
+            Uint128::try_from(info.funds[0].amount)
+                .map_err(|_| StdError::msg("funds amount exceeds Uint128"))?,
             AssetInfo::NativeToken {
                 denom: info.funds[0].denom.clone(),
             },
@@ -168,7 +171,8 @@ pub fn execute(
                 recipient = recip_addr;
             }
             (
-                info.funds[0].amount,
+                Uint128::try_from(info.funds[0].amount)
+                    .map_err(|_| StdError::msg("funds amount exceeds Uint128"))?,
                 AssetInfo::NativeToken {
                     denom: info.funds[0].denom.clone(),
                 },
@@ -197,7 +201,7 @@ pub fn execute(
 
     let final_return_amount = if offer_info == config.input_asset_info {
         let offer_decimal = Decimal::from_atomics(offer_amount, config.input_decimals as u32)
-            .map_err(|_| StdError::generic_err("Failed to create decimal from offer amount"))?;
+            .map_err(|_| StdError::msg("Failed to create decimal from offer amount"))?;
 
         let rate_decimal = Decimal::from_str(&config.rate)?;
         let return_decimal = offer_decimal * rate_decimal;
@@ -229,7 +233,7 @@ pub fn execute(
             to_address: recipient,
             amount: vec![Coin {
                 denom: denom.clone(),
-                amount: final_return_amount,
+                amount: final_return_amount.into(),
             }],
         }),
     };
@@ -289,7 +293,7 @@ pub fn query(
             };
 
             if source_denom != config_source_denom || target_denom != config_target_denom {
-                return Err(StdError::generic_err(format!(
+                return Err(StdError::msg(format!(
                     "Invalid trading pair for this mock contract. Expected {} -> {}, got {} -> {}",
                     config_source_denom, config_target_denom, source_denom, target_denom
                 )));
@@ -318,13 +322,13 @@ pub fn query(
             let config = CONFIG.load(deps.storage)?;
 
             if token_in != config.input_asset_info {
-                return Err(StdError::generic_err(
+                return Err(StdError::msg(
                     "Invalid token_in for this mock contract",
                 ));
             }
 
             let offer_decimal = Decimal::from_atomics(amount_in, config.input_decimals as u32)
-                .map_err(|_| StdError::generic_err("Failed to create decimal from amount_in"))?;
+                .map_err(|_| StdError::msg("Failed to create decimal from amount_in"))?;
             let rate_decimal = Decimal::from_str(&config.rate)?;
             let return_decimal = offer_decimal * rate_decimal;
             let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.output_decimals as u32);

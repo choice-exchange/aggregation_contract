@@ -1,7 +1,8 @@
 use cosmwasm_std::{
-    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdResult,
+    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdError,
+    StdResult, Uint128,
 };
-use cw20::Cw20ReceiveMsg;
+use crate::cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
@@ -58,7 +59,8 @@ pub fn execute(
                 info: amm::AssetInfo::NativeToken {
                     denom: info.funds[0].denom.clone(),
                 },
-                amount: info.funds[0].amount,
+                // cosmwasm-std 3.0: Coin.amount is Uint256; our assets are Uint128.
+                amount: Uint128::try_from(info.funds[0].amount).map_err(StdError::from)?,
             };
             execute::execute_aggregate_swaps_internal(
                 deps,

@@ -2,7 +2,7 @@ use cosmwasm_std::{
     to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response,
     StdError, StdResult, Uint128, WasmMsg,
 };
-use cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
+use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 use injective_math::FPDecimal;
 use std::str::FromStr;
@@ -107,7 +107,7 @@ pub fn create_swap_cosmos_msg(
                     msg: to_json_binary(&amm_swap_msg)?,
                     funds: vec![Coin {
                         denom: denom.clone(),
-                        amount,
+                        amount: amount.into(),
                     }],
                 }),
                 amm::AssetInfo::Token { contract_addr } => {
@@ -145,7 +145,7 @@ pub fn create_swap_cosmos_msg(
             let tick_size_atomic = ob_op.min_quantity_tick_size;
 
             if tick_size_atomic.is_zero() {
-                return Err(ContractError::Std(StdError::generic_err(
+                return Err(ContractError::Std(StdError::msg(
                     "min_quantity_tick_size cannot be zero",
                 )));
             }
@@ -166,7 +166,7 @@ pub fn create_swap_cosmos_msg(
             let offer_denom =
                 match &ob_op.offer_asset_info {
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
-                    _ => return Err(ContractError::Std(StdError::generic_err(
+                    _ => return Err(ContractError::Std(StdError::msg(
                         "This OrderbookSwapOp implementation only supports native token inputs.",
                     ))),
                 };
@@ -174,7 +174,7 @@ pub fn create_swap_cosmos_msg(
             let target_denom = match &ob_op.ask_asset_info {
                 amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
-                    return Err(ContractError::Std(StdError::generic_err(
+                    return Err(ContractError::Std(StdError::msg(
                         "Orderbook swaps only support native token (bank) outputs.",
                     )))
                 }
@@ -204,7 +204,7 @@ pub fn create_swap_cosmos_msg(
                     amm::AssetInfo::NativeToken { denom } => denom.clone(),
                     _ => unreachable!(),
                 },
-                amount: rounded_atomic_amount,
+                amount: rounded_atomic_amount.into(),
             }];
 
             CosmosMsg::Wasm(WasmMsg::Execute {
@@ -246,7 +246,7 @@ pub fn create_swap_cosmos_msg(
                     msg: to_json_binary(&clmm_swap_msg)?,
                     funds: vec![Coin {
                         denom: denom.clone(),
-                        amount,
+                        amount: amount.into(),
                     }],
                 }),
                 amm::AssetInfo::Token { contract_addr } => {
@@ -302,7 +302,7 @@ pub fn set_fee(
 
     // Validate that the fee is reasonable (e.g., less than 100%)
     if fee_percent >= Decimal::one() {
-        return Err(ContractError::Std(StdError::generic_err(
+        return Err(ContractError::Std(StdError::msg(
             "Fee percentage must be less than 100%",
         )));
     }
@@ -383,7 +383,11 @@ pub fn emergency_withdraw(
             } else {
                 None
             };
-            (balance.amount, msg)
+            // cosmwasm-std 3.0: native balance is Uint256; unify with the cw20 arm's Uint128.
+            (
+                Uint128::try_from(balance.amount).map_err(StdError::from)?,
+                msg,
+            )
         }
         amm::AssetInfo::Token { contract_addr } => {
             let balance: BalanceResponse = deps.querier.query_wasm_smart(

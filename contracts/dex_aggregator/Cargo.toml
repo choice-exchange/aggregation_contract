@@ -10,11 +10,13 @@ crate-type = ["cdylib", "rlib"]
 library = []
 
 [dependencies]
-cw2                = { version = "2.0.0" }
-cw20               = { version = "2.0.0" }
+cw2                = { version = "3.0.0" }
+# cosmwasm-schema stays on 2.x: its 3.0 `#[cw_serde]` derives the new cw-schema
+# `Schemaifier`, which injective-cosmwasm/injective-math 0.3.6 types (JsonSchema-
+# only) do not implement. 2.2.2 has no cosmwasm-std dep, so it coexists cleanly
+# with cosmwasm-std 3.0 and keeps the JsonSchema-only derive the injective stack expects.
 cosmwasm-schema    = { version = "2.2.2" }
-cosmwasm-std       = { version = "2.2.2", features = [
-    "abort",
+cosmwasm-std       = { version = "3.0", features = [
     "cosmwasm_1_2",
     "cosmwasm_1_3",
     "cosmwasm_1_4",
@@ -22,10 +24,12 @@ cosmwasm-std       = { version = "2.2.2", features = [
     "iterator",
     "stargate"
 ] }
-cw-storage-plus    = { version = "2.0.0" }
+cw-storage-plus    = { version = "3.0" }
 
-injective-cosmwasm  = { version = "0.3.4-1" }
-injective-math      = { version = "0.3.4-1" }
+injective-cosmwasm  = { version = "0.3.6" }
+injective-math      = { version = "0.3.6" }
+injective-std       = { version = "1.19.0" }
+prost               = { version = "0.13" }
 
 schemars           = { version = "0.8.22" }
 serde              = { version = "1.0.219", default-features = false, features = ["derive"] }
@@ -38,7 +42,7 @@ thiserror         = { version = "2.0.12" }
 hex               = { version = "0.4.3" }
 
 [dev-dependencies]
-injective-test-tube = { version = "1.16.3-1" }
+injective-test-tube = { version = "1.19.0" }
 mock_swap = { path = "../mock_swap" }
 cw20-base          = { version = "2.0.0" }
 
@@ -46,4 +50,3 @@ cw20-base          = { version = "2.0.0" }
 name = "integration"
 path = "../../tests/integration.rs"
 harness = true
-

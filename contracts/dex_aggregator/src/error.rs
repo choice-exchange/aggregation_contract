@@ -1,7 +1,10 @@
 use cosmwasm_std::{StdError, Uint128};
 use thiserror::Error;
 
-#[derive(Error, Debug, PartialEq)]
+// cosmwasm-std 3.0 made `StdError` opaque (no longer `PartialEq`), so the
+// `Std(StdError)` variant can no longer derive `PartialEq`. Tests that compared
+// errors by value must switch to `matches!`.
+#[derive(Error, Debug)]
 pub enum ContractError {
     // --- Standard & Authorization Errors ---
     #[error("{0}")]

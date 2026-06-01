@@ -2,7 +2,7 @@ use cosmwasm_std::{
     to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg,
     Uint128, WasmMsg,
 };
-use cw20::Cw20ExecuteMsg;
+use crate::cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
@@ -38,7 +38,7 @@ pub fn handle_reply(
             Awaiting::PathConversion => {
                 handle_path_conversion_reply(deps, env, msg, &mut exec_state)
             }
-            Awaiting::Swaps => Err(ContractError::Std(StdError::generic_err(format!(
+            Awaiting::Swaps => Err(ContractError::Std(StdError::msg(format!(
                 "Unregistered swap reply ID received: {}",
                 msg.id
             )))),
@@ -268,7 +268,7 @@ fn create_send_msg(
             to_address: recipient.to_string(),
             amount: vec![Coin {
                 denom: denom.clone(),
-                amount,
+                amount: amount.into(),
             }],
         })),
         amm::AssetInfo::Token { contract_addr } => {
@@ -395,7 +395,7 @@ fn handle_final_conversion_reply(
     let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let running_total_asset = exec_state.accumulated_assets.get_mut(0).ok_or_else(|| {
-        StdError::generic_err("Final conversion state is invalid: no accumulated asset found")
+        StdError::msg("Final conversion state is invalid: no accumulated asset found")
     })?;
 
     running_total_asset.amount += converted_amount;
@@ -498,7 +498,7 @@ fn create_conversion_msg(
             })?,
             funds: vec![Coin {
                 denom: denom.clone(),
-                amount: from.amount,
+                amount: from.amount.into(),
             }],
         })),
     }
@@ -688,7 +688,7 @@ fn plan_next_stage(
                 .find(|a| matches!(a.info, amm::AssetInfo::NativeToken { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
-                    StdError::generic_err(
+                    StdError::msg(
                         "State inconsistency: have native amount but no native asset info found",
                     )
                 })?;
@@ -709,7 +709,7 @@ fn plan_next_stage(
                 .find(|a| matches!(a.info, amm::AssetInfo::Token { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
-                    StdError::generic_err(
+                    StdError::msg(
                         "State inconsistency: have cw20 amount but no cw20 asset info found",
                     )
                 })?;
@@ -839,7 +839,7 @@ fn handle_path_conversion_reply(
     let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let pending_op_details = exec_state.pending_path_op.take().ok_or_else(|| {
-        StdError::generic_err("Path conversion state is invalid: no pending operation found")
+        StdError::msg("Path conversion state is invalid: no pending operation found")
     })?;
 
     let current_stage = exec_state
@@ -859,7 +859,7 @@ fn handle_path_conversion_reply(
                 .find(|(_, op)| **op == pending_op_details.operation)
                 .map(|(oi, _)| (si, oi))
         })
-        .ok_or_else(|| StdError::generic_err("Could not find pending op in route plan"))?;
+        .ok_or_else(|| StdError::msg("Could not find pending op in route plan"))?;
 
     let converted_asset_info = get_operation_input(&pending_op_details.operation)?;
     let swap_msg = create_swap_cosmos_msg(

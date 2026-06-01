@@ -30,7 +30,8 @@ pub fn simulate_route(
         info: amm::AssetInfo::NativeToken {
             denom: amount_in.denom,
         },
-        amount: amount_in.amount,
+        // cosmwasm-std 3.0: Coin.amount is Uint256; our assets are Uint128.
+        amount: Uint128::try_from(amount_in.amount).map_err(StdError::from)?,
     }];
 
     for stage in stages {
@@ -137,7 +138,7 @@ fn simulate_single_operation(
             let source_denom = match &offer_asset.info {
                 amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
-                    return Err(StdError::generic_err(
+                    return Err(StdError::msg(
                         "Orderbook simulation only supports native token inputs",
                     ))
                 }
@@ -145,7 +146,7 @@ fn simulate_single_operation(
             let target_denom = match &op.ask_asset_info {
                 amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
-                    return Err(StdError::generic_err(
+                    return Err(StdError::msg(
                         "Orderbook simulation only supports native token outputs",
                     ))
                 }
@@ -197,7 +198,7 @@ fn simulate_single_operation(
 fn get_path_start_info(path: &[Operation]) -> StdResult<amm::AssetInfo> {
     let first_op = path
         .first()
-        .ok_or_else(|| StdError::generic_err("Path cannot be empty"))?;
+        .ok_or_else(|| StdError::msg("Path cannot be empty"))?;
     Ok(match first_op {
         Operation::AmmSwap(op) => op.offer_asset_info.clone(),
         Operation::OrderbookSwap(op) => op.offer_asset_info.clone(),

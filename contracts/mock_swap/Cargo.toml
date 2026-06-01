@@ -10,10 +10,10 @@ crate-type = ["cdylib", "rlib"]
 library = []
 
 [dependencies]
-cw20               = { version = "2.0.0" }
+# See dex_aggregator/Cargo.toml: cosmwasm-schema 2.x avoids the cw-schema
+# `Schemaifier` bound that injective 0.3.6 types don't implement.
 cosmwasm-schema    = { version = "2.2.2" }
-cosmwasm-std       = { version = "2.2.2", features = [
-    "abort",
+cosmwasm-std       = { version = "3.0", features = [
     "cosmwasm_1_2",
     "cosmwasm_1_3",
     "cosmwasm_1_4",
@@ -21,10 +21,10 @@ cosmwasm-std       = { version = "2.2.2", features = [
     "iterator",
     "stargate"
 ] }
-cw-storage-plus    = { version = "2.0.0" }
+cw-storage-plus    = { version = "3.0" }
 
-injective-cosmwasm  = { version = "0.3.4-1" }
-injective-math      = { version = "0.3.4-1" }
+injective-cosmwasm  = { version = "0.3.6" }
+injective-math      = { version = "0.3.6" }
 
 schemars           = { version = "0.8.22" }
 serde              = { version = "1.0.219", default-features = false, features = ["derive"] }
@@ -34,5 +34,5 @@ serde_repr         = { version = "0.1.20" }
 hex                = { version = "0.4.3" }
 
 [dev-dependencies]
-injective-test-tube = { version = "1.16.3-1" }
+injective-test-tube = { version = "1.19.0" }
 cw20-base          = { version = "2.0.0" }

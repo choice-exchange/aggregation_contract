@@ -35,4 +35,3 @@ hex                = { version = "0.4.3" }
 
 [dev-dependencies]
 injective-test-tube = { version = "1.19.0" }
-cw20-base          = { version = "2.0.0" }

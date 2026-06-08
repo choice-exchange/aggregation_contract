@@ -29,7 +29,32 @@ took the full market-derived redesign (not the `offer_denom: String` fallback).
 | 4. Rewrite `create_swap_cosmos_msg` orderbook arm (atomic SpotOrder, self-relayer) | ✅ done | uncommitted |
 | 5. Rewrite `handle_swap_reply` orderbook branch + typed decode; delete dead event parse | ✅ done | uncommitted |
 | 6. Rewrite `simulate_single_operation` orderbook arm (shared estimator) | ✅ done | uncommitted |
-| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | ⬜ next | — |
+| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | 🟡 setup #1 done | uncommitted |
+
+### Step 7 progress (2026-06-08)
+
+- **Dev-dep conflict resolved.** `injective-test-tube` is already latest (1.19.0) and
+  already on cosmwasm-std 3 — it was NOT the conflict. The lone cosmwasm-std-2 source
+  was `cw20-base 2.0.0` (dev-dep). Dropped it from both crates; vendored the few cw20
+  test message types as local `mod cw20`/`mod cw20_base` in `tests/integration.rs`.
+- **Live-market scaffolding** ported from the proof into `tests/integration.rs`
+  (`register_min_notionals` via gov, `launch_spot_market`, `limit_order`, `tob`, scaling
+  helpers). Orderbook hops can't be mocked anymore — they place real atomic spot orders.
+- **Setup #1 (native INJ/USDT) fully converted + GREEN:** `setup()` launches a real
+  seeded INJ/USDT market; all setup #1 orderbook tests run against it. **23 integration
+  tests pass, 7 ignored** (`cargo test -p dex_aggregator --test integration`). Also fixed
+  a batch of cosmwasm-std 2→3 `Coin.amount` (Uint256) fallout that had kept the file from
+  compiling, and recalibrated assertions to real fills (book price + taker fee + ticks).
+- **Real bug found + fixed (orderbook_exec.rs):** BUY orders were sized with the *net*
+  taker fee (after the relayer-share discount), but the chain reserves the *gross* atomic
+  fee as order margin → buys over-committed the held quote by ~0.1% and were rejected
+  ("insufficient funds"). Fix: size buys with the gross fee; sells keep the net fee for
+  output. This is the documented buy-margin gotcha, caught by the live markets.
+- **Setup #2 (reconciliation) — 7 tests `#[ignore]`d.** Its orderbook markets use a
+  runtime cw20-adapter tokenfactory denom (`factory/{adapter}/{shroom_cw20}`); launching
+  real spot markets for a runtime denom (decimals registration) is unresolved — open
+  decision: research factory-denom markets vs. restructure those tests onto plain native
+  denoms. Their ABI is already converted; only the live market wiring is pending.
 
 `cargo build` (workspace), `cargo clippy --lib -p dex_aggregator`, and
 `cargo test -p dex_aggregator --lib` (15 tests) are all green. Artifacts in

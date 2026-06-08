@@ -222,9 +222,15 @@ pub fn estimate_single_swap_execution(
         .query_market_atomic_execution_fee_multiplier(market_id)?
         .multiplier;
 
-    let fee_percent = market.taker_fee_rate
-        * fee_multiplier
-        * (FPDecimal::ONE - get_effective_fee_discount_rate(&market, is_self_relayer));
+    // The chain reserves the GROSS atomic taker fee as order margin; the relayer-
+    // fee-share discount is only rebated *after* the trade (to the fee recipient,
+    // i.e. this contract). So size BUY orders with the gross fee — sizing with the
+    // discounted net fee over-commits the held quote and the order is rejected
+    // ("insufficient funds"). SELL output uses the net fee (what the self-relaying
+    // contract actually nets, discount included).
+    let gross_fee_percent = market.taker_fee_rate * fee_multiplier;
+    let net_fee_percent =
+        gross_fee_percent * (FPDecimal::ONE - get_effective_fee_discount_rate(&market, is_self_relayer));
 
     // from-source: paying quote => buying base; paying base => selling.
     let is_buy = input.denom != market.base_denom;
@@ -236,11 +242,11 @@ pub fn estimate_single_swap_execution(
             contract_address,
             &market,
             input.amount,
-            fee_percent,
+            gross_fee_percent,
             is_simulation,
         )
     } else {
-        estimate_execution_sell_from_source(&querier, &market, input.amount, fee_percent)
+        estimate_execution_sell_from_source(&querier, &market, input.amount, net_fee_percent)
     }
 }
 

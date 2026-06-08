@@ -134,7 +134,9 @@ fn price_proto(human: u128, base_dec: u32, quote_dec: u32) -> String {
 fn qty_proto(human_base: u128, base_dec: u32) -> String {
     format!("{human_base}{}", "0".repeat((18 + base_dec) as usize))
 }
-/// Parse an sdk.Dec proto string into chain-scale `FPDecimal`.
+/// Parse an sdk.Dec proto string into chain-scale `FPDecimal`. (Kept with `tob`
+/// for calibrating new orderbook tests.)
+#[allow(dead_code)]
 fn dec_from_proto(s: &str) -> FPDecimal {
     FPDecimal::from_str(s).unwrap() / FPDecimal::from_str(&dec18(1)).unwrap()
 }
@@ -154,7 +156,9 @@ fn register_min_notionals(app: &InjectiveTestApp, funder: &SigningAccount, denom
             from_address: funder.address(),
             to_address: validator.address(),
             amount: vec![ProtoCoin {
-                amount: micro(1_000_000, 18).to_string(),
+                // Covers the validator's 100k INJ proposal deposit + gas. Kept modest
+                // so setup #2's 1M-INJ admin (after deploys/fees) can afford it.
+                amount: micro(200_000, 18).to_string(),
                 denom: "inj".to_string(),
             }],
         },
@@ -291,6 +295,7 @@ fn subaccount_of(addr: &str) -> String {
 }
 
 /// Place one resting spot limit order (order_type 1 = buy/bid, 2 = sell/ask).
+#[allow(clippy::too_many_arguments)]
 fn limit_order(
     exchange: &Exchange<InjectiveTestApp>,
     trader: &SigningAccount,
@@ -324,6 +329,7 @@ fn limit_order(
 }
 
 /// (best_buy, best_sell) top-of-book prices in chain-scale `FPDecimal`.
+#[allow(dead_code)]
 fn tob(exchange: &Exchange<InjectiveTestApp>, market_id: &str) -> (FPDecimal, FPDecimal) {
     let r = exchange
         .query_spot_mid_price_and_tob(&QuerySpotMidPriceAndTobRequest {
@@ -818,11 +824,17 @@ pub struct ConversionTestSetup {
 
 fn setup_for_conversion_test() -> ConversionTestSetup {
     let app = InjectiveTestApp::new();
+    // Register inj/usdt denom decimals (spot-market launch prerequisite). The
+    // native SHROOM tokenfactory denom is created at runtime by the adapter and
+    // gets its decimals from the market-launch params below.
     let admin = app
-        .init_account(&[
-            Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
-            Coin::new(1_000_000_000_000u128, "usdt"),
-        ])
+        .init_account_decimals(
+            &[
+                Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+                Coin::new(1_000_000_000_000u128, "usdt"),
+            ],
+            &[18, 6],
+        )
         .unwrap();
     let user = app
         .init_account(&[
@@ -953,35 +965,8 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         &admin,
     )
     .unwrap();
-    // 5. Deploy and Fund Mock DEXs
+    // 5. Deploy Mock AMM DEXs (orderbook hops use real markets, launched below).
     let native_shroom_denom = format!("factory/{}/{}", adapter_addr, shroom_cw20_addr);
-
-    // DEX 1: INJ -> SHROOM (native)
-    let mock_inj_to_native_shroom_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: "inj".to_string(),
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: native_shroom_denom.clone(),
-                    },
-                    rate: "100.0".to_string(),
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 18,
-                    output_decimals: 6,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-inj-shroom"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
 
     // DEX 2: INJ -> SHROOM (cw20)
     let mock_inj_to_cw20_shroom_amm = wasm
@@ -1037,57 +1022,6 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
-    let mock_usdt_to_inj_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: "inj".to_string(),
-                    },
-                    rate: "0.1".to_string(), // Rate: 1 USDT = 0.1 INJ
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 6,
-                    output_decimals: 18,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-usdt-inj"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
-
-    let mock_native_shroom_to_usdt_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: native_shroom_denom.clone(), // ACCEPTS NATIVE SHROOM
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(), // PAYS OUT USDT
-                    },
-                    rate: "0.5".to_string(), // Rate: 1 SHROOM = 0.5 USDT
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 6,
-                    output_decimals: 6,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-native-shroom-usdt"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
 
     let mock_cw20_shroom_to_usdt_amm = wasm
         .instantiate(
@@ -1148,26 +1082,24 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
-    // 3. Fund the DEX that pays out in NATIVE SHROOM.
-    // To do this, the admin first needs to create some native shroom.
-    let native_shroom_to_create = Uint128::new(1_000_000_000_000); // 100k
-                                                                   // Mint cw20 to admin
+    // 3. Create native SHROOM (wrap cw20 via the adapter) so the admin can seed the
+    //    live orderbook markets that the conversion routes trade against.
+    let shroom_for_markets = Uint128::new(2_000_000_000_000); // 2,000,000 SHROOM (6dp)
     wasm.execute(
         &shroom_cw20_addr,
         &cw20_base::msg::ExecuteMsg::Mint {
             recipient: admin.address(),
-            amount: native_shroom_to_create,
+            amount: shroom_for_markets,
         },
         &[],
         &admin,
     )
     .unwrap();
-    // Admin sends cw20 to adapter, which mints native shroom and sends it back to the admin.
     wasm.execute(
         &shroom_cw20_addr,
         &cw20::Cw20ExecuteMsg::Send {
             contract: adapter_addr.clone(),
-            amount: native_shroom_to_create,
+            amount: shroom_for_markets,
             msg: to_json_binary(&"{}").unwrap(),
         },
         &[],
@@ -1175,46 +1107,51 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
-    // Now admin has native shroom and can fund the DEX.
     let bank = Bank::new(&app);
+
+    // 4. Register min-notionals (incl. the runtime SHROOM factory denom) and launch
+    //    the three live spot markets the orderbook hops trade against. Orientations
+    //    chosen so the seed prices are integers in (base/quote):
+    //      INJ/USDT   (inj 18 / usdt 6)  : usdt->inj  buys against asks @10
+    //      INJ/SHROOM (inj 18 / shroom 6): inj->shroom sells into bids @100 shroom/inj
+    //      USDT/SHROOM(usdt 6 / shroom 6): shroom->usdt buys usdt against asks @2 shroom/usdt
+    register_min_notionals(&app, &admin, &["inj", "usdt", &native_shroom_denom]);
+    let exchange = Exchange::new(&app);
+    let market_inj_usdt = launch_spot_market(&exchange, &admin, "INJ/USDT", "inj", "usdt", 18, 6);
+    let market_inj_shroom =
+        launch_spot_market(&exchange, &admin, "INJ/SHROOM", "inj", &native_shroom_denom, 18, 6);
+    let market_shroom_usdt =
+        launch_spot_market(&exchange, &admin, "USDT/SHROOM", "usdt", &native_shroom_denom, 6, 6);
+
+    // 5. Fund a maker and seed each book.
+    let maker = app
+        .init_account(&[
+            Coin::new(micro(100_000, 18), "inj"),
+            Coin::new(micro(10_000_000, 6), "usdt"),
+        ])
+        .unwrap();
     bank.send(
         MsgSend {
             from_address: admin.address(),
-            to_address: mock_inj_to_native_shroom_ob.clone(),
+            to_address: maker.address(),
             amount: vec![ProtoCoin {
                 denom: native_shroom_denom.clone(),
-                amount: native_shroom_to_create.to_string(),
+                amount: micro(1_500_000, 6).to_string(),
             }],
         },
         &admin,
     )
     .unwrap();
-
-    bank.send(
-        MsgSend {
-            from_address: admin.address(),
-            to_address: mock_usdt_to_inj_ob.clone(),
-            amount: vec![ProtoCoin {
-                denom: "inj".to_string(),
-                amount: "10000000000000000000000".to_string(), // 10,000 INJ
-            }],
-        },
-        &admin,
-    )
-    .unwrap();
-
-    bank.send(
-        MsgSend {
-            from_address: admin.address(),
-            to_address: mock_native_shroom_to_usdt_ob.clone(),
-            amount: vec![ProtoCoin {
-                denom: "usdt".to_string(),
-                amount: "10000000000".to_string(), // 10,000 USDT
-            }],
-        },
-        &admin,
-    )
-    .unwrap();
+    for (px, q) in [(10u128, 1000u128), (11, 1000), (12, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 2, px, q, 18, 6); // asks: sell inj
+    }
+    for (px, q) in [(100u128, 1000u128), (99, 1000), (98, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_shroom, 1, px, q, 18, 6); // bids: buy inj w/ shroom
+    }
+    for (px, q) in [(2u128, 100_000u128), (3, 100_000)] {
+        limit_order(&exchange, &maker, &market_shroom_usdt, 2, px, q, 6, 6); // asks: sell usdt for shroom
+    }
+    app.increase_time(1);
 
     bank.send(
         MsgSend {
@@ -1247,17 +1184,15 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         mock_inj_to_cw20_shroom_amm,
         mock_cw20_shroom_to_cw20_sai_amm,
         mock_cw20_shroom_to_usdt_amm,
-        // Live markets: placeholders until the factory-denom market launch (7d)
-        // lands; the conversion tests that use them are #[ignore]d for now.
-        market_inj_usdt: String::new(),
-        market_inj_shroom: String::new(),
-        market_shroom_usdt: String::new(),
+        // Live spot markets the orderbook hops trade against.
+        market_inj_usdt,
+        market_inj_shroom,
+        market_shroom_usdt,
         native_shroom_denom,
     }
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_full_normalization_route() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -1267,7 +1202,7 @@ fn test_full_normalization_route() {
     // 10 INJ -> 1000 SHROOM total (500 native + 500 cw20)
     // 1000 SHROOM -> 100 SAI (rate of 0.1)
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -1333,11 +1268,11 @@ fn test_full_normalization_route() {
         )
         .unwrap();
 
-    assert_eq!(balance.balance, Uint128::new(100_000_000));
+    // 99.925 SAI: the native-shroom split pays the live orderbook taker fee.
+    assert_eq!(balance.balance, Uint128::new(99_925_000));
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_multi_stage_with_final_normalization() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -1351,7 +1286,7 @@ fn test_multi_stage_with_final_normalization() {
     // Final Result: The aggregator normalizes the 9,000 Native SHROOM and sends the
     // total 10,000 CW20 SHROOM to the user.
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -1416,8 +1351,8 @@ fn test_multi_stage_with_final_normalization() {
         )
         .unwrap();
 
-    // Expected final amount: 10,000 SHROOM (with 6 decimals)
-    let expected_final_balance = Uint128::new(10_000_000_000u128);
+    // 9961.53375 SHROOM: the INJ->native-SHROOM orderbook split pays the taker fee.
+    let expected_final_balance = Uint128::new(9_961_533_750u128);
     assert_eq!(balance.balance, expected_final_balance);
 }
 
@@ -1523,7 +1458,6 @@ fn test_cw20_entry_point_swap_success() {
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_reverse_normalization_route() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -1538,7 +1472,7 @@ fn test_reverse_normalization_route() {
     //     its CW20 SHROOM balance from Stage 1 into Native SHROOM to proceed.
     // Final Result: The user receives 500 USDT.
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -1602,7 +1536,7 @@ fn test_reverse_normalization_route() {
         })
         .unwrap();
 
-    let swap_output = Uint128::new(500_000_000u128);
+    let swap_output = Uint128::new(498_753_000u128); // live shroom->usdt fill, net taker fee
     let expected_final_balance = initial_amount + swap_output;
 
     let final_balance = final_balance_response.balance.unwrap();
@@ -1793,7 +1727,6 @@ fn test_failure_on_invalid_percentage_sum() {
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_mixed_input_unified_output_reconciliation() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -1813,7 +1746,7 @@ fn test_mixed_input_unified_output_reconciliation() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
     let usdt_info = amm::AssetInfo::NativeToken {
@@ -1893,8 +1826,8 @@ fn test_mixed_input_unified_output_reconciliation() {
         })
         .unwrap();
 
-    // Expected Output: 300 USDT + 160 USDT = 460 USDT
-    let total_swap_output = Uint128::new(460_000_000u128);
+    // Expected Output: 300 USDT (AMM) + ~159.251 USDT (live shroom->usdt, net fee) = 459.251 USDT
+    let total_swap_output = Uint128::new(459_251_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
 
     let final_usdt_amount =
@@ -1904,7 +1837,6 @@ fn test_mixed_input_unified_output_reconciliation() {
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_cw20_input_with_initial_reconciliation() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -1938,7 +1870,7 @@ fn test_cw20_input_with_initial_reconciliation() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
     let usdt_info = amm::AssetInfo::NativeToken {
@@ -2006,8 +1938,8 @@ fn test_cw20_input_with_initial_reconciliation() {
         })
         .unwrap();
 
-    // Expected Output: 350 USDT (Native split) + 120 USDT (CW20 split) = 470 USDT
-    let total_swap_output = Uint128::new(470_000_000u128);
+    // Expected Output: ~349.127 USDT (live native split, net fee) + 120 USDT (CW20) = 469.127 USDT
+    let total_swap_output = Uint128::new(469_127_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
     let final_usdt_amount =
         Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
@@ -2016,7 +1948,6 @@ fn test_cw20_input_with_initial_reconciliation() {
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_complex_reconciliation_mixed_to_mixed() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -2040,7 +1971,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
     let usdt_info = amm::AssetInfo::NativeToken {
@@ -2132,8 +2063,8 @@ fn test_complex_reconciliation_mixed_to_mixed() {
         })
         .unwrap();
 
-    // Expected Output: 125 USDT + 300 USDT = 425 USDT
-    let total_swap_output = Uint128::new(425_000_000u128);
+    // Expected Output: ~124.306 USDT (live shroom->usdt, net fee) + 300 USDT (AMM) = 424.306 USDT
+    let total_swap_output = Uint128::new(424_306_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
 
     let final_usdt_amount =
@@ -3340,7 +3271,6 @@ fn test_update_admin_success_and_failure() {
 }
 
 #[test]
-#[ignore = "pending live factory-denom (native_shroom) spot markets — 7d"]
 fn test_multi_hop_path_with_mid_path_conversion() {
     let setup = setup_for_conversion_test();
     let wasm = Wasm::new(&setup.env.app);
@@ -3359,10 +3289,10 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = amm::AssetInfo::NativeToken {
+    let _usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
 

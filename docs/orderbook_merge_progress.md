@@ -29,7 +29,7 @@ took the full market-derived redesign (not the `offer_denom: String` fallback).
 | 4. Rewrite `create_swap_cosmos_msg` orderbook arm (atomic SpotOrder, self-relayer) | ✅ done | uncommitted |
 | 5. Rewrite `handle_swap_reply` orderbook branch + typed decode; delete dead event parse | ✅ done | uncommitted |
 | 6. Rewrite `simulate_single_operation` orderbook arm (shared estimator) | ✅ done | uncommitted |
-| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | 🟡 setup #1 done | uncommitted |
+| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | ✅ done (30/30) | uncommitted |
 
 ### Step 7 progress (2026-06-08)
 
@@ -50,11 +50,19 @@ took the full market-derived redesign (not the `offer_denom: String` fallback).
   fee as order margin → buys over-committed the held quote by ~0.1% and were rejected
   ("insufficient funds"). Fix: size buys with the gross fee; sells keep the net fee for
   output. This is the documented buy-margin gotcha, caught by the live markets.
-- **Setup #2 (reconciliation) — 7 tests `#[ignore]`d.** Its orderbook markets use a
-  runtime cw20-adapter tokenfactory denom (`factory/{adapter}/{shroom_cw20}`); launching
-  real spot markets for a runtime denom (decimals registration) is unresolved — open
-  decision: research factory-denom markets vs. restructure those tests onto plain native
-  denoms. Their ABI is already converted; only the live market wiring is pending.
+- **Setup #2 (reconciliation) — DONE, all 7 now live + green.** Its orderbook hops trade
+  a runtime cw20-adapter tokenfactory denom (`factory/{adapter}/{shroom_cw20}`).
+  **Finding: test-tube spot markets launch + trade fine on a runtime factory denom** —
+  no genesis decimals registration needed; the launch's `base_decimals`/`quote_decimals`
+  params suffice (a gov min-notional for the denom is still required, submitted after the
+  adapter creates it). `setup_for_conversion_test` wraps cw20→native SHROOM, launches
+  INJ/USDT + INJ/SHROOM + USDT/SHROOM (orientations chosen for integer seed prices:
+  @10, @100 shroom/inj, @2 shroom/usdt), and seeds each book from a maker. Assertions
+  recalibrated to real fills (the old mock's round-number outputs hid the taker fee).
+- **Full result: `cargo test -p dex_aggregator` → 15 lib + 30 integration tests pass,
+  0 ignored; `cargo clippy --tests` clean.** Step 7 complete; the standalone
+  `inj-orderbook-swap-contract` can now be deprecated once the off-chain router emits
+  single-`MarketId` orderbook ops.
 
 `cargo build` (workspace), `cargo clippy --lib -p dex_aggregator`, and
 `cargo test -p dex_aggregator --lib` (15 tests) are all green. Artifacts in

@@ -205,10 +205,21 @@ pub struct OrderbookSwapOp {
 /// the output (ask) asset is read from the pool's swap event (`ask_asset`
 /// attribute) during execution, and from the pool's `GetConfig {}` query (the
 /// pool token that isn't the offer) during `SimulateRoute`.
+///
+/// - **Estimation mode** (`minimum_amount_out` omitted): the contract runs a
+///   per-hop `Quote` query and applies 0.5% slippage. Used by the Choice dApp.
+/// - **Direct mode** (`minimum_amount_out` supplied): the caller fixes the swap
+///   floor, so the per-hop `Quote` re-simulation is skipped entirely. Used by the
+///   arb bot; the route-level `minimum_receive` is the real net guard. An
+///   unfillable hop reverts the atomic route (it does not zero out gracefully).
 #[cw_serde]
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
+    /// Direct mode: `SwapExactInput`'s `minimum_amount_out`, passed straight
+    /// through. `None` => estimate it from the pool (`Quote` + 0.5%).
+    #[serde(default)]
+    pub minimum_amount_out: Option<Uint128>,
 }
 
 #[cw_serde]

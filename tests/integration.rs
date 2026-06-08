@@ -3696,6 +3696,7 @@ fn test_clmm_single_hop_swap() {
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
+                    minimum_amount_out: None,
                 })],
             }],
         }],
@@ -3745,6 +3746,73 @@ fn test_clmm_single_hop_swap() {
 }
 
 #[test]
+fn test_clmm_single_hop_swap_direct_mode() {
+    // Direct mode: the caller fixes `minimum_amount_out`, so the contract skips
+    // the per-hop `Quote` re-simulation and passes the floor straight into
+    // `SwapExactInput`. Same 10 INJ -> 150 USDT swap, just self-sized.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    // 149.25 USDT floor (0.5% under the 150 expected) — bot-sized.
+                    minimum_amount_out: Some(Uint128::new(149_250_000)),
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(149_000_000)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(
+        res.is_ok(),
+        "CLMM direct-mode swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let total_received = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event")
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap()
+        .value
+        .clone();
+    assert_eq!(total_received, "150000000");
+
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_balance = Uint128::from_str(&balance_response.balance.unwrap().amount).unwrap();
+    assert_eq!(final_balance, Uint128::new(1_000_150_000_000));
+}
+
+#[test]
 fn test_clmm_mixed_with_amm_split() {
     let env = setup();
     let wasm = Wasm::new(&env.app);
@@ -3773,6 +3841,7 @@ fn test_clmm_mixed_with_amm_split() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        minimum_amount_out: None,
                     })],
                 },
             ],
@@ -3845,6 +3914,7 @@ fn test_clmm_multi_hop() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
+                        minimum_amount_out: None,
                     })],
                 }],
             },

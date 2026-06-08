@@ -185,11 +185,20 @@ pub struct AmmSwapOp {
     pub offer_asset_info: external::AssetInfo,
 }
 
+// Orderbook hops are placed natively by the aggregator itself (it submits an
+// atomic spot-market order from its own subaccount — there is no external swap
+// contract). Native denoms only. `market_id` + `target_denom` are sufficient:
+// the offer denom is the market's other side, the direction is
+// `is_buy = (target_denom == market.base_denom)`, and the ticks come from the
+// market — all derived on-chain.
 pub struct OrderbookSwapOp {
-    pub swap_contract: String,
-    pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
-    pub min_quantity_tick_size: Uint128,
+    pub market_id: MarketId,
+    /// The native denom this hop must produce (market base for a buy, quote for a sell).
+    pub target_denom: String,
+    /// Direct mode (arb bot): fixed base quantity. `None` => estimate from the book.
+    pub quantity: Option<FPDecimal>,
+    /// Direct mode (arb bot): worst acceptable price bound. `None` => estimate from the book.
+    pub worst_price: Option<FPDecimal>,
 }
 
 pub struct ClmmSwapOp {
@@ -206,7 +215,7 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
 
 ```json
 {
-  "aggregate_swaps": {
+  "execute_route": {
     "stages": [
       {
         "splits": [
@@ -226,10 +235,8 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
             "path": [
               {
                 "orderbook_swap": {
-                  "swap_contract": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
-                  "min_quantity_tick_size": "1000000000000000"
+                  "market_id": "0x...",
+                  "target_denom": "peggy0x...usdt"
                 }
               }
             ]

@@ -182,25 +182,32 @@ pub fn create_swap_cosmos_msg(
             }
         }
         Operation::ClmmSwap(clmm_op) => {
-            // Query the pool for expected output
-            let quote_query = clmm::ClmmPoolQueryMsg::Quote {
-                token_in: offer_asset_info.clone(),
-                amount_in: amount,
+            // Direct mode: the caller supplied the floor, so skip the per-hop
+            // `Quote` re-simulation entirely. Estimation mode: quote the pool and
+            // apply 0.5% slippage (and bail to a no-op on a zero-output hop, so a
+            // split that can't fill completes gracefully as a zero-value path).
+            let minimum_amount_out = match clmm_op.minimum_amount_out {
+                Some(min_out) => min_out,
+                None => {
+                    let quote_query = clmm::ClmmPoolQueryMsg::Quote {
+                        token_in: offer_asset_info.clone(),
+                        amount_in: amount,
+                    };
+                    let quote_response: clmm::QuoteResponse = deps
+                        .querier
+                        .query_wasm_smart(&clmm_op.pool_address, &quote_query)?;
+
+                    if quote_response.amount_out.is_zero() {
+                        return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: env.contract.address.to_string(),
+                            msg: to_json_binary(&{})?,
+                            funds: vec![],
+                        }));
+                    }
+
+                    quote_response.amount_out.multiply_ratio(995u128, 1000u128)
+                }
             };
-            let quote_response: clmm::QuoteResponse = deps
-                .querier
-                .query_wasm_smart(&clmm_op.pool_address, &quote_query)?;
-
-            if quote_response.amount_out.is_zero() {
-                return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
-                    contract_addr: env.contract.address.to_string(),
-                    msg: to_json_binary(&{})?,
-                    funds: vec![],
-                }));
-            }
-
-            // Apply 0.5% slippage
-            let minimum_amount_out = quote_response.amount_out.multiply_ratio(995u128, 1000u128);
 
             let clmm_swap_msg = clmm::ClmmPoolExecuteMsg::SwapExactInput {
                 minimum_amount_out,

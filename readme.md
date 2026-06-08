@@ -177,10 +177,12 @@ pub enum Operation {
 }
 
 // These structs define the specific details for each operation type.
+// AMM/CLMM ops carry only the `offer` side: the output (ask) asset is derived
+// from the pool's swap event (`ask_asset` attribute) during execution and from
+// the pool's `Pair {}` / `GetConfig {}` query during `SimulateRoute`.
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
 }
 
 pub struct OrderbookSwapOp {
@@ -193,7 +195,6 @@ pub struct OrderbookSwapOp {
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
 }
 ```
 
@@ -215,8 +216,7 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
               {
                 "amm_swap": {
                   "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
+                  "offer_asset_info": { "native_token": { "denom": "inj" } }
                 }
               }
             ]
@@ -240,8 +240,7 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
               {
                 "clmm_swap": {
                   "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
+                  "offer_asset_info": { "native_token": { "denom": "inj" } }
                 }
               }
             ]

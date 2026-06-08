@@ -597,9 +597,6 @@ fn test_aggregate_swap_success() {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -609,9 +606,6 @@ fn test_aggregate_swap_success() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -753,9 +747,6 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 49,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_1_addr.clone(),
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
-                            },
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
@@ -765,9 +756,6 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 51,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_2_addr.clone(),
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
-                            },
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
@@ -1263,9 +1251,6 @@ fn test_full_normalization_route() {
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: amm::AssetInfo::Token {
-                                contract_addr: setup.shroom_cw20_addr.clone(),
-                            },
                         })],
                     },
                 ],
@@ -1278,9 +1263,6 @@ fn test_full_normalization_route() {
                         pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                         offer_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.shroom_cw20_addr.clone(),
-                        },
-                        ask_asset_info: amm::AssetInfo::Token {
-                            contract_addr: setup.sai_cw20_addr.clone(),
                         },
                     })],
                 }],
@@ -1349,9 +1331,6 @@ fn test_multi_stage_with_final_normalization() {
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
-                            },
-                            ask_asset_info: amm::AssetInfo::Token {
-                                contract_addr: setup.shroom_cw20_addr.clone(),
                             },
                         })],
                     },
@@ -1446,9 +1425,6 @@ fn test_cw20_entry_point_swap_success() {
                     offer_asset_info: amm::AssetInfo::Token {
                         contract_addr: setup.shroom_cw20_addr.clone(),
                     },
-                    ask_asset_info: amm::AssetInfo::Token {
-                        contract_addr: setup.sai_cw20_addr.clone(),
-                    },
                 })],
             }],
         }],
@@ -1522,9 +1498,6 @@ fn test_reverse_normalization_route() {
                         pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
-                        },
-                        ask_asset_info: amm::AssetInfo::Token {
-                            contract_addr: setup.shroom_cw20_addr.clone(),
                         },
                     })],
                 }],
@@ -1607,9 +1580,6 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1619,9 +1589,6 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1702,9 +1669,6 @@ fn test_failure_on_invalid_percentage_sum() {
                     percent: 50, // 50%
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1714,9 +1678,6 @@ fn test_failure_on_invalid_percentage_sum() {
                     percent: 49, // + 49% = 99% (Invalid!)
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1787,9 +1748,6 @@ fn test_mixed_input_unified_output_reconciliation() {
     let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
-    };
 
     // Stage 1: Get 1000 CW20 SHROOM
     let stage1 = Stage {
@@ -1800,7 +1758,6 @@ fn test_mixed_input_unified_output_reconciliation() {
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
-                ask_asset_info: cw20_shroom_info.clone(),
             })],
         }],
     };
@@ -1824,7 +1781,6 @@ fn test_mixed_input_unified_output_reconciliation() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -1911,9 +1867,6 @@ fn test_cw20_input_with_initial_reconciliation() {
     let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
-    };
 
     let stage1 = Stage {
         splits: vec![
@@ -1933,7 +1886,6 @@ fn test_cw20_input_with_initial_reconciliation() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -2012,9 +1964,6 @@ fn test_complex_reconciliation_mixed_to_mixed() {
     let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
-    };
     let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
@@ -2038,7 +1987,6 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                     offer_asset_info: inj_info.clone(),
-                    ask_asset_info: cw20_shroom_info.clone(),
                 })],
             },
         ],
@@ -2063,7 +2011,6 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -2130,9 +2077,6 @@ fn test_final_output_is_cw20_token() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = amm::AssetInfo::Token {
-        contract_addr: setup.sai_cw20_addr.clone(),
-    };
 
     let stage1 = Stage {
         splits: vec![Split {
@@ -2140,7 +2084,6 @@ fn test_final_output_is_cw20_token() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                 offer_asset_info: inj_info.clone(),
-                ask_asset_info: cw20_shroom_info.clone(),
             })],
         }],
     };
@@ -2151,7 +2094,6 @@ fn test_final_output_is_cw20_token() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
-                ask_asset_info: cw20_sai_info.clone(),
             })],
         }],
     };
@@ -2217,9 +2159,6 @@ fn test_native_input_with_initial_cw20_requirement() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = amm::AssetInfo::Token {
-        contract_addr: setup.sai_cw20_addr.clone(),
-    };
 
     // First, we need to get some Native SHROOM to the user.
     // Admin mints CW20 -> sends to Adapter -> Adapter sends Native SHROOM to Admin -> Admin sends to User.
@@ -2268,7 +2207,6 @@ fn test_native_input_with_initial_cw20_requirement() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
-                ask_asset_info: cw20_sai_info.clone(),
             })],
         }],
     };
@@ -2327,9 +2265,6 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2339,9 +2274,6 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_2_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2406,9 +2338,6 @@ fn test_stage_with_single_hundred_percent_split() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: env.mock_amm_1_addr.clone(),
-                ask_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "usdt".to_string(),
-                },
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
@@ -2517,9 +2446,6 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2530,9 +2456,6 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: "inj1invalidcontractaddressxxxxxxxxxxxxxx".to_string(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2615,9 +2538,6 @@ fn test_fee_collection_on_single_swap() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2748,9 +2668,6 @@ fn test_fee_collection_on_cw20_output() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: fee_pool_address,
-                ask_asset_info: amm::AssetInfo::Token {
-                    contract_addr: setup.shroom_cw20_addr.clone(),
-                },
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
@@ -2893,9 +2810,6 @@ fn test_full_admin_fee_lifecycle() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -3044,9 +2958,6 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 40,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: taxed_pool,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -3057,9 +2968,6 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 60,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: untaxed_pool,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -3162,9 +3070,6 @@ fn test_fee_truncates_to_zero() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -3324,9 +3229,6 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
-    let cw20_shroom_info = amm::AssetInfo::Token {
-        contract_addr: setup.shroom_cw20_addr.clone(),
-    };
     let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
@@ -3340,7 +3242,6 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         Operation::AmmSwap(AmmSwapOp {
             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
             offer_asset_info: inj_info.clone(),
-            ask_asset_info: cw20_shroom_info.clone(),
         }),
         // Hop 2: Native SHROOM -> USDT (INPUT MISMATCH HERE)
         Operation::OrderbookSwap(OrderbookSwapOp {
@@ -3795,9 +3696,6 @@ fn test_clmm_single_hop_swap() {
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                 })],
             }],
         }],
@@ -3866,9 +3764,6 @@ fn test_clmm_mixed_with_amm_split() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                     })],
                 },
                 Split {
@@ -3877,9 +3772,6 @@ fn test_clmm_mixed_with_amm_split() {
                         pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
-                        },
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
                         },
                     })],
                 },
@@ -3952,9 +3844,6 @@ fn test_clmm_multi_hop() {
                         pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
-                        },
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
                         },
                     })],
                 }],

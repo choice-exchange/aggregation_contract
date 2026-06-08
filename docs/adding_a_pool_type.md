@@ -89,8 +89,9 @@ Each pool type has its own struct carrying pool-specific config per operation.
 
 **Questions to answer:**
 
-- Besides `pool_address`/`contract_address`, `offer_asset_info`, and `ask_asset_info` (which are standard), what **additional fields** does this pool type need per-operation?
-- For the orderbook, this is `min_quantity_tick_size`. For CLMM, it might be `sqrt_price_limit`, `tick_spacing`, `fee_tier`, etc.
+- Besides `pool_address`/`contract_address` and `offer_asset_info` (which are standard), what **additional fields** does this pool type need per-operation?
+- The output (ask) asset is **not** carried on the op: prefer to derive it from the pool's swap event during execution (emit an `ask_asset` attribute = the output asset's key) and from a pool config/pair query during `SimulateRoute`. Only add an explicit ask field if your pool can't expose the output asset either way.
+- For the orderbook, the extra field set is `quantity`/`worst_price` (direct mode). For CLMM, it might be `sqrt_price_limit`, `tick_spacing`, `fee_tier`, etc.
 - Which fields would be provided by the route planner (off-chain) vs. derived on-chain?
 
 **Proposed struct template:**
@@ -99,7 +100,7 @@ Each pool type has its own struct carrying pool-specific config per operation.
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
+    // Output asset derived from the swap event / pool query — see above.
     // What else goes here? List every field with its type.
 }
 ```

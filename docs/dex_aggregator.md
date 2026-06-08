@@ -44,11 +44,13 @@ Route
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
 }
 ```
 
-Supports both native and CW20 inputs/outputs.
+Supports both native and CW20 inputs/outputs. The output (ask) asset is not
+declared on the op: during execution it's read from the pair's swap event
+(`ask_asset` attribute), and during `SimulateRoute` it's derived from the pair's
+`Pair {}` query (the side that isn't the offer).
 
 ### OrderbookSwapOp
 

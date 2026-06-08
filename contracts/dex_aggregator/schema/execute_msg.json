@@ -204,16 +204,13 @@
   ],
   "definitions": {
     "AmmSwapOp": {
+      "description": "A single legacy-XYK AMM hop. `offer_asset_info` drives the dispatch (native funds vs `Cw20::Send` vs tax-exempt send) and per-stage allocation. The output (ask) asset is *not* carried: during execution it's read from the pair's swap event (`ask_asset` attribute), and during `SimulateRoute` it's derived from the pair's `Pair {}` query (the pair side that isn't the offer).",
       "type": "object",
       "required": [
-        "ask_asset_info",
         "offer_asset_info",
         "pool_address"
       ],
       "properties": {
-        "ask_asset_info": {
-          "$ref": "#/definitions/AssetInfo"
-        },
         "offer_asset_info": {
           "$ref": "#/definitions/AssetInfo"
         },
@@ -274,16 +271,13 @@
       "type": "string"
     },
     "ClmmSwapOp": {
+      "description": "A single CLMM hop. As with [`AmmSwapOp`], only `offer_asset_info` is carried: the output (ask) asset is read from the pool's swap event (`ask_asset` attribute) during execution, and from the pool's `GetConfig {}` query (the pool token that isn't the offer) during `SimulateRoute`.",
       "type": "object",
       "required": [
-        "ask_asset_info",
         "offer_asset_info",
         "pool_address"
       ],
       "properties": {
-        "ask_asset_info": {
-          "$ref": "#/definitions/AssetInfo"
-        },
         "offer_asset_info": {
           "$ref": "#/definitions/AssetInfo"
         },
@@ -294,7 +288,7 @@
       "additionalProperties": false
     },
     "Cw20ReceiveMsg": {
-      "description": "Cw20ReceiveMsg should be de/serialized under `Receive()` variant in a ExecuteMsg",
+      "description": "Hook payload delivered to a CW20 receiver via `Cw20ExecuteMsg::Send`. Mirrors `cw20::Cw20ReceiveMsg`. Deserialized from incoming `Receive` execute.",
       "type": "object",
       "required": [
         "amount",
@@ -315,7 +309,27 @@
       "additionalProperties": false
     },
     "Decimal": {
-      "description": "A fixed-point decimal value with 18 fractional digits, i.e. Decimal(1_000_000_000_000_000_000) == 1.0\n\nThe greatest possible value that can be represented is 340282366920938463463.374607431768211455 (which is (2^128 - 1) / 10^18)",
+      "description": "A fixed-point decimal value with 18 fractional digits, i.e. Decimal(1_000_000_000_000_000_000) == 1.0\n\nThe greatest possible value that can be represented is 340282366920938463463.374607431768211455 = (2^128 - 1) / 10^18",
+      "type": "string"
+    },
+    "FPDecimal": {
+      "type": "object",
+      "required": [
+        "num",
+        "sign"
+      ],
+      "properties": {
+        "num": {
+          "type": "string"
+        },
+        "sign": {
+          "type": "integer",
+          "format": "int8"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MarketId": {
       "type": "string"
     },
     "Operation": {
@@ -359,25 +373,43 @@
       ]
     },
     "OrderbookSwapOp": {
+      "description": "A single Injective spot-market hop, executed natively by the aggregator (it places the atomic spot order itself — there is no external swap contract).\n\n`market_id` + `target_denom` are sufficient: the offer denom is the market's *other* side, `is_buy = (target_denom == market.base_denom)`, and the ticks come from the market — all derived on-chain.\n\n- **Estimation mode** (`quantity`/`worst_price` omitted): the contract walks the book to size the order. Used by the Choice dApp (backs `SimulateRoute`). - **Direct mode** (both supplied): the caller fixes the base `quantity` and the `worst_price` bound, so no orderbook-walk queries run. Used by the arb bot; the route-level `minimum_receive` is the only net.",
       "type": "object",
       "required": [
-        "ask_asset_info",
-        "min_quantity_tick_size",
-        "offer_asset_info",
-        "swap_contract"
+        "market_id",
+        "target_denom"
       ],
       "properties": {
-        "ask_asset_info": {
-          "$ref": "#/definitions/AssetInfo"
+        "market_id": {
+          "$ref": "#/definitions/MarketId"
         },
-        "min_quantity_tick_size": {
-          "$ref": "#/definitions/Uint128"
+        "quantity": {
+          "description": "Direct mode: base quantity to trade. `None` => estimate from the book.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FPDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
-        "offer_asset_info": {
-          "$ref": "#/definitions/AssetInfo"
-        },
-        "swap_contract": {
+        "target_denom": {
+          "description": "Native denom this hop must produce (the market's base for a buy, quote for a sell).",
           "type": "string"
+        },
+        "worst_price": {
+          "description": "Direct mode: worst acceptable price bound. `None` => estimate from the book.",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FPDecimal"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false

@@ -65,6 +65,9 @@ pub enum ContractError {
     #[error("Failed to parse conversion reply: could not find a valid 'transfer' or 'wasm' event")]
     NoConversionEventInReply {},
 
+    #[error("Failed to parse swap reply: wasm event did not contain an 'ask_asset' attribute")]
+    NoAskAssetInReply {},
+
     // --- Orderbook (native spot-order) Errors ---
     #[error("Orderbook order quantity rounds to zero (input below one tick)")]
     AmountTooSmall {},

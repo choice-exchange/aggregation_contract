@@ -130,8 +130,16 @@ fn simulate_single_operation(
                 .into(),
             )?;
 
+            // The op no longer carries the output asset; derive it from the pair
+            // (the side that isn't the offer). Read-only query, so the extra
+            // `Pair {}` call is acceptable here (execution reads it from the event).
+            let pair_info: amm::PairInfo = deps
+                .querier
+                .query_wasm_smart(&op.pool_address, &amm::QueryMsg::Pair {})?;
+            let ask_info = counter_asset(&pair_info.asset_infos, &offer_asset.info)?;
+
             Ok(amm::Asset {
-                info: op.ask_asset_info.clone(),
+                info: ask_info,
                 amount: sim_response.return_amount,
             })
         }
@@ -190,11 +198,38 @@ fn simulate_single_operation(
                 .into(),
             )?;
 
+            // Derive the output asset from the pool config (the token that isn't
+            // the offer); read-only, so the extra `GetConfig {}` query is fine.
+            let config: clmm::ConfigResponse = deps
+                .querier
+                .query_wasm_smart(&op.pool_address, &clmm::ClmmPoolQueryMsg::GetConfig {})?;
+            let ask_info = counter_asset(
+                &[config.token0, config.token1],
+                &offer_asset.info,
+            )?;
+
             Ok(amm::Asset {
-                info: op.ask_asset_info.clone(),
+                info: ask_info,
                 amount: quote_response.amount_out,
             })
         }
+    }
+}
+
+/// Given a pool's two assets and the offer side, return the *other* side (the
+/// asset the hop produces). Errors if the offer isn't one of the pair.
+fn counter_asset(
+    pair: &[amm::AssetInfo; 2],
+    offer: &amm::AssetInfo,
+) -> StdResult<amm::AssetInfo> {
+    if *offer == pair[0] {
+        Ok(pair[1].clone())
+    } else if *offer == pair[1] {
+        Ok(pair[0].clone())
+    } else {
+        Err(StdError::msg(
+            "offer asset is not part of the pool's asset pair",
+        ))
     }
 }
 
@@ -288,6 +323,20 @@ mod tests {
         }
     }
 
+    /// Build an `amm::PairInfo` binary for the given two assets.
+    fn pair_binary(a0: AssetInfo, a1: AssetInfo) -> Binary {
+        to_json_binary(&amm::PairInfo {
+            asset_infos: [a0, a1],
+        })
+        .unwrap()
+    }
+
+    fn native(denom: &str) -> AssetInfo {
+        AssetInfo::NativeToken {
+            denom: denom.to_string(),
+        }
+    }
+
     #[test]
     fn test_simulate_simple_path() {
         let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
@@ -301,14 +350,17 @@ mod tests {
         querier.update_wasm(
             move |query: &WasmQuery| -> SystemResult<ContractResult<Binary>> {
                 match query {
-                    WasmQuery::Smart {
-                        contract_addr,
-                        msg: _,
-                    } => {
-                        if contract_addr == POOL_A_ADDR {
-                            SystemResult::Ok(ContractResult::Ok(mock_response_binary.clone()))
-                        } else {
+                    WasmQuery::Smart { contract_addr, msg } => {
+                        if contract_addr != POOL_A_ADDR {
                             panic!("Unexpected contract call to {}", contract_addr);
+                        }
+                        match from_json::<amm::QueryMsg>(msg).unwrap() {
+                            amm::QueryMsg::Simulation { .. } => {
+                                SystemResult::Ok(ContractResult::Ok(mock_response_binary.clone()))
+                            }
+                            amm::QueryMsg::Pair {} => SystemResult::Ok(ContractResult::Ok(
+                                pair_binary(native("inj"), native("usdt")),
+                            )),
                         }
                     }
                     _ => panic!("Unsupported query type"),
@@ -325,9 +377,6 @@ mod tests {
                     pool_address: POOL_A_ADDR.to_string(),
                     offer_asset_info: AssetInfo::NativeToken {
                         denom: "inj".to_string(),
-                    },
-                    ask_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
                     },
                 })],
             }],
@@ -365,17 +414,29 @@ mod tests {
             } => {
                 let decoded: amm::QueryMsg = from_json(msg).unwrap();
                 if contract_addr == POOL_A_ADDR {
-                    let amm::QueryMsg::Simulation { offer_asset } = decoded;
-                    assert_eq!(offer_asset.amount, Uint128::new(1000));
-                    SystemResult::Ok(ContractResult::Ok(
-                        to_json_binary(&mock_response_hop1).unwrap(),
-                    ))
+                    match decoded {
+                        amm::QueryMsg::Simulation { offer_asset } => {
+                            assert_eq!(offer_asset.amount, Uint128::new(1000));
+                            SystemResult::Ok(ContractResult::Ok(
+                                to_json_binary(&mock_response_hop1).unwrap(),
+                            ))
+                        }
+                        amm::QueryMsg::Pair {} => SystemResult::Ok(ContractResult::Ok(
+                            pair_binary(native("inj"), native("usdt")),
+                        )),
+                    }
                 } else if contract_addr == POOL_B_ADDR {
-                    let amm::QueryMsg::Simulation { offer_asset } = decoded;
-                    assert_eq!(offer_asset.amount, Uint128::new(20000));
-                    SystemResult::Ok(ContractResult::Ok(
-                        to_json_binary(&mock_response_hop2).unwrap(),
-                    ))
+                    match decoded {
+                        amm::QueryMsg::Simulation { offer_asset } => {
+                            assert_eq!(offer_asset.amount, Uint128::new(20000));
+                            SystemResult::Ok(ContractResult::Ok(
+                                to_json_binary(&mock_response_hop2).unwrap(),
+                            ))
+                        }
+                        amm::QueryMsg::Pair {} => SystemResult::Ok(ContractResult::Ok(
+                            pair_binary(native("usdt"), native("ausd")),
+                        )),
+                    }
                 } else {
                     panic!("Unexpected query to {}", contract_addr);
                 }
@@ -395,17 +456,11 @@ mod tests {
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                     }),
                     Operation::AmmSwap(AmmSwapOp {
                         pool_address: POOL_B_ADDR.to_string(),
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
-                        },
-                        ask_asset_info: AssetInfo::NativeToken {
-                            denom: "ausd".to_string(),
                         },
                     }),
                 ],
@@ -425,6 +480,14 @@ mod tests {
 
     #[test]
     fn test_simulate_multi_split_multi_stage() {
+        // A pool address is one fixed pair, so each logical pair needs its own
+        // address (the op no longer declares its output asset — it's derived from
+        // the pool's `Pair {}`).
+        const POOL_INJ_USDT: &str = "inj1pool0000000000000000000000000injusdt0";
+        const POOL_INJ_AUSD: &str = "inj1pool0000000000000000000000000injausd0";
+        const POOL_USDT_SHROOM: &str = "inj1pool000000000000000000000000usdtshrm";
+        const POOL_AUSD_SHROOM: &str = "inj1pool000000000000000000000000ausdshrm";
+
         let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
 
         // Mock responses for all 4 swaps
@@ -433,15 +496,27 @@ mod tests {
                 contract_addr, msg, ..
             } => {
                 let decoded: amm::QueryMsg = from_json(msg).unwrap();
-                let amm::QueryMsg::Simulation { offer_asset } = decoded;
+                let pair = match contract_addr.as_str() {
+                    POOL_INJ_USDT => (native("inj"), native("usdt")),
+                    POOL_INJ_AUSD => (native("inj"), native("ausd")),
+                    POOL_USDT_SHROOM => (native("usdt"), native("shroom")),
+                    POOL_AUSD_SHROOM => (native("ausd"), native("shroom")),
+                    other => panic!("Unexpected query to {}", other),
+                };
+                let offer_asset = match decoded {
+                    amm::QueryMsg::Pair {} => {
+                        return SystemResult::Ok(ContractResult::Ok(pair_binary(pair.0, pair.1)));
+                    }
+                    amm::QueryMsg::Simulation { offer_asset } => offer_asset,
+                };
 
                 let response_amount = match (contract_addr.as_str(), offer_asset.amount.u128()) {
                     // Stage 1
-                    (POOL_A_ADDR, 500) => 10000, // 50% of 1000 INJ -> 10000 USDT
-                    (POOL_B_ADDR, 500) => 20000, // 50% of 1000 INJ -> 20000 AUSD
+                    (POOL_INJ_USDT, 500) => 10000, // 50% of 1000 INJ -> 10000 USDT
+                    (POOL_INJ_AUSD, 500) => 20000, // 50% of 1000 INJ -> 20000 AUSD
                     // Stage 2 (Totals: 10k USDT, 20k AUSD)
-                    (POOL_A_ADDR, 10000) => 5000, // 10000 USDT -> 5000 SHROOM
-                    (POOL_B_ADDR, 20000) => 8000, // 20000 AUSD -> 8000 SHROOM
+                    (POOL_USDT_SHROOM, 10000) => 5000, // 10000 USDT -> 5000 SHROOM
+                    (POOL_AUSD_SHROOM, 20000) => 8000, // 20000 AUSD -> 8000 SHROOM
                     _ => panic!(
                         "Unexpected query: {} with amount {}",
                         contract_addr, offer_asset.amount
@@ -466,24 +541,18 @@ mod tests {
                     Split {
                         percent: 50,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_A_ADDR.to_string(),
+                            pool_address: POOL_INJ_USDT.to_string(),
                             offer_asset_info: AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
-                            },
-                            ask_asset_info: AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
                             },
                         })],
                     },
                     Split {
                         percent: 50,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_B_ADDR.to_string(),
+                            pool_address: POOL_INJ_AUSD.to_string(),
                             offer_asset_info: AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
-                            },
-                            ask_asset_info: AssetInfo::NativeToken {
-                                denom: "ausd".to_string(),
                             },
                         })],
                     },
@@ -495,24 +564,18 @@ mod tests {
                     Split {
                         percent: 100,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_A_ADDR.to_string(),
+                            pool_address: POOL_USDT_SHROOM.to_string(),
                             offer_asset_info: AssetInfo::NativeToken {
                                 denom: "usdt".to_string(),
-                            },
-                            ask_asset_info: AssetInfo::NativeToken {
-                                denom: "shroom".to_string(),
                             },
                         })],
                     },
                     Split {
                         percent: 100,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_B_ADDR.to_string(),
+                            pool_address: POOL_AUSD_SHROOM.to_string(),
                             offer_asset_info: AssetInfo::NativeToken {
                                 denom: "ausd".to_string(),
-                            },
-                            ask_asset_info: AssetInfo::NativeToken {
-                                denom: "shroom".to_string(),
                             },
                         })],
                     },

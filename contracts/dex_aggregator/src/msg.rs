@@ -65,6 +65,17 @@ pub mod amm {
     #[cw_serde]
     pub enum QueryMsg {
         Simulation { offer_asset: Asset },
+        /// Pool pair info. Used by `SimulateRoute` to derive a hop's output asset
+        /// (the pair side that isn't the offer) without an explicit `ask_asset_info`
+        /// on the op. We only model `asset_infos`; serde drops the pair's other
+        /// fields (`contract_addr`, `liquidity_token`, decimals, ...) on decode.
+        Pair {},
+    }
+
+    /// Partial view of the pair's `PairInfo` — only the two asset infos.
+    #[cw_serde]
+    pub struct PairInfo {
+        pub asset_infos: [AssetInfo; 2],
     }
 
     #[cw_serde]
@@ -131,6 +142,12 @@ pub mod clmm {
             token_in: amm::AssetInfo,
             amount_in: Uint128,
         },
+        /// Pool config. Used by `SimulateRoute` to derive a hop's output asset
+        /// (the pool token that isn't the offer). The pool's `AssetInfo` is
+        /// wire-compatible with [`amm::AssetInfo`] (same `native_token`/`token`
+        /// snake_case tags); serde drops the unmodeled `tick_spacing`/`fee_config`/
+        /// `hook`/... fields on decode.
+        GetConfig {},
     }
 
     #[cw_serde]
@@ -139,13 +156,24 @@ pub mod clmm {
         pub amount_in_consumed: Uint128,
         pub fee_amount: Uint128,
     }
+
+    /// Partial view of the pool's `PoolConfig` — only the two token infos.
+    #[cw_serde]
+    pub struct ConfigResponse {
+        pub token0: amm::AssetInfo,
+        pub token1: amm::AssetInfo,
+    }
 }
 
+/// A single legacy-XYK AMM hop. `offer_asset_info` drives the dispatch (native
+/// funds vs `Cw20::Send` vs tax-exempt send) and per-stage allocation. The output
+/// (ask) asset is *not* carried: during execution it's read from the pair's swap
+/// event (`ask_asset` attribute), and during `SimulateRoute` it's derived from the
+/// pair's `Pair {}` query (the pair side that isn't the offer).
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
 }
 
 /// A single Injective spot-market hop, executed natively by the aggregator (it
@@ -173,11 +201,14 @@ pub struct OrderbookSwapOp {
     pub worst_price: Option<FPDecimal>,
 }
 
+/// A single CLMM hop. As with [`AmmSwapOp`], only `offer_asset_info` is carried:
+/// the output (ask) asset is read from the pool's swap event (`ask_asset`
+/// attribute) during execution, and from the pool's `GetConfig {}` query (the
+/// pool token that isn't the offer) during `SimulateRoute`.
 #[cw_serde]
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
 }
 
 #[cw_serde]

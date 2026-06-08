@@ -111,6 +111,20 @@ pub struct QuoteResponse {
     pub fee_amount: Uint128,
 }
 
+/// Mirrors the legacy pair's `PairInfo` (partial) so the aggregator's
+/// `SimulateRoute` can derive a hop's output asset from `Pair {}`.
+#[cw_serde]
+pub struct PairInfo {
+    pub asset_infos: [AssetInfo; 2],
+}
+
+/// Mirrors the CLMM pool's `PoolConfig` (partial) for `GetConfig {}`.
+#[cw_serde]
+pub struct ConfigResponse {
+    pub token0: AssetInfo,
+    pub token1: AssetInfo,
+}
+
 #[cw_serde]
 pub enum QueryMsg {
     GetOutputQuantity {
@@ -122,6 +136,10 @@ pub enum QueryMsg {
         token_in: AssetInfo,
         amount_in: Uint128,
     },
+    /// Legacy-AMM pair info (output-asset derivation in `SimulateRoute`).
+    Pair {},
+    /// CLMM pool config (output-asset derivation in `SimulateRoute`).
+    GetConfig {},
 }
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
@@ -242,9 +260,13 @@ pub fn execute(
     let (output_denom_str, _) = get_denom_and_addr(&config.output_asset_info);
 
     let event = match config.protocol_type {
+        // `ask_asset` mirrors the real pair/pool swap event: it carries the output
+        // asset's key (denom or CW20 address) so the aggregator can recover the
+        // output `AssetInfo` from the reply without an explicit op field.
         ProtocolType::Amm => Event::new("wasm")
             .add_attribute("action", "swap")
-            .add_attribute("return_amount", final_return_amount.to_string()),
+            .add_attribute("return_amount", final_return_amount.to_string())
+            .add_attribute("ask_asset", output_denom_str.clone()),
         ProtocolType::Orderbook => Event::new("atomic_swap_execution")
             .add_attribute("sender", info.sender.to_string())
             .add_attribute("swap_input_amount", offer_amount)
@@ -255,7 +277,8 @@ pub fn execute(
         ProtocolType::Clmm => Event::new("wasm")
             .add_attribute("action", "swap")
             .add_attribute("amount_in", offer_amount.to_string())
-            .add_attribute("amount_out", final_return_amount.to_string()),
+            .add_attribute("amount_out", final_return_amount.to_string())
+            .add_attribute("ask_asset", output_denom_str.clone()),
     };
 
     Ok(Response::new().add_message(send_msg).add_event(event))
@@ -342,6 +365,19 @@ pub fn query(
                 amount_out,
                 amount_in_consumed: amount_in,
                 fee_amount: Uint128::zero(),
+            })
+        }
+        QueryMsg::Pair {} => {
+            let config = CONFIG.load(deps.storage)?;
+            to_json_binary(&PairInfo {
+                asset_infos: [config.input_asset_info, config.output_asset_info],
+            })
+        }
+        QueryMsg::GetConfig {} => {
+            let config = CONFIG.load(deps.storage)?;
+            to_json_binary(&ConfigResponse {
+                token0: config.input_asset_info,
+                token1: config.output_asset_info,
             })
         }
     }

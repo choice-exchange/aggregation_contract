@@ -154,7 +154,7 @@ fn handle_swap_reply(
         }
     }
 
-    let received_asset_info = get_operation_output(replied_op)?;
+    let received_asset_info = get_operation_output(deps.api, replied_op, &result.events)?;
 
     let replied_path = &current_stage.splits[split_index].path;
 
@@ -524,14 +524,50 @@ fn create_conversion_msg(
     }
 }
 
-fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError> {
+/// The asset a completed hop produced. AMM/CLMM ops no longer carry an explicit
+/// `ask_asset_info`; instead both pools emit an `ask_asset` attribute on their
+/// swap event, which we read back here at zero query cost. Orderbook output is
+/// always the native `target_denom`.
+fn get_operation_output(
+    api: &dyn cosmwasm_std::Api,
+    op: &Operation,
+    events: &[cosmwasm_std::Event],
+) -> Result<amm::AssetInfo, ContractError> {
     Ok(match op {
-        Operation::AmmSwap(o) => o.ask_asset_info.clone(),
-        // Orderbook output is always the native `target_denom` — no query needed.
+        Operation::AmmSwap(_) | Operation::ClmmSwap(_) => parse_ask_asset_from_events(api, events)?,
         Operation::OrderbookSwap(o) => amm::AssetInfo::NativeToken {
             denom: o.target_denom.clone(),
         },
-        Operation::ClmmSwap(o) => o.ask_asset_info.clone(),
+    })
+}
+
+/// Reconstruct the output `AssetInfo` from a pool swap reply. Both the legacy AMM
+/// pair and the CLMM pool emit an `ask_asset` attribute equal to the output
+/// asset's key — a bank denom or a CW20 contract address. The variant is recovered
+/// by bech32 validation: a value that validates as an address is a CW20
+/// (`Token`), anything else is a native bank denom (`NativeToken`). This is
+/// unambiguous on Injective — native denoms (`inj`, `peggy0x..`, `factory/..`,
+/// `ibc/..`, ...) are never bare bech32 addresses, so they can't be mistaken for a
+/// CW20 contract.
+fn parse_ask_asset_from_events(
+    api: &dyn cosmwasm_std::Api,
+    events: &[cosmwasm_std::Event],
+) -> Result<amm::AssetInfo, ContractError> {
+    let key = events
+        .iter()
+        .filter(|e| e.ty.starts_with("wasm"))
+        .find_map(|e| {
+            e.attributes
+                .iter()
+                .find(|a| a.key == "ask_asset")
+                .map(|a| a.value.clone())
+        })
+        .ok_or(ContractError::NoAskAssetInReply {})?;
+
+    Ok(if api.addr_validate(&key).is_ok() {
+        amm::AssetInfo::Token { contract_addr: key }
+    } else {
+        amm::AssetInfo::NativeToken { denom: key }
     })
 }
 

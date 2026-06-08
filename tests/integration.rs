@@ -764,7 +764,8 @@ fn test_aggregator_swap_event_emitted() {
     // The leg breakdown is a JSON array of 3 venue trades; spot-check that every
     // venue and both kinds are present, and that it parses.
     let results = attr("swap_results");
-    let legs: serde_json::Value = serde_json::from_str(&results).expect("swap_results is valid JSON");
+    let legs: serde_json::Value =
+        serde_json::from_str(&results).expect("swap_results is valid JSON");
     let legs = legs.as_array().expect("swap_results is an array");
     assert_eq!(legs.len(), 3);
     assert!(results.contains(&env.mock_amm_1_addr));

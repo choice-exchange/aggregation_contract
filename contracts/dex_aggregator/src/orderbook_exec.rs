@@ -284,26 +284,24 @@ fn estimate_execution_buy_from_source(
     let result_quantity = round_to_min_tick(expected_base_quantity, market.min_quantity_tick_size);
     let fee_estimate = input_quote_quantity - available_swap_quote_funds;
 
-    // check the contract holds enough quote to create the order
-    let required_funds = worst_price * expected_base_quantity * (FPDecimal::ONE + fee_percent);
-    let funds_in_contract: FPDecimal = deps
-        .querier
-        .query_balance(contract_address, &market.quote_denom)
-        .expect("query own balance should not fail")
-        .amount
-        .into();
-
-    let funds_for_margin = match is_simulation {
-        // in execution mode funds_in_contract already include the user's input,
-        // so we must not count it twice
-        false => funds_in_contract,
-        true => funds_in_contract + available_swap_quote_funds,
-    };
-
-    if required_funds > funds_for_margin {
-        return Err(StdError::msg(format!(
-            "Swap amount too high, required funds: {required_funds}, available funds: {funds_for_margin}",
-        )));
+    // The funds check only matters for real execution: the atomic order debits the
+    // contract's subaccount, so it must already hold enough quote (the user's input,
+    // which it's holding during the route) to back the order. In simulation
+    // (`SimulateRoute`) no funds are sent — skip the check so a read-only quote does
+    // NOT require the aggregator to be pre-seeded with the quote denom.
+    if !is_simulation {
+        let required_funds = worst_price * expected_base_quantity * (FPDecimal::ONE + fee_percent);
+        let funds_in_contract: FPDecimal = deps
+            .querier
+            .query_balance(contract_address, &market.quote_denom)
+            .expect("query own balance should not fail")
+            .amount
+            .into();
+        if required_funds > funds_in_contract {
+            return Err(StdError::msg(format!(
+                "Swap amount too high, required funds: {required_funds}, available funds: {funds_in_contract}",
+            )));
+        }
     }
 
     Ok(StepExecutionEstimate {

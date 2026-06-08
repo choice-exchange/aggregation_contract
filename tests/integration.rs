@@ -8,7 +8,7 @@ use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
     amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
-    OrderbookSwapOp, QueryMsg, Split, Stage,
+    OrderbookSwapOp, QueryMsg, SimulateRouteResponse, Split, Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
 use injective_cosmwasm::{get_default_subaccount_id_for_checked_address, MarketId};
@@ -682,6 +682,44 @@ fn test_aggregate_swap_success() {
     // Assert the final balance is correct
     assert_eq!(final_amount, expected_final_balance);
     assert_eq!(final_balance.denom, "usdt");
+}
+
+#[test]
+fn test_simulate_route_orderbook_buy_needs_no_buffer() {
+    // Regression for the buy-side margin gotcha: SimulateRoute on a BUY orderbook hop
+    // must succeed even though the aggregator holds NONE of the quote denom — a
+    // read-only quote should not require the contract to be pre-seeded. (Execution
+    // never needed a buffer; this guards the simulation path.)
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let res: SimulateRouteResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::SimulateRoute {
+                stages: vec![Stage {
+                    splits: vec![Split {
+                        percent: 100,
+                        path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                            target_denom: "inj".to_string(),
+                            quantity: None,
+                            worst_price: None,
+                        })],
+                    }],
+                }],
+                amount_in: Coin::new(1_000_000_000u128, "usdt"), // 1000 USDT, aggregator holds 0 usdt
+            },
+        )
+        .unwrap();
+
+    // ~99.75 INJ (best ask 10, gross atomic fee). The point: a real quote is returned,
+    // not the "Swap amount too high" error the un-fixed margin check produced at 0 balance.
+    let out = res.output_amount.u128();
+    assert!(
+        out > 99_000_000_000_000_000_000 && out < 100_000_000_000_000_000_000,
+        "expected ~99.75 INJ from the buy-side quote, got {out}"
+    );
 }
 
 #[test]

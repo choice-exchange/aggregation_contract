@@ -192,6 +192,29 @@ fn simulate_single_operation(
                 amount: quote_response.amount_out,
             })
         }
+        Operation::ClmmSwapExactOutput(op) => {
+            // Exact-output: the leg's output is the (deliverable) `amount_out`,
+            // independent of the supplied input amount — the unspent input is
+            // refunded, not routed onward. Report the pool's deliverable output.
+            let quote_query = clmm::ClmmPoolQueryMsg::QuoteExactOutput {
+                token_out: op.ask_asset_info.clone(),
+                amount_out: op.amount_out,
+            };
+            let contract_addr = op.pool_address.to_string();
+
+            let quote_response: clmm::QuoteResponse = querier.query(
+                &WasmQuery::Smart {
+                    contract_addr,
+                    msg: to_json_binary(&quote_query)?,
+                }
+                .into(),
+            )?;
+
+            Ok(amm::Asset {
+                info: op.ask_asset_info.clone(),
+                amount: quote_response.amount_out,
+            })
+        }
     }
 }
 
@@ -203,6 +226,7 @@ fn get_path_start_info(path: &[Operation]) -> StdResult<amm::AssetInfo> {
         Operation::AmmSwap(op) => op.offer_asset_info.clone(),
         Operation::OrderbookSwap(op) => op.offer_asset_info.clone(),
         Operation::ClmmSwap(op) => op.offer_asset_info.clone(),
+        Operation::ClmmSwapExactOutput(op) => op.offer_asset_info.clone(),
     })
 }
 
@@ -506,6 +530,54 @@ mod tests {
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
         // Final output is the sum of the shroom from both paths
         assert_eq!(result.output_amount, Uint128::new(5000 + 8000));
+    }
+
+    #[test]
+    fn test_simulate_clmm_exact_output_reports_deliverable() {
+        use crate::msg::ClmmSwapExactOutputOp;
+
+        let mut querier = MockQuerier::new(&[]);
+        // Pool can deliver the full requested exact-output of 250_000.
+        let quote = clmm::QuoteResponse {
+            amount_out: Uint128::new(250_000),
+            amount_in_consumed: Uint128::new(100),
+            fee_amount: Uint128::zero(),
+        };
+        let quote_bin = to_json_binary(&quote).unwrap();
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart { contract_addr, msg } => {
+                // Must be a QuoteExactOutput query (exact-output simulate path).
+                let decoded: clmm::ClmmPoolQueryMsg = from_json(msg).unwrap();
+                assert!(matches!(
+                    decoded,
+                    clmm::ClmmPoolQueryMsg::QuoteExactOutput { .. }
+                ));
+                assert_eq!(contract_addr, POOL_A_ADDR);
+                SystemResult::Ok(ContractResult::Ok(quote_bin.clone()))
+            }
+            _ => panic!("unsupported query"),
+        });
+        let mut deps = mock_dependencies();
+        deps.querier = querier;
+
+        let stages = vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwapExactOutput(ClmmSwapExactOutputOp {
+                    pool_address: POOL_A_ADDR.to_string(),
+                    offer_asset_info: AssetInfo::NativeToken { denom: "inj".to_string() },
+                    ask_asset_info: AssetInfo::NativeToken { denom: "usdt".to_string() },
+                    amount_out: Uint128::new(250_000),
+                })],
+            }],
+        }];
+
+        let result_binary =
+            simulate_route(deps.as_ref(), mock_env(), stages, Coin::new(1000u128, "inj")).unwrap();
+        let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
+        // The leg's reported output is the deliverable exact-output, not a
+        // function of the input amount.
+        assert_eq!(result.output_amount, Uint128::new(250_000));
     }
 
     #[test]

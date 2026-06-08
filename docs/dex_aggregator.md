@@ -61,7 +61,13 @@ pub struct OrderbookSwapOp {
 }
 ```
 
-**Native tokens only** for both input and output. Amounts are rounded down to the nearest `min_quantity_tick_size` before execution. The contract queries `GetOutputQuantity` on the orderbook contract, applies 0.5% slippage, and submits `SwapMinOutput`.
+**Native tokens only** for both input and output. The leg's **INPUT** amount is rounded down to the nearest `min_quantity_tick_size` before execution (`execute.rs::create_swap_cosmos_msg`). The contract queries `GetOutputQuantity` on the orderbook contract, applies 0.5% slippage, and submits `SwapMinOutput`.
+
+> ⚠️ **`min_quantity_tick_size` must match the leg's INPUT denom, not always the market base tick.** Because the rounding is applied to the input:
+> - **Sell leg** (offer = base, e.g. INJ→USDC): pass the market's base `min_quantity_tick_size` — correct, the input is the base asset.
+> - **Buy leg** (offer = quote, e.g. USDC→INJ): the input is the *quote*. Passing the base tick (sized for 18-dec INJ ≈ `1e14`) rounds a normal quote amount (6-dec USDC) **down to 0**, which trips the zero-amount short-circuit (`to_json_binary(&{})` → a `null` self-call) and the route reverts with the misleading **`dispatch: submessages: kind: Serialization, error: expected value at line 1 column 1`**. Pass a quote-appropriate tick (`"1"` is safe — no meaningful quote rounding; the orderbook swap contract aligns the base OUTPUT to its own tick downstream).
+>
+> See the [Integration Gotchas](#integration-gotchas) section — both this and the buffer issue below surface as the *same* serialization error.
 
 ### Asset Abstraction (amm submodule)
 
@@ -311,3 +317,26 @@ Validates all addresses, saves `Config`, initializes `REPLY_ID_COUNTER` to 0.
 - `pending_swaps` in `ExecutionState` temporarily holds the planned swaps while conversions complete
 - `pending_path_op` holds the next operation in a multi-hop path while a mid-path conversion completes
 - The last split in a stage receives the remainder amount (total - already allocated) to prevent rounding dust loss
+
+## Integration Gotchas
+
+Two distinct issues both surface as the **same opaque revert** — keep this in mind when an orderbook leg fails:
+
+```
+failed to execute message; message index: 0: dispatch: submessages:
+  kind: Serialization, error: expected value at line 1 column 1: execute wasm contract failed
+```
+
+`expected value at line 1 column 1` is serde-json's error for **empty input**. It does *not* mean your `ExecuteRoute` JSON is malformed — it means a *downstream* step produced/parsed empty bytes. The two known causes:
+
+### 1. Buy-leg `min_quantity_tick_size` rounding the quote input to zero
+
+The aggregator rounds an `OrderbookSwapOp`'s **input** by `min_quantity_tick_size`. For a **buy** leg the input is the quote asset, so passing the base-asset tick rounds a normal quote amount to `0`, hits the zero-amount short-circuit (a `null` self-call), and reverts.
+
+**Fix (caller-side):** pass the tick that matches the leg's *input* denom — base tick for sell legs, a quote-appropriate tick (`"1"` works) for buy legs. See [OrderbookSwapOp](#orderbookswapop).
+
+### 2. The orderbook swap contract holds no quote-denom balance
+
+The aggregator pre-flights each orderbook leg with a `GetOutputQuantity` query. The orderbook swap contract's **buy-from-source** estimation has a net-vs-gross fee inconsistency: in simulation it credits `funds_in_contract + input/(1+fee)` (net of fee) but compares against a gross `required_funds ≈ input`, so the check fails by the fee factor (`required > available` by ~`fee`) **unless the swap contract already holds some of that quote denom**. When the query errors, the aggregator's typed deserialize of the (empty) error response throws the serialization error above.
+
+**Fix (one-time, ops):** seed the orderbook swap contract with a small balance of each quote denom it will route (only the *simulation* margin needs it — `funds_in_contract` covers the fee-factor gap; execution mode already counts the user's funds). Long-lived mainnet contracts satisfy this automatically from accumulated fees, which is why it only bites freshly-deployed instances. Required buffer ≈ `max_trade_size × fee/(1+fee)` (a few units of the quote denom is plenty).

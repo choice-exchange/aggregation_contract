@@ -177,12 +177,14 @@ fn handle_swap_reply(
         }
 
         // Create the message for the next step.
-        let next_msg = create_swap_cosmos_msg(
+        let initiator = exec_state.plan.sender.clone();
+        let (next_msg, extra_msgs) = create_swap_cosmos_msg(
             &mut deps,
             next_op,
             &offer_asset_for_next_op.info,
             offer_asset_for_next_op.amount,
             &env,
+            &initiator,
         )?;
 
         let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
@@ -206,6 +208,7 @@ fn handle_swap_reply(
 
         Ok(Response::new()
             .add_submessage(sub_msg)
+            .add_messages(extra_msgs)
             .add_attribute("action", "proceeding_to_next_op_in_path")
             .add_attribute("split_index", split_index.to_string())
             .add_attribute("op_index", (op_index + 1).to_string()))
@@ -509,6 +512,7 @@ fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError>
         Operation::AmmSwap(o) => o.ask_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.ask_asset_info.clone(),
         Operation::ClmmSwap(o) => o.ask_asset_info.clone(),
+        Operation::ClmmSwapExactOutput(o) => o.ask_asset_info.clone(),
     })
 }
 
@@ -761,6 +765,7 @@ fn get_operation_input(op: &Operation) -> Result<amm::AssetInfo, ContractError> 
         Operation::AmmSwap(o) => o.offer_asset_info.clone(),
         Operation::OrderbookSwap(o) => o.offer_asset_info.clone(),
         Operation::ClmmSwap(o) => o.offer_asset_info.clone(),
+        Operation::ClmmSwapExactOutput(o) => o.offer_asset_info.clone(),
     })
 }
 
@@ -772,7 +777,9 @@ fn execute_planned_swaps(
     swaps: &[PlannedSwap],
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let mut submessages = Vec::with_capacity(swaps.len());
+    let mut extra_messages: Vec<CosmosMsg<InjectiveMsgWrapper>> = vec![];
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
+    let initiator = exec_state.plan.sender.clone();
 
     for swap in swaps.iter().filter(|s| !s.amount.is_zero()) {
         reply_id_counter += 1;
@@ -789,10 +796,17 @@ fn execute_planned_swaps(
         )?;
 
         let offer_asset_info = get_operation_input(&swap.operation)?;
-        let msg =
-            create_swap_cosmos_msg(deps, &swap.operation, &offer_asset_info, swap.amount, &env)?;
+        let (msg, extra) = create_swap_cosmos_msg(
+            deps,
+            &swap.operation,
+            &offer_asset_info,
+            swap.amount,
+            &env,
+            &initiator,
+        )?;
 
         submessages.push(SubMsg::reply_on_success(msg, submsg_id));
+        extra_messages.extend(extra);
     }
 
     REPLY_ID_COUNTER.save(deps.storage, &reply_id_counter)?;
@@ -809,6 +823,7 @@ fn execute_planned_swaps(
 
     Ok(Response::new()
         .add_submessages(submessages)
+        .add_messages(extra_messages)
         .add_attribute("action", "executing_planned_swaps")
         .add_attribute("stage_index", exec_state.current_stage_index.to_string()))
 }
@@ -818,6 +833,7 @@ fn get_operation_address(op: &Operation) -> &String {
         Operation::AmmSwap(o) => &o.pool_address,
         Operation::OrderbookSwap(o) => &o.swap_contract,
         Operation::ClmmSwap(o) => &o.pool_address,
+        Operation::ClmmSwapExactOutput(o) => &o.pool_address,
     }
 }
 
@@ -862,12 +878,14 @@ fn handle_path_conversion_reply(
         .ok_or_else(|| StdError::msg("Could not find pending op in route plan"))?;
 
     let converted_asset_info = get_operation_input(&pending_op_details.operation)?;
-    let swap_msg = create_swap_cosmos_msg(
+    let initiator = exec_state.plan.sender.clone();
+    let (swap_msg, extra_msgs) = create_swap_cosmos_msg(
         &mut deps,
         &pending_op_details.operation,
         &converted_asset_info,
         converted_amount,
         &env,
+        &initiator,
     )?;
 
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
@@ -892,5 +910,6 @@ fn handle_path_conversion_reply(
 
     Ok(Response::new()
         .add_submessage(sub_msg)
+        .add_messages(extra_msgs)
         .add_attribute("action", "resuming_path_after_conversion"))
 }

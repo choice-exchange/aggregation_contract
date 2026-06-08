@@ -29,6 +29,26 @@ pub enum ContractError {
     #[error("Invalid funds for native token swap. Expected 1 coin, sent {sent}")]
     InvalidFunds { sent: usize },
 
+    #[error("Slippage tolerance {bps} bps exceeds 10000 (100%)")]
+    InvalidSlippage { bps: u16 },
+
+    #[error("Exact-output CLMM legs require a native input token")]
+    ExactOutputNativeInputOnly {},
+
+    #[error("Operation offer asset does not match either pool token")]
+    OperationAssetMismatch {},
+
+    #[error(
+        "Exact-output not fillable: requested {requested}, pool can deliver only {deliverable}"
+    )]
+    ExactOutputNotFillable {
+        requested: Uint128,
+        deliverable: Uint128,
+    },
+
+    #[error("Exact-output cost {cost} exceeds the leg's input budget {budget}")]
+    InsufficientInputBudget { cost: Uint128, budget: Uint128 },
+
     // --- Execution & Economic Outcome Errors ---
     #[error(
         "Minimum receive amount not met. Minimum: {minimum_receive}, Received: {actual_receive}"

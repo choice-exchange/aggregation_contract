@@ -146,6 +146,18 @@ pub mod clmm {
             recipient: Option<String>,
             deadline: Option<u64>,
         },
+        /// Exact-output swap. `zero_for_one` pays token0 / receives token1.
+        /// Native input is attached as funds (pool refunds any surplus over the
+        /// actual cost); the aggregator only attaches the quoted cost, so no
+        /// refund is expected. Reverts if the cost exceeds `maximum_amount_in`
+        /// or the full `amount_out` can't be delivered.
+        SwapExactOutput {
+            zero_for_one: bool,
+            amount_out: Uint128,
+            maximum_amount_in: Uint128,
+            recipient: Option<String>,
+            deadline: Option<u64>,
+        },
     }
 
     #[cw_serde]
@@ -163,6 +175,17 @@ pub mod clmm {
             token_in: amm::AssetInfo,
             amount_in: Uint128,
         },
+        /// Exact-output quote: given a desired `amount_out` of `token_out`,
+        /// returns the input cost in `amount_in_consumed` (and the actually
+        /// deliverable `amount_out`, which is `< amount_out` only if the pool
+        /// is liquidity/price-limit bound).
+        QuoteExactOutput {
+            token_out: amm::AssetInfo,
+            amount_out: Uint128,
+        },
+        /// Pool config. We only deserialize `token0`/`token1` (serde ignores the
+        /// rest) to resolve the `zero_for_one` direction for `SwapExactOutput`.
+        GetConfig {},
     }
 
     #[cw_serde]
@@ -170,6 +193,16 @@ pub mod clmm {
         pub amount_out: Uint128,
         pub amount_in_consumed: Uint128,
         pub fee_amount: Uint128,
+    }
+
+    /// Partial view of the pool's `PoolConfig` — only the fields we need. The
+    /// pool's `AssetInfo` is wire-compatible with [`amm::AssetInfo`] (same
+    /// `native_token`/`token` snake_case tags), and serde drops the unmodeled
+    /// `factory`/`tick_spacing`/`fee_config`/`hook`/... fields on deserialize.
+    #[cw_serde]
+    pub struct ConfigResponse {
+        pub token0: amm::AssetInfo,
+        pub token1: amm::AssetInfo,
     }
 }
 
@@ -186,6 +219,11 @@ pub struct OrderbookSwapOp {
     pub offer_asset_info: amm::AssetInfo,
     pub ask_asset_info: amm::AssetInfo,
     pub min_quantity_tick_size: Uint128,
+    /// Per-op slippage tolerance in basis points applied to the simulated
+    /// output to derive `min_output_quantity`. `None` defaults to
+    /// [`DEFAULT_SLIPPAGE_BPS`](crate::execute::DEFAULT_SLIPPAGE_BPS) (50 =
+    /// 0.5%), preserving the previous hardcoded behavior.
+    pub max_slippage_bps: Option<u16>,
 }
 
 #[cw_serde]
@@ -193,6 +231,25 @@ pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
     pub ask_asset_info: amm::AssetInfo,
+    /// Per-op slippage tolerance in basis points applied to the quoted output
+    /// to derive `minimum_amount_out`. `None` defaults to
+    /// [`DEFAULT_SLIPPAGE_BPS`](crate::execute::DEFAULT_SLIPPAGE_BPS) (50 =
+    /// 0.5%), preserving the previous hardcoded behavior.
+    pub max_slippage_bps: Option<u16>,
+}
+
+/// Exact-output CLMM leg: receive exactly `amount_out` of `ask_asset_info`,
+/// paying the pool's quoted cost in `offer_asset_info` and refunding the
+/// unspent portion of the leg's input budget to the route initiator.
+/// **Native input only** for now (`offer_asset_info` must be `NativeToken`);
+/// the struct is CW20-capable so allowance-based CW20 input can be added later
+/// without a message migration.
+#[cw_serde]
+pub struct ClmmSwapExactOutputOp {
+    pub pool_address: String,
+    pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: amm::AssetInfo,
+    pub amount_out: Uint128,
 }
 
 #[cw_serde]
@@ -200,6 +257,7 @@ pub enum Operation {
     AmmSwap(AmmSwapOp),
     OrderbookSwap(OrderbookSwapOp),
     ClmmSwap(ClmmSwapOp),
+    ClmmSwapExactOutput(ClmmSwapExactOutputOp),
 }
 
 #[cw_serde]

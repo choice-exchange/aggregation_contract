@@ -58,6 +58,17 @@ pub enum ExecuteMsg {
         recipient: Option<String>,
         deadline: Option<u64>,
     },
+    /// Exact-output (CLMM). Delivers exactly `amount_out` of the output asset to
+    /// `recipient`, consuming the attached native funds as the (already-quoted)
+    /// cost. The mock does not enforce `maximum_amount_in`/`zero_for_one`; the
+    /// aggregator attaches exactly the `QuoteExactOutput` cost.
+    SwapExactOutput {
+        zero_for_one: bool,
+        amount_out: Uint128,
+        maximum_amount_in: Uint128,
+        recipient: Option<String>,
+        deadline: Option<u64>,
+    },
     Receive(Cw20ReceiveMsg),
 }
 
@@ -111,6 +122,14 @@ pub struct QuoteResponse {
     pub fee_amount: Uint128,
 }
 
+/// Mirrors the CLMM pool's partial `GetConfig` response (token0/token1 only).
+/// `AssetInfo` is wire-compatible with the aggregator's `clmm::ConfigResponse`.
+#[cw_serde]
+pub struct ConfigResponse {
+    pub token0: AssetInfo,
+    pub token1: AssetInfo,
+}
+
 #[cw_serde]
 pub enum QueryMsg {
     GetOutputQuantity {
@@ -122,6 +141,13 @@ pub enum QueryMsg {
         token_in: AssetInfo,
         amount_in: Uint128,
     },
+    /// Exact-output quote: inverse-rate cost for a desired `amount_out`.
+    QuoteExactOutput {
+        token_out: AssetInfo,
+        amount_out: Uint128,
+    },
+    /// Pool config — token0 = input asset, token1 = output asset.
+    GetConfig {},
 }
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
@@ -146,6 +172,41 @@ pub fn execute(
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
     let config = CONFIG.load(deps.storage)?;
+
+    // Exact-output is handled separately: the output is fixed (not rate-derived
+    // from the input), and the attached native funds are the already-quoted cost.
+    if let ExecuteMsg::SwapExactOutput {
+        amount_out,
+        recipient,
+        ..
+    } = &msg
+    {
+        let recipient = recipient.clone().unwrap_or_else(|| info.sender.to_string());
+        let amount_in = info.funds.first().map(|c| c.amount).unwrap_or_default();
+        let send_msg: CosmosMsg = match &config.output_asset_info {
+            AssetInfo::Token { contract_addr } => CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: contract_addr.clone(),
+                msg: to_json_binary(&Cw20ExecuteMsg::Transfer {
+                    recipient,
+                    amount: *amount_out,
+                })?,
+                funds: vec![],
+            }),
+            AssetInfo::NativeToken { denom } => CosmosMsg::Bank(BankMsg::Send {
+                to_address: recipient,
+                amount: vec![Coin {
+                    denom: denom.clone(),
+                    amount: (*amount_out).into(),
+                }],
+            }),
+        };
+        let event = Event::new("wasm")
+            .add_attribute("action", "swap")
+            .add_attribute("amount_in", amount_in.to_string())
+            .add_attribute("amount_out", amount_out.to_string());
+        return Ok(Response::new().add_message(send_msg).add_event(event));
+    }
+
     let mut recipient = info.sender.to_string();
 
     let (offer_amount, offer_info) = match msg {
@@ -178,6 +239,8 @@ pub fn execute(
                 },
             )
         }
+        // Handled by the early-return branch above.
+        ExecuteMsg::SwapExactOutput { .. } => unreachable!(),
         ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender,
             amount,
@@ -342,6 +405,41 @@ pub fn query(
                 amount_out,
                 amount_in_consumed: amount_in,
                 fee_amount: Uint128::zero(),
+            })
+        }
+        QueryMsg::QuoteExactOutput {
+            token_out,
+            amount_out,
+        } => {
+            let config = CONFIG.load(deps.storage)?;
+
+            if token_out != config.output_asset_info {
+                return Err(StdError::msg("Invalid token_out for this mock contract"));
+            }
+
+            // Inverse of the forward rate: amount_in = amount_out / rate.
+            let out_decimal = Decimal::from_atomics(amount_out, config.output_decimals as u32)
+                .map_err(|_| StdError::msg("Failed to create decimal from amount_out"))?;
+            let rate_decimal = Decimal::from_str(&config.rate)?;
+            let in_decimal = out_decimal / rate_decimal;
+            let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.input_decimals as u32);
+            let scaling_factor = Uint128::from(10u128.pow(decimal_diff));
+            let amount_in = in_decimal
+                .atomics()
+                .checked_div(scaling_factor)
+                .unwrap_or_default();
+
+            to_json_binary(&QuoteResponse {
+                amount_out,
+                amount_in_consumed: amount_in,
+                fee_amount: Uint128::zero(),
+            })
+        }
+        QueryMsg::GetConfig {} => {
+            let config = CONFIG.load(deps.storage)?;
+            to_json_binary(&ConfigResponse {
+                token0: config.input_asset_info,
+                token1: config.output_asset_info,
             })
         }
     }

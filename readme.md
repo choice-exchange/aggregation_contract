@@ -253,3 +253,19 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
   }
 }
 ```
+
+## Integration Gotchas (Orderbook Legs)
+
+Two issues both revert with the **same** opaque error —
+`dispatch: submessages: kind: Serialization, error: expected value at line 1 column 1`
+(serde-json's "empty input"). Neither means your route JSON is malformed:
+
+1. **Buy-leg `min_quantity_tick_size` must match the INPUT denom.** The leg input is
+   rounded by this tick; for a *buy* leg the input is the quote asset, so the base
+   tick rounds it to `0` → no-op → revert. Pass `"1"` for buy legs (base tick is
+   only correct for sell legs).
+2. **The orderbook swap contract must hold a small balance of each quote denom**
+   it routes, or its buy-side `GetOutputQuantity` pre-flight fails by the fee
+   factor (fresh deploys only; mainnet contracts have it from accrued fees).
+
+Full explanation: [docs/dex_aggregator.md → Integration Gotchas](docs/dex_aggregator.md#integration-gotchas).

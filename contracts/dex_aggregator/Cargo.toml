@@ -44,7 +44,9 @@ hex               = { version = "0.4.3" }
 [dev-dependencies]
 injective-test-tube = { version = "1.19.0" }
 mock_swap = { path = "../mock_swap" }
-cw20-base          = { version = "2.0.0" }
+# NOTE: cw20 / cw20-base 2.0.0 deliberately NOT depended on — they pull a second
+# cosmwasm-std (2.x) that conflicts with the 3.0 used by the contract + test-tube.
+# The integration test talks to cw20_base.wasm via local 3.0 types (cw20_compat).
 
 [[test]]
 name = "integration"

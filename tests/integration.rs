@@ -3,13 +3,71 @@
 use std::slice;
 use std::str::FromStr;
 
-use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
-use cw20::{BalanceResponse, Cw20QueryMsg};
-use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
-use dex_aggregator::msg::{
-    amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
-    OrderbookSwapOp, QueryMsg, Split, Stage,
+use cosmwasm_std::{to_json_binary, Addr, Binary, Coin, Decimal, Empty, Uint128};
+use cw20_compat::{
+    BalanceResponse, Cw20ExecuteMsg, Cw20InstantiateMsg, Cw20QueryMsg, MinterResponse,
 };
+use dex_aggregator::msg::{
+    amm, cw20_adapter, AmmSwapOp, ClmmSwapExactOutputOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg,
+    InstantiateMsg, Operation, OrderbookSwapOp, QueryMsg, Split, Stage,
+};
+
+/// cosmwasm-std-3.0-compatible mirrors of the cw20 / cw20-base message types.
+///
+/// The `cw20`/`cw20-base` 2.0.0 crates hard-depend on cosmwasm-std 2.x, which
+/// would pull a *second* cosmwasm-std into this test (the aggregator + test-tube
+/// are on 3.0) and make `Uint128`/`Coin`/`Binary` two incompatible types. The
+/// cw20 JSON ABI is stable across versions, so we talk to the `cw20_base.wasm`
+/// bytecode with these locally-defined 3.0 types instead.
+mod cw20_compat {
+    use super::*;
+    use cosmwasm_schema::cw_serde;
+
+    #[cw_serde]
+    pub struct Cw20Coin {
+        pub address: String,
+        pub amount: Uint128,
+    }
+
+    #[cw_serde]
+    pub struct MinterResponse {
+        pub minter: String,
+        pub cap: Option<Uint128>,
+    }
+
+    #[cw_serde]
+    pub struct Cw20InstantiateMsg {
+        pub name: String,
+        pub symbol: String,
+        pub decimals: u8,
+        pub initial_balances: Vec<Cw20Coin>,
+        pub mint: Option<MinterResponse>,
+        pub marketing: Option<Empty>,
+    }
+
+    #[cw_serde]
+    pub enum Cw20ExecuteMsg {
+        Mint {
+            recipient: String,
+            amount: Uint128,
+        },
+        Send {
+            contract: String,
+            amount: Uint128,
+            msg: Binary,
+        },
+    }
+
+    #[cw_serde]
+    pub enum Cw20QueryMsg {
+        Balance { address: String },
+    }
+
+    #[cw_serde]
+    pub struct BalanceResponse {
+        pub balance: Uint128,
+    }
+}
 use dex_aggregator::state::Config as AggregatorConfig;
 use injective_test_tube::{
     injective_std::types::cosmos::{
@@ -352,7 +410,7 @@ fn test_aggregate_swap_success() {
                             denom: "inj".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 },
             ],
         }],
@@ -439,7 +497,7 @@ fn test_multi_stage_aggregate_swap_success() {
                             denom: "usdt".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(10000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 }],
             },
             // Stage 2: The resulting INJ is split 49/51 across two AMMs to get final USDT.
@@ -528,7 +586,7 @@ fn test_multi_stage_aggregate_swap_success() {
     // Expected Final: 1_000_000_000_000 - 1_000_000_000_000 + 1_510_000_000_000 = 1_510_000_000_000
     let initial_user_balance = 1_000_000_000_000u128; // Assuming this is the initial balance from setup()
     let expected_final_balance = Uint128::new(initial_user_balance)
-        - Uint128::new(initial_funds.amount.u128())
+        - Uint128::try_from(initial_funds.amount).unwrap()
         + Uint128::from_str(expected_final_amount).unwrap();
 
     // Extract the amount from the query response
@@ -632,7 +690,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
                 symbol: "SHROOM".to_string(),
                 decimals: 6,
                 initial_balances: vec![],
-                mint: Some(cw20::MinterResponse {
+                mint: Some(MinterResponse {
                     minter: admin.address(),
                     cap: None,
                 }),
@@ -654,7 +712,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
                 symbol: "SAI".to_string(),
                 decimals: 6,
                 initial_balances: vec![],
-                mint: Some(cw20::MinterResponse {
+                mint: Some(MinterResponse {
                     minter: admin.address(),
                     cap: None,
                 }),
@@ -854,7 +912,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
 
     wasm.execute(
         &shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: mock_inj_to_cw20_shroom_amm.clone(),
             amount: Uint128::new(100_000_000_000),
         },
@@ -864,7 +922,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     .unwrap();
     wasm.execute(
         &sai_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: mock_cw20_shroom_to_cw20_sai_amm.clone(),
             amount: Uint128::new(100_000_000_000),
         },
@@ -876,7 +934,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     // 2. Fund the ADAPTER with a liquidity pool of CW20 SHROOM for conversions.
     wasm.execute(
         &shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: adapter_addr.clone(),
             amount: Uint128::new(100_000_000_000),
         },
@@ -891,7 +949,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
                                                                    // Mint cw20 to admin
     wasm.execute(
         &shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: admin.address(),
             amount: native_shroom_to_create,
         },
@@ -902,7 +960,7 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     // Admin sends cw20 to adapter, which mints native shroom and sends it back to the admin.
     wasm.execute(
         &shroom_cw20_addr,
-        &cw20::Cw20ExecuteMsg::Send {
+        &Cw20ExecuteMsg::Send {
             contract: adapter_addr.clone(),
             amount: native_shroom_to_create,
             msg: to_json_binary(&"{}").unwrap(),
@@ -1019,7 +1077,7 @@ fn test_full_normalization_route() {
                                 denom: native_shroom_denom.clone(),
                             },
                             min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                        })],
+                            max_slippage_bps: None,                        })],
                     },
                     Split {
                         percent: 50,
@@ -1105,7 +1163,7 @@ fn test_multi_stage_with_final_normalization() {
                             denom: "inj".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(10000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 }],
             },
             // Stage 2: The resulting INJ is split 10/90 to get a mix of SHROOM types.
@@ -1134,7 +1192,7 @@ fn test_multi_stage_with_final_normalization() {
                                 denom: native_shroom_denom.clone(),
                             },
                             min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                        })],
+                            max_slippage_bps: None,                        })],
                     },
                 ],
             },
@@ -1177,7 +1235,7 @@ fn test_cw20_entry_point_swap_success() {
     let initial_shroom_amount = Uint128::new(1_000_000_000u128); // 1,000 SHROOM
     wasm.execute(
         &setup.shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: user.address(),
             amount: initial_shroom_amount,
         },
@@ -1229,7 +1287,7 @@ fn test_cw20_entry_point_swap_success() {
 
     let res = wasm.execute(
         &setup.shroom_cw20_addr,
-        &cw20::Cw20ExecuteMsg::Send {
+        &Cw20ExecuteMsg::Send {
             contract: setup.env.aggregator_addr.clone(),
             amount: initial_shroom_amount,
             msg: to_json_binary(&hook_msg).unwrap(),
@@ -1315,7 +1373,7 @@ fn test_reverse_normalization_route() {
                             denom: "usdt".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(10000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 }],
             },
         ],
@@ -1415,7 +1473,7 @@ fn test_failure_if_minimum_receive_not_met() {
                             denom: "inj".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 },
             ],
         }],
@@ -1597,7 +1655,7 @@ fn test_mixed_input_unified_output_reconciliation() {
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
                     min_quantity_tick_size: Uint128::new(10000),
-                })],
+                    max_slippage_bps: None,                })],
             },
             Split {
                 // 40% requires CW20 SHROOM
@@ -1676,7 +1734,7 @@ fn test_cw20_input_with_initial_reconciliation() {
     let initial_user_shroom = Uint128::new(1_000_000_000); // 1,000 SHROOM (6 decimals)
     wasm.execute(
         &setup.shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: user.address(),
             amount: initial_user_shroom,
         },
@@ -1706,7 +1764,7 @@ fn test_cw20_input_with_initial_reconciliation() {
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
                     min_quantity_tick_size: Uint128::new(10000),
-                })],
+                    max_slippage_bps: None,                })],
             },
             Split {
                 // 30% requires CW20 SHROOM
@@ -1739,7 +1797,7 @@ fn test_cw20_input_with_initial_reconciliation() {
     // Execute the transaction via Cw20::Send
     let res = wasm.execute(
         &setup.shroom_cw20_addr,
-        &cw20::Cw20ExecuteMsg::Send {
+        &Cw20ExecuteMsg::Send {
             contract: setup.env.aggregator_addr.clone(),
             amount: initial_user_shroom,
             msg: to_json_binary(&hook_msg).unwrap(),
@@ -1811,7 +1869,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                     offer_asset_info: inj_info.clone(),
                     ask_asset_info: native_shroom_info.clone(),
                     min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                })],
+                    max_slippage_bps: None,                })],
             },
             Split {
                 // 40% of INJ goes to create CW20 SHROOM
@@ -1836,7 +1894,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                     offer_asset_info: native_shroom_info.clone(),
                     ask_asset_info: usdt_info.clone(),
                     min_quantity_tick_size: Uint128::new(10000),
-                })],
+                    max_slippage_bps: None,                })],
             },
             Split {
                 // 75% of total value requires CW20 SHROOM
@@ -2008,7 +2066,7 @@ fn test_native_input_with_initial_cw20_requirement() {
     wasm.execute(
         // Admin gets CW20
         &setup.shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: admin.address(),
             amount: amount_to_test,
         },
@@ -2019,7 +2077,7 @@ fn test_native_input_with_initial_cw20_requirement() {
     wasm.execute(
         // Admin converts to Native
         &setup.shroom_cw20_addr,
-        &cw20::Cw20ExecuteMsg::Send {
+        &Cw20ExecuteMsg::Send {
             contract: setup.adapter_addr.clone(),
             amount: amount_to_test,
             msg: to_json_binary(&"{}").unwrap(),
@@ -2065,7 +2123,7 @@ fn test_native_input_with_initial_cw20_requirement() {
         &msg,
         &[Coin {
             denom: native_shroom_denom,
-            amount: amount_to_test,
+            amount: amount_to_test.into(),
         }],
         user,
     );
@@ -2209,7 +2267,7 @@ fn test_stage_with_single_hundred_percent_split() {
                     denom: "usdt".to_string(),
                 },
                 min_quantity_tick_size: Uint128::new(10000),
-            })],
+                max_slippage_bps: None,            })],
         }],
     };
 
@@ -2293,7 +2351,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                     denom: "usdt".to_string(),
                 },
                 min_quantity_tick_size: Uint128::new(10000),
-            })],
+                max_slippage_bps: None,            })],
         }],
     };
 
@@ -3136,14 +3194,14 @@ fn test_multi_hop_path_with_mid_path_conversion() {
             offer_asset_info: native_shroom_info.clone(),
             ask_asset_info: usdt_info.clone(),
             min_quantity_tick_size: Uint128::new(10000),
-        }),
+            max_slippage_bps: None,        }),
         // Hop 3: USDT -> INJ
         Operation::OrderbookSwap(OrderbookSwapOp {
             swap_contract: setup.mock_usdt_to_inj_ob.clone(),
             offer_asset_info: usdt_info.clone(),
             ask_asset_info: inj_info.clone(),
             min_quantity_tick_size: Uint128::new(10000),
-        }),
+            max_slippage_bps: None,        }),
     ];
 
     let msg = ExecuteMsg::ExecuteRoute {
@@ -3197,7 +3255,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
 
     // Expected change: -10 INJ (sent) + 50 INJ (received) = +40 INJ net gain.
     let expected_final_amount = initial_inj_amount
-        .checked_sub(funds_to_send.amount)
+        .checked_sub(Uint128::try_from(funds_to_send.amount).unwrap())
         .unwrap()
         .checked_add(Uint128::new(50_000_000_000_000_000_000u128))
         .unwrap();
@@ -3243,7 +3301,7 @@ fn test_emergency_withdraw() {
     // Admin mints and sends 500 SHROOM to the aggregator contract
     wasm.execute(
         shroom_cw20_addr,
-        &cw20_base::msg::ExecuteMsg::Mint {
+        &Cw20ExecuteMsg::Mint {
             recipient: aggregator_addr.clone(),
             amount: cw20_shroom_to_send,
         },
@@ -3392,7 +3450,7 @@ fn test_multi_split_to_same_orderbook_contract() {
                         },
                         // Tick size from the generic setup
                         min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 },
                 Split {
                     percent: 60,
@@ -3405,7 +3463,7 @@ fn test_multi_split_to_same_orderbook_contract() {
                             denom: "inj".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 },
             ],
         }],
@@ -3492,7 +3550,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
                 denom: "inj".to_string(),
             },
             min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-        }),
+            max_slippage_bps: None,        }),
         Operation::OrderbookSwap(OrderbookSwapOp {
             swap_contract: env.mock_ob_usdt_inj_addr.clone(),
             ask_asset_info: amm::AssetInfo::NativeToken {
@@ -3502,7 +3560,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
                 denom: "usdt".to_string(),
             },
             min_quantity_tick_size: Uint128::new(10000),
-        }),
+            max_slippage_bps: None,        }),
     ];
 
     let msg = ExecuteMsg::ExecuteRoute {
@@ -3568,7 +3626,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
 
     // Calculate the "perfect world" final balance (without gas costs).
     let expected_final_amount_sans_gas = initial_inj_amount
-        .checked_sub(funds_to_send.amount)
+        .checked_sub(Uint128::try_from(funds_to_send.amount).unwrap())
         .unwrap()
         .checked_add(expected_swap_output)
         .unwrap();
@@ -3610,6 +3668,7 @@ fn test_clmm_single_hop_swap() {
                     ask_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
+                    max_slippage_bps: None,
                 })],
             }],
         }],
@@ -3658,6 +3717,113 @@ fn test_clmm_single_hop_swap() {
     assert_eq!(final_balance, Uint128::new(1_000_150_000_000));
 }
 
+/// Phase 5: exact-output CLMM leg. The user wants exactly 150 USDT out and
+/// supplies a 12-INJ budget; the pool costs 10 INJ (150 / rate 15), so the
+/// aggregator must deliver exactly 150 USDT and refund the unspent 2 INJ.
+#[test]
+fn test_clmm_exact_output_delivers_exact_and_refunds_surplus() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let inj_before = Uint128::from_str(
+        &bank
+            .query_balance(&QueryBalanceRequest {
+                address: env.user.address(),
+                denom: "inj".to_string(),
+            })
+            .unwrap()
+            .balance
+            .unwrap()
+            .amount,
+    )
+    .unwrap();
+
+    let one_inj = Uint128::new(1_000_000_000_000_000_000);
+    let budget = one_inj * Uint128::new(12); // 12 INJ budget; cost is 10 INJ
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwapExactOutput(ClmmSwapExactOutputOp {
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    ask_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    amount_out: Uint128::new(150_000_000), // exactly 150 USDT
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(150_000_000)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(budget.u128(), "inj")],
+        &env.user,
+    );
+    assert!(res.is_ok(), "exact-output route failed: {:?}", res.unwrap_err());
+
+    // USDT: exactly 150 delivered (not more — exact output).
+    let usdt = Uint128::from_str(
+        &bank
+            .query_balance(&QueryBalanceRequest {
+                address: env.user.address(),
+                denom: "usdt".to_string(),
+            })
+            .unwrap()
+            .balance
+            .unwrap()
+            .amount,
+    )
+    .unwrap();
+    assert_eq!(usdt, Uint128::new(1_000_150_000_000));
+
+    // INJ: net spend ≈ the 10-INJ cost (+gas), NOT the full 12-INJ budget —
+    // proving the unspent 2 INJ was refunded, not stranded in the aggregator.
+    let inj_after = Uint128::from_str(
+        &bank
+            .query_balance(&QueryBalanceRequest {
+                address: env.user.address(),
+                denom: "inj".to_string(),
+            })
+            .unwrap()
+            .balance
+            .unwrap()
+            .amount,
+    )
+    .unwrap();
+    let spent = inj_before - inj_after;
+    assert!(
+        spent >= one_inj * Uint128::new(10),
+        "spent {spent} < 10 INJ cost"
+    );
+    assert!(
+        spent < one_inj * Uint128::new(10) + one_inj / Uint128::new(2),
+        "spent {spent} ≈ full budget — refund did not land"
+    );
+
+    // Aggregator holds no leftover INJ (refund + cost fully accounted).
+    let agg_inj = Uint128::from_str(
+        &bank
+            .query_balance(&QueryBalanceRequest {
+                address: env.aggregator_addr.clone(),
+                denom: "inj".to_string(),
+            })
+            .unwrap()
+            .balance
+            .unwrap()
+            .amount,
+    )
+    .unwrap();
+    assert_eq!(agg_inj, Uint128::zero(), "aggregator stranded INJ");
+}
+
 #[test]
 fn test_clmm_mixed_with_amm_split() {
     let env = setup();
@@ -3693,6 +3859,7 @@ fn test_clmm_mixed_with_amm_split() {
                         ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
+                        max_slippage_bps: None,
                     })],
                 },
             ],
@@ -3758,7 +3925,7 @@ fn test_clmm_multi_hop() {
                             denom: "inj".to_string(),
                         },
                         min_quantity_tick_size: Uint128::new(1_000_000),
-                    })],
+                        max_slippage_bps: None,                    })],
                 }],
             },
             Stage {
@@ -3772,6 +3939,7 @@ fn test_clmm_multi_hop() {
                         ask_asset_info: amm::AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
                         },
+                        max_slippage_bps: None,
                     })],
                 }],
             },

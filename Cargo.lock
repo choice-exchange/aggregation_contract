@@ -1109,7 +1109,6 @@ dependencies = [
  "cosmwasm-std 3.0.7",
  "cw-storage-plus 3.0.1",
  "cw2 3.0.0",
- "cw20-base",
  "hex",
  "injective-cosmwasm",
  "injective-math",

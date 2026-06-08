@@ -46,8 +46,32 @@ pub struct RoutePlan {
     pub sender: Addr,
     pub minimum_receive: Uint128,
     pub stages: Vec<Stage>,
+    /// The route's original input (offer) asset, preserved so the terminal
+    /// `aggregator_swap` event can report what the user put in. For a flash cycle
+    /// this is the borrowed principal.
+    pub offer: amm::Asset,
     /// `Some` for flash-arb cycles, `None` for ordinary user swaps.
     pub flash_repayment: Option<FlashRepayment>,
+}
+
+/// One executed venue trade within a route, recorded for indexing. Serialized into
+/// the `swap_results` attribute of the terminal `aggregator_swap` event so an
+/// indexer can attribute per-venue volume without indexing each pool/market's own
+/// native event. Conversions (CW20<->native adapter wraps) are NOT legs.
+#[cw_serde]
+pub struct SwapLeg {
+    /// Venue kind: `"amm"`, `"clmm"`, or `"orderbook"`.
+    pub kind: String,
+    /// Pool contract address (AMM/CLMM) or spot market id (orderbook).
+    pub venue: String,
+    pub offer_denom: String,
+    pub offer_amount: Uint128,
+    pub ask_denom: String,
+    /// Gross output the venue produced, before any aggregator fee.
+    pub ask_amount: Uint128,
+    /// Aggregator fee taken on this leg (in `ask_denom`); zero for hops that carry
+    /// no aggregator fee (orderbook, and non-terminal hops).
+    pub fee_amount: Uint128,
 }
 
 /// Transient context for an in-flight flash, saved by `execute_flash_route` and
@@ -77,6 +101,9 @@ pub struct ExecutionState {
     pub accumulated_assets: Vec<amm::Asset>,
     pub pending_swaps: Vec<PlannedSwap>,
     pub pending_path_op: Option<PendingPathOp>,
+    /// Executed venue trades, accumulated across the whole route for the terminal
+    /// `aggregator_swap` event.
+    pub legs: Vec<SwapLeg>,
 }
 
 #[cw_serde]
@@ -84,6 +111,10 @@ pub struct SubmsgReplyState {
     pub master_reply_id: u64,
     pub split_index: usize,
     pub op_index: usize,
+    /// The asset this hop was dispatched with — carried so its reply can record a
+    /// complete [`SwapLeg`] (offer side) without re-deriving it.
+    pub in_denom: String,
+    pub in_amount: Uint128,
 }
 
 pub const ACTIVE_ROUTES: Map<u64, ExecutionState> = Map::new("execution_states");

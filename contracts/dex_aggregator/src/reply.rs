@@ -1,7 +1,7 @@
 use crate::cw20::Cw20ExecuteMsg;
 use cosmwasm_std::{
-    to_json_binary, Addr, Coin, CosmosMsg, Deps, DepsMut, Env, Reply, Response, StdError, SubMsg,
-    Uint128, WasmMsg,
+    to_json_binary, Addr, Coin, CosmosMsg, Deps, DepsMut, Env, Event, Reply, Response, StdError,
+    SubMsg, Uint128, WasmMsg,
 };
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
@@ -10,8 +10,8 @@ use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
 use crate::orderbook_exec;
 use crate::state::{
-    Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, ACTIVE_ROUTES, CONFIG,
-    FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
+    Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, SwapLeg, ACTIVE_ROUTES,
+    CONFIG, FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
 };
 
 const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
@@ -169,6 +169,19 @@ fn handle_swap_reply(
 
     let received_asset_info = get_operation_output(deps.api, replied_op, &result.events)?;
 
+    // Record this venue trade for the terminal `aggregator_swap` event. A
+    // fee-bearing terminal hop patches `fee_amount` in below; intermediate and
+    // orderbook hops keep zero.
+    exec_state.legs.push(SwapLeg {
+        kind: operation_kind(replied_op).to_string(),
+        venue: get_operation_address(replied_op),
+        offer_denom: submsg_state.in_denom.clone(),
+        offer_amount: submsg_state.in_amount,
+        ask_denom: asset_key(&received_asset_info),
+        ask_amount: received_amount,
+        fee_amount: Uint128::zero(),
+    });
+
     let replied_path = &current_stage.splits[split_index].path;
 
     if let Some(next_op) = replied_path.get(op_index + 1) {
@@ -225,6 +238,8 @@ fn handle_swap_reply(
                 master_reply_id,
                 split_index,
                 op_index: op_index + 1,
+                in_denom: asset_key(&offer_asset_for_next_op.info),
+                in_amount: offer_asset_for_next_op.amount,
             },
         )?;
 
@@ -250,6 +265,14 @@ fn handle_swap_reply(
                 (after_fee, fee, Some(pool_addr.to_string()))
             }
         };
+
+        // Patch the fee onto this hop's leg record *before* `proceed_to_next_step`
+        // can finalize and emit the `aggregator_swap` event.
+        if !fee.is_zero() {
+            if let Some(last_leg) = exec_state.legs.last_mut() {
+                last_leg.fee_amount = fee;
+            }
+        }
 
         exec_state.accumulated_assets.push(amm::Asset {
             info: received_asset_info.clone(),
@@ -402,8 +425,61 @@ fn finalize_route(
         }
         ACTIVE_ROUTES.remove(deps.storage, reply_id);
         Ok(response
+            .add_event(build_swap_event(exec_state, asset_info, total_amount))
             .add_attribute("action", "aggregate_swap_complete")
             .add_attribute("final_received", total_amount.to_string()))
+    }
+}
+
+/// The single consolidated event emitted once per completed user swap. Lets an
+/// indexer record one row per route — who swapped what for what — instead of
+/// stitching together the underlying pool/market events. `swap_results` carries the
+/// per-venue leg breakdown (JSON array of [`SwapLeg`]) for per-pool attribution.
+///
+/// Field names for the top-line (`sender`, `swap_input_*`, `swap_final_*`,
+/// `swap_results`) mirror the legacy `inj-orderbook-swap-contract`
+/// `atomic_swap_execution` event so existing indexer plumbing maps over directly.
+/// On-chain the event type is `wasm-aggregator_swap`.
+fn build_swap_event(
+    exec_state: &ExecutionState,
+    final_asset: &amm::AssetInfo,
+    final_amount: Uint128,
+) -> Event {
+    let route_json = serde_json_wasm::to_string(&exec_state.legs).unwrap_or_default();
+    Event::new("aggregator_swap")
+        .add_attribute("sender", exec_state.plan.sender.to_string())
+        .add_attribute("recipient", exec_state.plan.sender.to_string())
+        .add_attribute("swap_input_denom", asset_key(&exec_state.plan.offer.info))
+        .add_attribute(
+            "swap_input_amount",
+            exec_state.plan.offer.amount.to_string(),
+        )
+        .add_attribute("swap_final_denom", asset_key(final_asset))
+        .add_attribute("swap_final_amount", final_amount.to_string())
+        .add_attribute(
+            "minimum_receive",
+            exec_state.plan.minimum_receive.to_string(),
+        )
+        .add_attribute("stage_count", exec_state.plan.stages.len().to_string())
+        .add_attribute("leg_count", exec_state.legs.len().to_string())
+        .add_attribute("swap_results", route_json)
+}
+
+/// String key for an asset: the bank denom for natives, the contract address for
+/// CW20s. Used in leg records and the consolidated swap event.
+fn asset_key(info: &amm::AssetInfo) -> String {
+    match info {
+        amm::AssetInfo::NativeToken { denom } => denom.clone(),
+        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+    }
+}
+
+/// Venue-kind tag for a leg record: `"amm"`, `"clmm"`, or `"orderbook"`.
+fn operation_kind(op: &Operation) -> &'static str {
+    match op {
+        Operation::AmmSwap(_) => "amm",
+        Operation::OrderbookSwap(_) => "orderbook",
+        Operation::ClmmSwap(_) => "clmm",
     }
 }
 
@@ -937,6 +1013,8 @@ fn execute_planned_swaps(
                 master_reply_id,
                 split_index: swap.split_index,
                 op_index: swap.op_index,
+                in_denom: asset_key(&offer_asset_info),
+                in_amount: swap.amount,
             },
         )?;
 
@@ -1037,6 +1115,8 @@ fn handle_path_conversion_reply(
             master_reply_id,
             split_index,
             op_index,
+            in_denom: asset_key(&converted_asset_info),
+            in_amount: converted_amount,
         },
     )?;
 

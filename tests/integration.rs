@@ -684,6 +684,101 @@ fn test_aggregate_swap_success() {
 }
 
 #[test]
+fn test_aggregator_swap_event_emitted() {
+    // The consolidated `aggregator_swap` event must carry everything an indexer
+    // needs to record one row per user swap: sender, input (denom+amount), output
+    // (denom+amount), and the per-venue leg breakdown. Same route as
+    // test_aggregate_swap_success: 100 INJ -> 3 legs (amm/amm/orderbook) -> USDT.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 33,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_1_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 42,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_2_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 25,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "usdt".to_string(),
+                        quantity: None,
+                        worst_price: None,
+                    })],
+                },
+            ],
+        }],
+        minimum_receive: Some(Uint128::new(1_390_000_000)),
+    };
+
+    let res = wasm
+        .execute(
+            &env.aggregator_addr,
+            &msg,
+            &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+            &env.user,
+        )
+        .expect("route should succeed");
+
+    // cosmwasm prefixes custom events with `wasm-`.
+    let ev = res
+        .events
+        .iter()
+        .find(|e| e.ty == "wasm-aggregator_swap")
+        .expect("aggregator_swap event not emitted");
+
+    let attr = |k: &str| {
+        ev.attributes
+            .iter()
+            .find(|a| a.key == k)
+            .unwrap_or_else(|| panic!("missing attribute {k}"))
+            .value
+            .clone()
+    };
+
+    assert_eq!(attr("sender"), env.user.address());
+    assert_eq!(attr("recipient"), env.user.address());
+    assert_eq!(attr("swap_input_denom"), "inj");
+    assert_eq!(attr("swap_input_amount"), "100000000000000000000");
+    assert_eq!(attr("swap_final_denom"), "usdt");
+    assert_eq!(attr("swap_final_amount"), "1394662500");
+    assert_eq!(attr("stage_count"), "1");
+    assert_eq!(attr("leg_count"), "3");
+
+    // The leg breakdown is a JSON array of 3 venue trades; spot-check that every
+    // venue and both kinds are present, and that it parses.
+    let results = attr("swap_results");
+    let legs: serde_json::Value = serde_json::from_str(&results).expect("swap_results is valid JSON");
+    let legs = legs.as_array().expect("swap_results is an array");
+    assert_eq!(legs.len(), 3);
+    assert!(results.contains(&env.mock_amm_1_addr));
+    assert!(results.contains(&env.mock_amm_2_addr));
+    assert!(results.contains(&env.market_inj_usdt));
+    assert!(results.contains("\"kind\":\"amm\""));
+    assert!(results.contains("\"kind\":\"orderbook\""));
+    // Every leg's output is the USDT we end in (single stage, all converge).
+    for leg in legs {
+        assert_eq!(leg["ask_denom"], "usdt");
+    }
+}
+
+#[test]
 fn test_simulate_route_orderbook_buy_needs_no_buffer() {
     // Regression for the buy-side margin gotcha: SimulateRoute on a BUY orderbook hop
     // must succeed even though the aggregator holds NONE of the quote denom — a

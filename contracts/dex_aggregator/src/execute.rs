@@ -65,6 +65,7 @@ pub fn execute_aggregate_swaps_internal(
         sender: initiator.clone(),
         minimum_receive,
         stages,
+        offer: offer_asset.clone(),
         flash_repayment: None,
     };
 
@@ -76,6 +77,7 @@ pub fn execute_aggregate_swaps_internal(
         accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
         pending_path_op: None,
+        legs: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut initial_exec_state, reply_id)
@@ -204,6 +206,10 @@ pub fn execute_flash_callback(
         sender: ctx.initiator,
         minimum_receive: Uint128::zero(),
         stages: ctx.stages,
+        offer: amm::Asset {
+            info: ctx.flash_asset.clone(),
+            amount: ctx.principal,
+        },
         flash_repayment: Some(FlashRepayment {
             pool: ctx.flash_pool,
             asset: ctx.flash_asset.clone(),
@@ -223,6 +229,7 @@ pub fn execute_flash_callback(
         }],
         pending_swaps: vec![],
         pending_path_op: None,
+        legs: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut exec_state, reply_id)

@@ -257,6 +257,50 @@ After all stages complete:
 - Fee is sent to `config.fee_collector` as a separate message appended to the response
 - Pools with no entry in `FEE_MAP` have zero fee
 
+## Indexing — the `aggregator_swap` event
+
+Every completed **user** swap emits exactly one consolidated event so an indexer can
+record one row per route, instead of stitching together the underlying pool/market
+events. Emitted by `build_swap_event` in `finalize_route` (the non-flash branch;
+flash-arb cycles emit `flash_route_complete` instead). On-chain type:
+`wasm-aggregator_swap`.
+
+Top-line attributes (field names mirror the legacy
+`inj-orderbook-swap-contract` `atomic_swap_execution` event so existing indexer
+plumbing maps over):
+
+| attribute | meaning |
+|-----------|---------|
+| `sender` | route initiator (CW20 sender or native caller) |
+| `recipient` | where the output went (= `sender`) |
+| `swap_input_denom` / `swap_input_amount` | the route's original offer (denom = bank denom or CW20 address) |
+| `swap_final_denom` / `swap_final_amount` | the net output delivered to the user |
+| `minimum_receive` | the route's slippage floor (0 if unset) |
+| `stage_count` | number of stages in the route |
+| `leg_count` | number of executed venue trades |
+| `swap_results` | JSON array of per-venue legs (see below) |
+
+`swap_results` is a JSON array of `SwapLeg` objects (one per executed venue trade;
+CW20↔native conversions are **not** legs):
+
+```json
+[{"kind":"amm","venue":"inj1pool…","offer_denom":"inj","offer_amount":"33000000000000000000",
+  "ask_denom":"usdt","ask_amount":"330000000","fee_amount":"0"}]
+```
+
+- `kind` — `"amm"`, `"clmm"`, or `"orderbook"`
+- `venue` — pool contract address (AMM/CLMM) or spot market id (orderbook)
+- `offer_*` / `ask_*` — the leg's input and gross output (before aggregator fee)
+- `fee_amount` — aggregator fee taken on the leg, in `ask_denom` (0 for orderbook
+  and non-terminal hops; per-pool `FEE_MAP` fee on terminal hops)
+
+Notes:
+- Leg order is completion order (parallel splits interleave), but each leg is
+  self-describing (`venue` + `offer`/`ask`), so order is irrelevant to indexing.
+- A route that produces nothing (all splits zero-filled, `minimum_receive == 0`)
+  completes via `aggregate_swap_complete_empty` and emits no `aggregator_swap` event
+  — there is no volume to record.
+
 ## Tax Token Handling
 
 - Tax tokens are CW20 tokens with transfer taxes (registered in `TAX_TOKEN_REGISTRY`)

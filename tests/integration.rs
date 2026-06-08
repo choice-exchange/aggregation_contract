@@ -100,6 +100,7 @@ fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
     match filename {
         "dex_aggregator.wasm" => include_bytes!("../artifacts/dex_aggregator.wasm"),
         "mock_swap.wasm" => include_bytes!("../artifacts/mock_swap.wasm"),
+        "mock_clmm_flash.wasm" => include_bytes!("../artifacts/mock_clmm_flash.wasm"),
         "cw20_base.wasm" => include_bytes!("../cw20_base/cw20_base.wasm"),
         "cw20_adapter.wasm" => include_bytes!("../cw20_adapter/cw20_adapter.wasm"),
         _ => panic!("Unknown wasm file"),
@@ -3955,4 +3956,392 @@ fn test_clmm_multi_hop() {
 
     // 1000 USDT * 0.1 = 100 INJ, 100 INJ * 15 = 1500 USDT
     assert_eq!(total_received.value, "1496250000");
+}
+
+// ===========================================================================
+// FlashRoute — capital-free CLMM flash-arb
+//
+// The flash source is `mock_clmm_flash`, a faithful mirror of choice_clmm_pool's
+// flash interface (lend → FlashCallback → balance-delta repayment check +
+// reentrancy lock + GetConfig). The aggregator is the borrower:
+//   FlashRoute → pool.Flash → aggregator.FlashCallback → cycle via mock AMMs
+//             → repay principal+fee to the pool → surplus to the caller.
+// ===========================================================================
+
+struct FlashEnv {
+    app: InjectiveTestApp,
+    user: SigningAccount,
+    aggregator_addr: String,
+    /// token0 = usdt, token1 = inj, 0.30% flash fee.
+    flash_pool_addr: String,
+    /// Cycle leg 1: 1 USDT -> 0.1 INJ (buy INJ around 10 usdt/inj).
+    amm_usdt_to_inj: String,
+    /// Cycle leg 2: 1 INJ -> 11 USDT (sell INJ above cost — the arb edge).
+    amm_inj_to_usdt: String,
+}
+
+fn setup_for_flash_test() -> FlashEnv {
+    let app = InjectiveTestApp::new();
+    let admin = app
+        .init_account_decimals(
+            &[
+                Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+                Coin::new(1_000_000_000_000_000u128, "usdt"),
+            ],
+            &[18, 6],
+        )
+        .unwrap();
+    // The caller is capital-free: it only needs INJ for gas, no usdt/inj input.
+    let user = app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let fee_collector = app.init_account(&[]).unwrap();
+
+    let wasm = Wasm::new(&app);
+    let aggregator_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let mock_swap_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let flash_pool_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_clmm_flash.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let adapter_code_id = wasm
+        .store_code(get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+
+    let adapter_addr = wasm
+        .instantiate(
+            adapter_code_id,
+            &cw20_adapter::InstantiateMsg {},
+            Some(&admin.address()),
+            Some("adapter"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let aggregator_addr = wasm
+        .instantiate(
+            aggregator_code_id,
+            &InstantiateMsg {
+                admin: admin.address(),
+                cw20_adapter_address: adapter_addr,
+                fee_collector_address: fee_collector.address(),
+            },
+            Some(&admin.address()),
+            Some("aggregator"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let flash_pool_addr = wasm
+        .instantiate(
+            flash_pool_code_id,
+            &mock_clmm_flash::InstantiateMsg {
+                token0: mock_clmm_flash::AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+                token1: mock_clmm_flash::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                fee_bps: 30,
+            },
+            Some(&admin.address()),
+            Some("flash-pool"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let amm_usdt_to_inj = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    rate: "0.1".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,
+                    output_decimals: 18,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-usdt-inj"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let amm_inj_to_usdt = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "11.0".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-inj-usdt"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // Fund: the pool holds usdt (lendable) + inj; leg 1 pays out inj; leg 2 usdt.
+    let bank = Bank::new(&app);
+    for (to, denom, amount) in [
+        (&flash_pool_addr, "usdt", micro(1_000_000, 6)), // lendable USDT
+        (&flash_pool_addr, "inj", micro(10, 18)),        // token1 presence only
+        (&amm_usdt_to_inj, "inj", micro(10_000, 18)),    // pays out ~100 INJ/cycle
+        (&amm_inj_to_usdt, "usdt", micro(10_000_000, 6)), // pays out ~1100 USDT/cycle
+    ] {
+        bank.send(
+            MsgSend {
+                from_address: admin.address(),
+                to_address: to.clone(),
+                amount: vec![ProtoCoin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }],
+            },
+            &admin,
+        )
+        .unwrap();
+    }
+
+    FlashEnv {
+        app,
+        user,
+        aggregator_addr,
+        flash_pool_addr,
+        amm_usdt_to_inj,
+        amm_inj_to_usdt,
+    }
+}
+
+/// The profitable USDT -> INJ -> USDT cycle (leg1 then leg2).
+fn flash_cycle_stages(env: &FlashEnv) -> Vec<Stage> {
+    vec![
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.amm_usdt_to_inj.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                })],
+            }],
+        },
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.amm_inj_to_usdt.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                })],
+            }],
+        },
+    ]
+}
+
+fn usdt_balance(app: &InjectiveTestApp, addr: &str) -> u128 {
+    let b = Bank::new(app)
+        .query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    u128::from_str(&b.amount).unwrap()
+}
+
+#[test]
+fn test_flash_route_happy_path() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+    // Borrow 1000 USDT @ 0.30% fee (= 3 USDT). Cycle: 1000 USDT -> 100 INJ -> 1100
+    // USDT. Repay 1003, surplus 97 USDT to the caller (min_profit 50 satisfied).
+    let pool_usdt_before = usdt_balance(&env.app, &env.flash_pool_addr);
+    let user_usdt_before = usdt_balance(&env.app, &env.user.address());
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000), // 1000 USDT
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000), // 50 USDT floor
+    };
+
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[], &env.user);
+    assert!(res.is_ok(), "flash route failed: {:?}", res.unwrap_err());
+
+    let response = res.unwrap();
+    let done = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "flash_route_complete")
+        })
+        .expect("missing flash_route_complete event");
+    assert_eq!(
+        done.attributes
+            .iter()
+            .find(|a| a.key == "profit")
+            .unwrap()
+            .value,
+        "97000000"
+    );
+    assert_eq!(
+        done.attributes
+            .iter()
+            .find(|a| a.key == "repaid")
+            .unwrap()
+            .value,
+        "1003000000"
+    );
+
+    // Caller pocketed exactly the 97 USDT surplus.
+    assert_eq!(
+        usdt_balance(&env.app, &env.user.address()) - user_usdt_before,
+        97_000_000
+    );
+    // Pool is net +3 USDT (the flash fee), proving principal+fee was repaid.
+    assert_eq!(
+        usdt_balance(&env.app, &env.flash_pool_addr) - pool_usdt_before,
+        3_000_000
+    );
+}
+
+#[test]
+fn test_flash_route_below_min_profit_reverts() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+    let pool_usdt_before = usdt_balance(&env.app, &env.flash_pool_addr);
+
+    // Same cycle (yields 97 surplus) but demand 200 USDT — the route can't clear
+    // the floor, so the whole transaction must revert (loan auto-unwound).
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(200_000_000), // unreachable
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("profit floor not met"),
+        "expected FlashProfitNotMet, got: {err}"
+    );
+    // Nothing moved — the borrow was atomically reverted.
+    assert_eq!(usdt_balance(&env.app, &env.flash_pool_addr), pool_usdt_before);
+}
+
+#[test]
+fn test_flash_route_cycle_through_flash_pool_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A cycle that swaps against the flash pool itself would deadlock on the pool's
+    // reentrancy lock; the aggregator must reject it up-front.
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.flash_pool_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    minimum_amount_out: Some(Uint128::zero()),
+                })],
+            }],
+        }],
+        min_profit: Uint128::zero(),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("flash-source pool"),
+        "expected FlashPoolInCycle, got: {err}"
+    );
+}
+
+#[test]
+fn test_flash_callback_without_pending_flash_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A direct FlashCallback (no in-flight FlashRoute) must be rejected before any
+    // route runs, so a forged callback can't spend idle contract balances.
+    let msg = ExecuteMsg::FlashCallback {
+        fee0: Uint128::zero(),
+        fee1: Uint128::zero(),
+        data: cosmwasm_std::Binary::default(),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no flash in flight"),
+        "expected NoPendingFlash, got: {err}"
+    );
 }

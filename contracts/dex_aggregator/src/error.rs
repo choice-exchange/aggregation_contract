@@ -77,4 +77,20 @@ pub enum ContractError {
 
     #[error("Denom '{denom}' is not part of orderbook market {market_id}")]
     InvalidOrderbookDenom { denom: String, market_id: String },
+
+    // --- Flash-arb (FlashRoute) Errors ---
+    #[error("FlashCallback received with no flash in flight (forged or stray call)")]
+    NoPendingFlash {},
+
+    #[error("Flash-arb cycle may not route through the flash-source pool")]
+    FlashPoolInCycle {},
+
+    #[error("flash_asset is neither token0 nor token1 of the flash pool")]
+    FlashAssetNotInPool {},
+
+    #[error("Flash-arb profit floor not met. Required (principal+fee+min_profit): {required}, produced: {actual}")]
+    FlashProfitNotMet {
+        required: Uint128,
+        actual: Uint128,
+    },
 }

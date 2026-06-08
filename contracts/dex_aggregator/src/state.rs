@@ -29,12 +29,44 @@ pub struct PendingPathOp {
     pub amount: Uint128,
 }
 
+/// Repayment obligation attached to a flash-arb route. Present only on routes
+/// kicked off by `FlashRoute`; when set, the final stage repays `repay_amount`
+/// (principal + flash fee) of `asset` to `pool` and forwards the surplus to the
+/// route's `sender`, instead of sending the whole output to `sender`.
+#[cw_serde]
+pub struct FlashRepayment {
+    pub pool: Addr,
+    pub asset: amm::AssetInfo,
+    pub repay_amount: Uint128,
+    pub min_profit: Uint128,
+}
+
 #[cw_serde]
 pub struct RoutePlan {
     pub sender: Addr,
     pub minimum_receive: Uint128,
     pub stages: Vec<Stage>,
+    /// `Some` for flash-arb cycles, `None` for ordinary user swaps.
+    pub flash_repayment: Option<FlashRepayment>,
 }
+
+/// Transient context for an in-flight flash, saved by `execute_flash_route` and
+/// consumed by `execute_flash_callback`. Its presence is the authorization gate
+/// for `FlashCallback` (a callback with no pending context is forged). Only one
+/// flash is ever in flight, since the whole flow is a single atomic transaction.
+#[cw_serde]
+pub struct PendingFlashCtx {
+    pub flash_pool: Addr,
+    pub flash_asset: amm::AssetInfo,
+    /// Whether `flash_asset` is the pool's token0 (selects `fee0` vs `fee1`).
+    pub flash_is_token0: bool,
+    pub principal: Uint128,
+    pub stages: Vec<Stage>,
+    pub min_profit: Uint128,
+    pub initiator: Addr,
+}
+
+pub const PENDING_FLASH: Item<PendingFlashCtx> = Item::new("pending_flash");
 
 #[cw_serde]
 pub struct ExecutionState {

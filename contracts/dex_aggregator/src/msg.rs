@@ -1,7 +1,7 @@
 #[allow(unused_imports)]
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
+use cosmwasm_std::{Addr, Binary, Coin, Decimal, Uint128};
 use crate::cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::MarketId;
 use injective_math::FPDecimal;
@@ -124,6 +124,21 @@ pub mod clmm {
             minimum_amount_out: Uint128,
             recipient: Option<String>,
             deadline: Option<u64>,
+        },
+    }
+
+    /// Flash-loan entry point on the CLMM pool. Wire-compatible with
+    /// `choice_clmm_common::pool::ExecuteMsg::Flash` (variant tag `flash`). The
+    /// pool lends `amount0`/`amount1` of token0/token1 to `recipient` and then
+    /// calls `recipient` back with `FlashCallbackMsg::FlashCallback`. `data` is
+    /// echoed into that callback unchanged.
+    #[cw_serde]
+    pub enum ClmmPoolFlashMsg {
+        Flash {
+            recipient: String,
+            amount0: Uint128,
+            amount1: Uint128,
+            data: Binary,
         },
     }
 
@@ -299,6 +314,27 @@ pub enum ExecuteMsg {
     /// Removes a tax token from the registry.
     DeregisterTaxToken {
         contract_addr: String,
+    },
+    /// Capital-free CLMM flash-arb. Borrows `flash_amount` of `flash_asset` from
+    /// `flash_pool`, runs the `stages` cycle (must end in `flash_asset` and must
+    /// not route through `flash_pool`), repays principal + flash fee, and forwards
+    /// the surplus to the caller. The cycle reverts atomically unless the surplus
+    /// covers `min_profit`.
+    FlashRoute {
+        flash_pool: String,
+        flash_asset: amm::AssetInfo,
+        flash_amount: Uint128,
+        stages: Vec<Stage>,
+        min_profit: Uint128,
+    },
+    /// Borrower callback invoked by the CLMM pool mid-flash. Field layout matches
+    /// `choice_clmm_common::pool::FlashCallbackMsg::FlashCallback` so the pool's
+    /// serialized callback decodes straight into this variant. Only valid while a
+    /// `FlashRoute`-initiated flash is in flight (gated by `PENDING_FLASH`).
+    FlashCallback {
+        fee0: Uint128,
+        fee1: Uint128,
+        data: Binary,
     },
 }
 

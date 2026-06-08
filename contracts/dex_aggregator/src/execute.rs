@@ -1,6 +1,6 @@
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo, Response,
-    StdError, StdResult, Uint128, WasmMsg,
+    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo,
+    Response, StdError, StdResult, Uint128, WasmMsg,
 };
 use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -10,7 +10,8 @@ use crate::msg::{amm, clmm, Operation, Stage};
 use crate::orderbook_exec;
 use crate::reply::proceed_to_next_step;
 use crate::state::{
-    Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
+    Awaiting, ExecutionState, FlashRepayment, PendingFlashCtx, RoutePlan, CONFIG, FEE_MAP,
+    PENDING_FLASH, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
 };
 
 pub fn update_admin(
@@ -64,6 +65,7 @@ pub fn execute_aggregate_swaps_internal(
         sender: initiator.clone(),
         minimum_receive,
         stages,
+        flash_repayment: None,
     };
 
     let mut initial_exec_state = ExecutionState {
@@ -77,6 +79,153 @@ pub fn execute_aggregate_swaps_internal(
     };
 
     proceed_to_next_step(&mut deps, env, &mut initial_exec_state, reply_id)
+}
+
+/// Entry point for a capital-free CLMM flash-arb. Borrows `flash_amount` of
+/// `flash_asset` from `flash_pool` and fires the pool's `Flash {}`; the rest of
+/// the cycle runs inside the pool's `FlashCallback` (see [`execute_flash_callback`]).
+#[allow(clippy::too_many_arguments)]
+pub fn execute_flash_route(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    info: MessageInfo,
+    flash_pool: String,
+    flash_asset: amm::AssetInfo,
+    flash_amount: Uint128,
+    stages: Vec<Stage>,
+    min_profit: Uint128,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if flash_amount.is_zero() {
+        return Err(ContractError::ZeroAmount {});
+    }
+    if stages.is_empty() {
+        return Err(ContractError::NoStages {});
+    }
+    let first_stage = stages.first().unwrap();
+    let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
+    if total_percentage != 100 {
+        return Err(ContractError::InvalidPercentageSum {});
+    }
+
+    let flash_pool_addr = deps.api.addr_validate(&flash_pool)?;
+
+    // The pool holds its reentrancy lock for the whole callback, so any swap
+    // against `flash_pool` inside the cycle would revert the entire transaction.
+    // Reject it up-front. Only CLMM hops can hit the flash pool (AMM/orderbook
+    // venues have distinct addresses).
+    for stage in &stages {
+        for split in &stage.splits {
+            for op in &split.path {
+                if let Operation::ClmmSwap(o) = op {
+                    if deps.api.addr_validate(&o.pool_address)? == flash_pool_addr {
+                        return Err(ContractError::FlashPoolInCycle {});
+                    }
+                }
+            }
+        }
+    }
+
+    // Map the borrowed asset onto the pool's token0/token1 to set the loan amounts.
+    let config: clmm::ConfigResponse = deps
+        .querier
+        .query_wasm_smart(&flash_pool_addr, &clmm::ClmmPoolQueryMsg::GetConfig {})?;
+    let flash_is_token0 = if flash_asset == config.token0 {
+        true
+    } else if flash_asset == config.token1 {
+        false
+    } else {
+        return Err(ContractError::FlashAssetNotInPool {});
+    };
+    let (amount0, amount1) = if flash_is_token0 {
+        (flash_amount, Uint128::zero())
+    } else {
+        (Uint128::zero(), flash_amount)
+    };
+
+    PENDING_FLASH.save(
+        deps.storage,
+        &PendingFlashCtx {
+            flash_pool: flash_pool_addr.clone(),
+            flash_asset,
+            flash_is_token0,
+            principal: flash_amount,
+            stages,
+            min_profit,
+            initiator: info.sender,
+        },
+    )?;
+
+    // `data` is unused — both ends of the callback read `PENDING_FLASH`.
+    let flash_msg = CosmosMsg::Wasm(WasmMsg::Execute {
+        contract_addr: flash_pool_addr.to_string(),
+        msg: to_json_binary(&clmm::ClmmPoolFlashMsg::Flash {
+            recipient: env.contract.address.to_string(),
+            amount0,
+            amount1,
+            data: Binary::default(),
+        })?,
+        funds: vec![],
+    });
+
+    Ok(Response::new()
+        .add_message(flash_msg)
+        .add_attribute("action", "flash_route")
+        .add_attribute("flash_pool", flash_pool_addr)
+        .add_attribute("flash_amount", flash_amount.to_string()))
+}
+
+/// Borrower callback the CLMM pool invokes mid-flash. The loan is already on our
+/// balance; we run the arb cycle through the normal route engine, then the final
+/// stage repays the pool and forwards the surplus (see `finalize_route`).
+pub fn execute_flash_callback(
+    mut deps: DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    info: MessageInfo,
+    fee0: Uint128,
+    fee1: Uint128,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    // No pending context ⇒ this is not a flash we initiated. Reject before any
+    // route runs, so forged callbacks can never spend idle contract balances.
+    let ctx = PENDING_FLASH
+        .may_load(deps.storage)?
+        .ok_or(ContractError::NoPendingFlash {})?;
+    PENDING_FLASH.remove(deps.storage);
+
+    if info.sender != ctx.flash_pool {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let fee = if ctx.flash_is_token0 { fee0 } else { fee1 };
+    let repay_amount = ctx.principal.checked_add(fee).map_err(StdError::from)?;
+
+    let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> { Ok(id + 1) })?;
+
+    let plan = RoutePlan {
+        sender: ctx.initiator,
+        minimum_receive: Uint128::zero(),
+        stages: ctx.stages,
+        flash_repayment: Some(FlashRepayment {
+            pool: ctx.flash_pool,
+            asset: ctx.flash_asset.clone(),
+            repay_amount,
+            min_profit: ctx.min_profit,
+        }),
+    };
+
+    let mut exec_state = ExecutionState {
+        plan,
+        awaiting: Awaiting::Swaps,
+        current_stage_index: 0,
+        replies_expected: 0,
+        accumulated_assets: vec![amm::Asset {
+            info: ctx.flash_asset,
+            amount: ctx.principal,
+        }],
+        pending_swaps: vec![],
+        pending_path_op: None,
+    };
+
+    proceed_to_next_step(&mut deps, env, &mut exec_state, reply_id)
 }
 
 pub fn create_swap_cosmos_msg(

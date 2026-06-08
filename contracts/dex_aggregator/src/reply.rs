@@ -319,6 +319,77 @@ fn create_send_msg(
     }
 }
 
+/// Terminal disposition of a completed route's output. For an ordinary swap the
+/// whole `total_amount` goes to the route's sender (gated by `minimum_receive`).
+/// For a flash-arb cycle it repays `principal + fee` to the flash pool by direct
+/// transfer and forwards the surplus to the initiator (gated by `min_profit`).
+fn finalize_route(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
+    reply_id: u64,
+    exec_state: &ExecutionState,
+    total_amount: Uint128,
+    asset_info: &amm::AssetInfo,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if let Some(flash) = &exec_state.plan.flash_repayment {
+        let required = flash
+            .repay_amount
+            .checked_add(flash.min_profit)
+            .map_err(StdError::from)?;
+        if total_amount < required {
+            return Err(ContractError::FlashProfitNotMet {
+                required,
+                actual: total_amount,
+            });
+        }
+        let surplus = total_amount
+            .checked_sub(flash.repay_amount)
+            .map_err(StdError::from)?;
+
+        // Repay the pool by direct transfer. `create_send_msg` uses Bank `Send` /
+        // CW20 `Transfer` (never CW20 `Send`), which is exactly what the pool's
+        // reentrancy-locked flash requires.
+        let mut response = Response::new().add_message(create_send_msg(
+            deps,
+            &flash.pool,
+            asset_info,
+            flash.repay_amount,
+        )?);
+        if !surplus.is_zero() {
+            response = response.add_message(create_send_msg(
+                deps,
+                &exec_state.plan.sender,
+                asset_info,
+                surplus,
+            )?);
+        }
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
+        Ok(response
+            .add_attribute("action", "flash_route_complete")
+            .add_attribute("repaid", flash.repay_amount.to_string())
+            .add_attribute("profit", surplus.to_string()))
+    } else {
+        if total_amount < exec_state.plan.minimum_receive {
+            return Err(ContractError::MinimumReceiveNotMet {
+                minimum_receive: exec_state.plan.minimum_receive,
+                actual_receive: total_amount,
+            });
+        }
+        let mut response = Response::new();
+        if !total_amount.is_zero() {
+            response = response.add_message(create_send_msg(
+                deps,
+                &exec_state.plan.sender,
+                asset_info,
+                total_amount,
+            )?);
+        }
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
+        Ok(response
+            .add_attribute("action", "aggregate_swap_complete")
+            .add_attribute("final_received", total_amount.to_string()))
+    }
+}
+
 fn handle_final_stage(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
@@ -326,6 +397,18 @@ fn handle_final_stage(
     exec_state: &mut ExecutionState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if exec_state.accumulated_assets.is_empty() {
+        if let Some(flash) = &exec_state.plan.flash_repayment {
+            // The cycle produced nothing, so the loan can't be repaid. (The pool's
+            // `reply_flash` would revert the tx anyway; surface a precise error.)
+            let required = flash
+                .repay_amount
+                .checked_add(flash.min_profit)
+                .map_err(StdError::from)?;
+            return Err(ContractError::FlashProfitNotMet {
+                required,
+                actual: Uint128::zero(),
+            });
+        }
         if !exec_state.plan.minimum_receive.is_zero() {
             return Err(ContractError::MinimumReceiveNotMet {
                 minimum_receive: exec_state.plan.minimum_receive,
@@ -336,8 +419,14 @@ fn handle_final_stage(
         return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty"));
     }
 
-    // The target asset for normalization is the type of the first asset in the final list.
-    let target_asset_info = exec_state.accumulated_assets[0].info.clone();
+    // Normalization target: the borrowed asset for a flash cycle (so the route
+    // closes in the token it must repay), otherwise the first accumulated asset.
+    let target_asset_info = exec_state
+        .plan
+        .flash_repayment
+        .as_ref()
+        .map(|f| f.asset.clone())
+        .unwrap_or_else(|| exec_state.accumulated_assets[0].info.clone());
 
     let mut conversion_submsgs = Vec::with_capacity(exec_state.accumulated_assets.len());
     let mut ready_amount = Uint128::zero();
@@ -353,33 +442,8 @@ fn handle_final_stage(
     }
 
     if conversion_submsgs.is_empty() {
-        // SCENARIO A: All assets were already the same type. We are done.
-        let total_final_amount = ready_amount;
-        // Check against minimum_receive from the immutable plan
-        if total_final_amount < exec_state.plan.minimum_receive {
-            return Err(ContractError::MinimumReceiveNotMet {
-                minimum_receive: exec_state.plan.minimum_receive,
-                actual_receive: total_final_amount,
-            });
-        }
-
-        let mut response = Response::new();
-        if !total_final_amount.is_zero() {
-            // Use the sender address from the immutable plan
-            let send_msg = create_send_msg(
-                deps,
-                &exec_state.plan.sender,
-                &target_asset_info,
-                total_final_amount,
-            )?;
-            response = response.add_message(send_msg);
-        }
-
-        ACTIVE_ROUTES.remove(deps.storage, reply_id);
-
-        Ok(response
-            .add_attribute("action", "aggregate_swap_complete")
-            .add_attribute("final_received", total_final_amount.to_string()))
+        // SCENARIO A: All assets were already the target type. We are done.
+        finalize_route(deps, reply_id, exec_state, ready_amount, &target_asset_info)
     } else {
         // SCENARIO B: Conversions are needed. Set up the exec_state for the final reply.
         exec_state.awaiting = Awaiting::FinalConversions;
@@ -398,7 +462,7 @@ fn handle_final_stage(
 }
 
 fn handle_final_conversion_reply(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    mut deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
@@ -431,29 +495,13 @@ fn handle_final_conversion_reply(
     let total_final_amount = running_total_asset.amount;
     let final_asset_info = running_total_asset.info.clone();
 
-    if total_final_amount < exec_state.plan.minimum_receive {
-        return Err(ContractError::MinimumReceiveNotMet {
-            minimum_receive: exec_state.plan.minimum_receive,
-            actual_receive: total_final_amount,
-        });
-    }
-
-    let mut response = Response::new();
-    if !total_final_amount.is_zero() {
-        let send_msg = create_send_msg(
-            &deps,
-            &exec_state.plan.sender,
-            &final_asset_info,
-            total_final_amount,
-        )?;
-        response = response.add_message(send_msg);
-    }
-
-    ACTIVE_ROUTES.remove(deps.storage, reply_id);
-
-    Ok(response
-        .add_attribute("action", "aggregate_swap_complete")
-        .add_attribute("final_received", total_final_amount.to_string()))
+    finalize_route(
+        &mut deps,
+        reply_id,
+        exec_state,
+        total_final_amount,
+        &final_asset_info,
+    )
 }
 
 fn handle_conversion_reply(

@@ -131,6 +131,25 @@ pub fn execute(
         ExecuteMsg::DeregisterTaxToken { contract_addr } => {
             crate::execute::deregister_tax_token(deps, info, contract_addr)
         }
+        ExecuteMsg::FlashRoute {
+            flash_pool,
+            flash_asset,
+            flash_amount,
+            stages,
+            min_profit,
+        } => execute::execute_flash_route(
+            deps,
+            env,
+            info,
+            flash_pool,
+            flash_asset,
+            flash_amount,
+            stages,
+            min_profit,
+        ),
+        ExecuteMsg::FlashCallback { fee0, fee1, data: _ } => {
+            execute::execute_flash_callback(deps, env, info, fee0, fee1)
+        }
     }
 }
 

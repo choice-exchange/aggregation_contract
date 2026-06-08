@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "contracts/dex_aggregator",
     "contracts/mock_swap",
+    "contracts/mock_clmm_flash",
 ]

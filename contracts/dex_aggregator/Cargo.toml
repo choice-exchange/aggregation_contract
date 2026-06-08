@@ -44,6 +44,7 @@ hex               = { version = "0.4.3" }
 [dev-dependencies]
 injective-test-tube = { version = "1.19.0" }
 mock_swap = { path = "../mock_swap" }
+mock_clmm_flash = { path = "../mock_clmm_flash" }
 
 [[test]]
 name = "integration"

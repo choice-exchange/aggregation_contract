@@ -1,9 +1,9 @@
+use crate::cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
     entry_point, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps,
     DepsMut, Env, Event, MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
-use crate::cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cw_storage_plus::Item;
 use injective_cosmwasm::InjectiveQueryWrapper;
 use injective_math::FPDecimal;
@@ -345,9 +345,7 @@ pub fn query(
             let config = CONFIG.load(deps.storage)?;
 
             if token_in != config.input_asset_info {
-                return Err(StdError::msg(
-                    "Invalid token_in for this mock contract",
-                ));
+                return Err(StdError::msg("Invalid token_in for this mock contract"));
             }
 
             let offer_decimal = Decimal::from_atomics(amount_in, config.input_decimals as u32)

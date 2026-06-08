@@ -28,7 +28,6 @@ injective-math      = { version = "0.3.6" }
 
 schemars           = { version = "0.8.22" }
 serde              = { version = "1.0.219", default-features = false, features = ["derive"] }
-serde-json-wasm    = { version = "1.0.0" }
 serde_json         = { version = "1.0.140" }
 serde_repr         = { version = "0.1.20" }
 hex                = { version = "0.4.3" }

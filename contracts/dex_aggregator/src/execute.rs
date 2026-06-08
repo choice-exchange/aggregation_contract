@@ -1,8 +1,8 @@
+use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use cosmwasm_std::{
     to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo,
     Response, StdError, StdResult, Uint128, WasmMsg,
 };
-use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
@@ -228,13 +228,17 @@ pub fn execute_flash_callback(
     proceed_to_next_step(&mut deps, env, &mut exec_state, reply_id)
 }
 
+/// Builds the dispatch message for a single hop. Returns `Ok(None)` when the hop
+/// provably produces nothing (a CLMM estimation-mode `Quote` of zero), so the
+/// caller can finish the split as a graceful zero-value path instead of emitting a
+/// submessage. Every other outcome returns `Ok(Some(msg))`.
 pub fn create_swap_cosmos_msg(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     operation: &Operation,
     offer_asset_info: &amm::AssetInfo,
     amount: Uint128,
     env: &Env,
-) -> Result<CosmosMsg<InjectiveMsgWrapper>, ContractError> {
+) -> Result<Option<CosmosMsg<InjectiveMsgWrapper>>, ContractError> {
     let recipient = env.contract.address.to_string();
 
     let cosmos_msg = match operation {
@@ -346,12 +350,10 @@ pub fn create_swap_cosmos_msg(
                         .querier
                         .query_wasm_smart(&clmm_op.pool_address, &quote_query)?;
 
+                    // The pool can't fill this hop. Signal a zero-value path to the
+                    // caller (no submessage); a self-call no-op would only revert.
                     if quote_response.amount_out.is_zero() {
-                        return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
-                            contract_addr: env.contract.address.to_string(),
-                            msg: to_json_binary(&{})?,
-                            funds: vec![],
-                        }));
+                        return Ok(None);
                     }
 
                     quote_response.amount_out.multiply_ratio(995u128, 1000u128)
@@ -409,7 +411,7 @@ pub fn create_swap_cosmos_msg(
         }
     };
 
-    Ok(cosmos_msg)
+    Ok(Some(cosmos_msg))
 }
 
 /// Admin-only. Sets or updates the fee for a given pool address.
@@ -491,10 +493,14 @@ pub fn emergency_withdraw(
         return Err(ContractError::Unauthorized {});
     }
 
+    let asset_label = match &asset_info {
+        amm::AssetInfo::NativeToken { denom } => denom.clone(),
+        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+    };
     let mut response = Response::new()
         .add_attribute("action", "emergency_withdraw")
         .add_attribute("recipient", info.sender.to_string())
-        .add_attribute("asset", format!("{:?}", asset_info));
+        .add_attribute("asset", asset_label);
 
     let (amount_to_withdraw, send_msg) = match asset_info {
         amm::AssetInfo::NativeToken { denom } => {

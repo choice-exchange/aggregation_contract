@@ -168,7 +168,7 @@ fn simulate_single_operation(
             let est = orderbook_exec::estimate_single_swap_execution(
                 &deps,
                 &env.contract.address,
-                &op.market_id,
+                &market,
                 FPCoin {
                     amount: offer_asset.amount.into(),
                     denom: source_denom,
@@ -203,10 +203,7 @@ fn simulate_single_operation(
             let config: clmm::ConfigResponse = deps
                 .querier
                 .query_wasm_smart(&op.pool_address, &clmm::ClmmPoolQueryMsg::GetConfig {})?;
-            let ask_info = counter_asset(
-                &[config.token0, config.token1],
-                &offer_asset.info,
-            )?;
+            let ask_info = counter_asset(&[config.token0, config.token1], &offer_asset.info)?;
 
             Ok(amm::Asset {
                 info: ask_info,
@@ -218,10 +215,7 @@ fn simulate_single_operation(
 
 /// Given a pool's two assets and the offer side, return the *other* side (the
 /// asset the hop produces). Errors if the offer isn't one of the pair.
-fn counter_asset(
-    pair: &[amm::AssetInfo; 2],
-    offer: &amm::AssetInfo,
-) -> StdResult<amm::AssetInfo> {
+fn counter_asset(pair: &[amm::AssetInfo; 2], offer: &amm::AssetInfo) -> StdResult<amm::AssetInfo> {
     if *offer == pair[0] {
         Ok(pair[1].clone())
     } else if *offer == pair[1] {
@@ -304,7 +298,7 @@ mod tests {
     use crate::msg::{AmmSwapOp, QueryMsg, Split, Stage};
     use amm::AssetInfo;
     use cosmwasm_std::testing::{mock_env, MockApi, MockQuerier, MockStorage};
-    use cosmwasm_std::{from_json, ContractResult, OwnedDeps, Decimal, SystemResult};
+    use cosmwasm_std::{from_json, ContractResult, Decimal, OwnedDeps, SystemResult};
     use std::marker::PhantomData;
     use std::str::FromStr;
 
@@ -313,7 +307,8 @@ mod tests {
 
     /// Injective-typed mock deps (the query path now needs `Deps<InjectiveQueryWrapper>`).
     /// Orderbook isn't exercised here, so the default wasm-only `MockQuerier` suffices.
-    fn inj_mock_deps() -> OwnedDeps<MockStorage, MockApi, MockQuerier<InjectiveQueryWrapper>, InjectiveQueryWrapper>
+    fn inj_mock_deps(
+    ) -> OwnedDeps<MockStorage, MockApi, MockQuerier<InjectiveQueryWrapper>, InjectiveQueryWrapper>
     {
         OwnedDeps {
             storage: MockStorage::default(),

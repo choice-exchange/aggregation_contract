@@ -198,7 +198,8 @@ fn register_min_notionals(app: &InjectiveTestApp, funder: &SigningAccount, denom
         .submit_proposal_v1beta1(
             MsgSubmitProposal {
                 content: Some(Any {
-                    type_url: "/injective.exchange.v2.BatchExchangeModificationProposal".to_string(),
+                    type_url: "/injective.exchange.v2.BatchExchangeModificationProposal"
+                        .to_string(),
                     value: buf,
                 }),
                 initial_deposit: vec![ProtoCoin {
@@ -239,7 +240,10 @@ fn register_min_notionals(app: &InjectiveTestApp, funder: &SigningAccount, denom
         .proposal
         .unwrap()
         .status;
-    assert_eq!(status, 3, "min-notional proposal did not pass (status {status})");
+    assert_eq!(
+        status, 3,
+        "min-notional proposal did not pass (status {status})"
+    );
     app.increase_time(200);
 }
 
@@ -718,6 +722,76 @@ fn test_simulate_route_orderbook_buy_needs_no_buffer() {
 }
 
 #[test]
+fn test_orderbook_buy_crosses_multiple_price_levels() {
+    // Regression for the buy-side margin fix (C2): a BUY whose fill crosses more
+    // than one ask level must NOT revert. The order quantity is sized from the worst
+    // (last) consumed price, so the chain's atomic-order margin reservation
+    // (worst * qty * (1+fee)) stays within the `input` the contract holds.
+    //
+    // Book asks: 10/11/12 USDT @ 1000 INJ each. 14,000 USDT consumes all of level 10
+    // (10,000 USDT -> 1000 INJ) and part of level 11 -> worst price 11. Pre-fix this
+    // errored with "Swap amount too high" because the quantity was sized from the
+    // average price, making required margin (worst/avg)*input exceed the held input.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(14_000_000_000u128, "usdt")], // 14,000 USDT
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "multi-level orderbook buy should not revert: {:?}",
+        res.unwrap_err()
+    );
+    let response = res.unwrap();
+
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find aggregate_swap_complete event");
+    let final_received: u128 = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap()
+        .value
+        .parse()
+        .unwrap();
+
+    // available ~= 14000/(1+fee) ~= 13965 USDT; qty = available/worst(11) ~= 1269.5 INJ.
+    assert!(
+        final_received > 1_255_000_000_000_000_000_000
+            && final_received < 1_285_000_000_000_000_000_000,
+        "expected ~1269 INJ from a two-level buy, got {final_received}"
+    );
+}
+
+#[test]
 fn test_multi_stage_aggregate_swap_success() {
     let env = setup();
     let wasm = Wasm::new(&env.app);
@@ -1049,7 +1123,6 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         .data
         .address;
 
-
     let mock_cw20_shroom_to_usdt_amm = wasm
         .instantiate(
             mock_swap_code_id,
@@ -1145,10 +1218,24 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     register_min_notionals(&app, &admin, &["inj", "usdt", &native_shroom_denom]);
     let exchange = Exchange::new(&app);
     let market_inj_usdt = launch_spot_market(&exchange, &admin, "INJ/USDT", "inj", "usdt", 18, 6);
-    let market_inj_shroom =
-        launch_spot_market(&exchange, &admin, "INJ/SHROOM", "inj", &native_shroom_denom, 18, 6);
-    let market_shroom_usdt =
-        launch_spot_market(&exchange, &admin, "USDT/SHROOM", "usdt", &native_shroom_denom, 6, 6);
+    let market_inj_shroom = launch_spot_market(
+        &exchange,
+        &admin,
+        "INJ/SHROOM",
+        "inj",
+        &native_shroom_denom,
+        18,
+        6,
+    );
+    let market_shroom_usdt = launch_spot_market(
+        &exchange,
+        &admin,
+        "USDT/SHROOM",
+        "usdt",
+        &native_shroom_denom,
+        6,
+        6,
+    );
 
     // 5. Fund a maker and seed each book.
     let maker = app
@@ -1239,11 +1326,11 @@ fn test_full_normalization_route() {
                     Split {
                         percent: 50,
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
-                        target_denom: setup.native_shroom_denom.clone(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                            market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                            target_denom: setup.native_shroom_denom.clone(),
+                            quantity: None,
+                            worst_price: None,
+                        })],
                     },
                     Split {
                         percent: 50,
@@ -1338,11 +1425,11 @@ fn test_multi_stage_with_final_normalization() {
                     Split {
                         percent: 90, // 90% to Native SHROOM
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
-                        target_denom: setup.native_shroom_denom.clone(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                            market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                            target_denom: setup.native_shroom_denom.clone(),
+                            quantity: None,
+                            worst_price: None,
+                        })],
                     },
                 ],
             },
@@ -1770,11 +1857,11 @@ fn test_mixed_input_unified_output_reconciliation() {
                 // 60% requires Native SHROOM
                 percent: 60,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
-                        target_denom: "usdt".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
             },
             Split {
                 // 40% requires CW20 SHROOM
@@ -1875,11 +1962,11 @@ fn test_cw20_input_with_initial_reconciliation() {
                 // 70% requires Native SHROOM
                 percent: 70,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
-                        target_denom: "usdt".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
             },
             Split {
                 // 30% requires CW20 SHROOM
@@ -1976,11 +2063,11 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 // 60% of INJ goes to create Native SHROOM
                 percent: 60,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
-                        target_denom: setup.native_shroom_denom.clone(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                    market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                    target_denom: setup.native_shroom_denom.clone(),
+                    quantity: None,
+                    worst_price: None,
+                })],
             },
             Split {
                 // 40% of INJ goes to create CW20 SHROOM
@@ -2000,11 +2087,11 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 // 25% of total value requires Native SHROOM
                 percent: 25,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
-                        target_denom: "usdt".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
             },
             Split {
                 // 75% of total value requires CW20 SHROOM
@@ -2350,11 +2437,11 @@ fn test_stage_with_single_hundred_percent_split() {
         splits: vec![Split {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
-                        target_denom: "inj".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                target_denom: "inj".to_string(),
+                quantity: None,
+                worst_price: None,
+            })],
         }],
     };
 
@@ -2431,11 +2518,11 @@ fn test_intermediate_swap_failure_reverts_transaction() {
         splits: vec![Split {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
-                        target_denom: "inj".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    })],
+                market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                target_denom: "inj".to_string(),
+                quantity: None,
+                worst_price: None,
+            })],
         }],
     };
 
@@ -3246,18 +3333,18 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         }),
         // Hop 2: Native SHROOM -> USDT (INPUT MISMATCH HERE)
         Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
-                        target_denom: "usdt".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    }),
+            market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+            target_denom: "usdt".to_string(),
+            quantity: None,
+            worst_price: None,
+        }),
         // Hop 3: USDT -> INJ
         Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(setup.market_inj_usdt.clone()).unwrap(),
-                        target_denom: "inj".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    }),
+            market_id: MarketId::new(setup.market_inj_usdt.clone()).unwrap(),
+            target_denom: "inj".to_string(),
+            quantity: None,
+            worst_price: None,
+        }),
     ];
 
     let msg = ExecuteMsg::ExecuteRoute {
@@ -3579,17 +3666,17 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
 
     let path = vec![
         Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
-                        target_denom: "usdt".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    }),
+            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+            target_denom: "usdt".to_string(),
+            quantity: None,
+            worst_price: None,
+        }),
         Operation::OrderbookSwap(OrderbookSwapOp {
-                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
-                        target_denom: "inj".to_string(),
-                        quantity: None,
-                        worst_price: None,
-                    }),
+            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+            target_denom: "inj".to_string(),
+            quantity: None,
+            worst_price: None,
+        }),
     ];
 
     let msg = ExecuteMsg::ExecuteRoute {
@@ -4282,7 +4369,10 @@ fn test_flash_route_below_min_profit_reverts() {
         "expected FlashProfitNotMet, got: {err}"
     );
     // Nothing moved — the borrow was atomically reverted.
-    assert_eq!(usdt_balance(&env.app, &env.flash_pool_addr), pool_usdt_before);
+    assert_eq!(
+        usdt_balance(&env.app, &env.flash_pool_addr),
+        pool_usdt_before
+    );
 }
 
 #[test]

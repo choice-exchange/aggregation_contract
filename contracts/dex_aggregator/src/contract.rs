@@ -1,8 +1,8 @@
+use crate::cw20::Cw20ReceiveMsg;
 use cosmwasm_std::{
     entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdError,
     StdResult, Uint128,
 };
-use crate::cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
@@ -147,9 +147,11 @@ pub fn execute(
             stages,
             min_profit,
         ),
-        ExecuteMsg::FlashCallback { fee0, fee1, data: _ } => {
-            execute::execute_flash_callback(deps, env, info, fee0, fee1)
-        }
+        ExecuteMsg::FlashCallback {
+            fee0,
+            fee1,
+            data: _,
+        } => execute::execute_flash_callback(deps, env, info, fee0, fee1),
     }
 }
 

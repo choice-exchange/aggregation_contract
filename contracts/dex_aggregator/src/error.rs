@@ -89,8 +89,5 @@ pub enum ContractError {
     FlashAssetNotInPool {},
 
     #[error("Flash-arb profit floor not met. Required (principal+fee+min_profit): {required}, produced: {actual}")]
-    FlashProfitNotMet {
-        required: Uint128,
-        actual: Uint128,
-    },
+    FlashProfitNotMet { required: Uint128, actual: Uint128 },
 }

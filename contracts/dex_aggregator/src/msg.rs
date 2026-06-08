@@ -1,8 +1,8 @@
+use crate::cw20::Cw20ReceiveMsg;
 #[allow(unused_imports)]
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Binary, Coin, Decimal, Uint128};
-use crate::cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::MarketId;
 use injective_math::FPDecimal;
 
@@ -64,7 +64,9 @@ pub mod amm {
 
     #[cw_serde]
     pub enum QueryMsg {
-        Simulation { offer_asset: Asset },
+        Simulation {
+            offer_asset: Asset,
+        },
         /// Pool pair info. Used by `SimulateRoute` to derive a hop's output asset
         /// (the pair side that isn't the offer) without an explicit `ask_asset_info`
         /// on the op. We only model `asset_infos`; serde drops the pair's other

@@ -1,8 +1,8 @@
+use crate::cw20::Cw20ExecuteMsg;
 use cosmwasm_std::{
     to_json_binary, Addr, Coin, CosmosMsg, Deps, DepsMut, Env, Reply, Response, StdError, SubMsg,
     Uint128, WasmMsg,
 };
-use crate::cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
@@ -44,6 +44,28 @@ pub fn handle_reply(
                 msg.id
             )))),
         }
+    }
+}
+
+/// Finish an in-flight split that produced nothing (a zero fill, an IOC no-fill,
+/// or a hop whose dispatch resolved to "no message"). Drops the path's pending
+/// reply: if it was the last one in the stage, advance to the next step; otherwise
+/// keep accumulating the remaining splits.
+fn complete_zero_value_path(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    exec_state: &mut ExecutionState,
+    master_reply_id: u64,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    exec_state.replies_expected -= 1;
+    if exec_state.replies_expected == 0 {
+        exec_state.current_stage_index += 1;
+        proceed_to_next_step(deps, env, exec_state, master_reply_id)
+    } else {
+        ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
+        Ok(Response::new()
+            .add_attribute("action", "accumulating_path_outputs")
+            .add_attribute("info", "zero_value_path_completed"))
     }
 }
 
@@ -142,16 +164,7 @@ fn handle_swap_reply(
     // A zero fill (no liquidity, IOC no-fill, or a zero-value path) ends this path
     // without contributing an asset.
     if received_amount.is_zero() {
-        exec_state.replies_expected -= 1;
-        if exec_state.replies_expected == 0 {
-            exec_state.current_stage_index += 1;
-            return proceed_to_next_step(&mut deps, env, exec_state, master_reply_id);
-        } else {
-            ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
-            return Ok(Response::new()
-                .add_attribute("action", "accumulating_path_outputs")
-                .add_attribute("info", "zero_value_path_completed"));
-        }
+        return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id);
     }
 
     let received_asset_info = get_operation_output(deps.api, replied_op, &result.events)?;
@@ -186,14 +199,19 @@ fn handle_swap_reply(
                 .add_attribute("action", "performing_path_conversion"));
         }
 
-        // Create the message for the next step.
-        let next_msg = create_swap_cosmos_msg(
+        // Create the message for the next step. `None` => the next hop provably
+        // yields nothing (e.g. a CLMM quote of zero), so this path ends here as a
+        // zero-value path rather than reverting.
+        let next_msg = match create_swap_cosmos_msg(
             &mut deps,
             next_op,
             &offer_asset_for_next_op.info,
             offer_asset_for_next_op.amount,
             &env,
-        )?;
+        )? {
+            Some(msg) => msg,
+            None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
+        };
 
         let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
         reply_id_counter += 1;
@@ -227,8 +245,7 @@ fn handle_swap_reply(
         let (amount_after_fee, fee, fee_pool_label) = match replied_op {
             Operation::OrderbookSwap(_) => (received_amount, Uint128::zero(), None),
             _ => {
-                let pool_addr =
-                    deps.api.addr_validate(&get_operation_address(replied_op))?;
+                let pool_addr = deps.api.addr_validate(&get_operation_address(replied_op))?;
                 let (after_fee, fee) = apply_fee(&deps, &pool_addr, received_amount)?;
                 (after_fee, fee, Some(pool_addr.to_string()))
             }
@@ -734,21 +751,31 @@ fn plan_next_stage(
     accumulated_assets: &[amm::Asset],
     next_stage: &Stage,
 ) -> Result<StagePlan, ContractError> {
+    // Resolve each split's offer asset once. For orderbook ops this loads the spot
+    // market, so caching it here avoids re-querying the same market in the needs and
+    // allocation passes below.
+    let offer_infos: Vec<amm::AssetInfo> = next_stage
+        .splits
+        .iter()
+        .map(|split| {
+            let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
+            get_operation_input(deps, first_op)
+        })
+        .collect::<Result<_, _>>()?;
+
     let mut native_info: Option<amm::AssetInfo> = None;
     let mut cw20_info: Option<amm::AssetInfo> = None;
 
-    for split in &next_stage.splits {
-        let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(deps, first_op)?;
+    for offer_info in &offer_infos {
         match offer_info {
             amm::AssetInfo::NativeToken { .. } => {
                 if native_info.is_none() {
-                    native_info = Some(offer_info);
+                    native_info = Some(offer_info.clone());
                 }
             }
             amm::AssetInfo::Token { .. } => {
                 if cw20_info.is_none() {
-                    cw20_info = Some(offer_info);
+                    cw20_info = Some(offer_info.clone());
                 }
             }
         }
@@ -770,11 +797,9 @@ fn plan_next_stage(
 
     let mut total_native_needs = Uint128::zero();
     let mut total_cw20_needs = Uint128::zero();
-    for split in &next_stage.splits {
+    for (i, split) in next_stage.splits.iter().enumerate() {
         let amount_for_split = total_logical_amount.multiply_ratio(split.percent as u128, 100u128);
-        let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(deps, first_op)?;
-        match offer_info {
+        match offer_infos[i] {
             amm::AssetInfo::NativeToken { .. } => total_native_needs += amount_for_split,
             amm::AssetInfo::Token { .. } => total_cw20_needs += amount_for_split,
         }
@@ -829,7 +854,6 @@ fn plan_next_stage(
     let mut cw20_allocated = Uint128::zero();
     for (i, split) in next_stage.splits.iter().enumerate() {
         let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(deps, first_op)?;
         let amount_for_split = if i < next_stage.splits.len() - 1 {
             total_logical_amount.multiply_ratio(split.percent as u128, 100u128)
         } else {
@@ -838,7 +862,7 @@ fn plan_next_stage(
                 .checked_sub(already_allocated)
                 .map_err(StdError::from)?
         };
-        match offer_info {
+        match offer_infos[i] {
             amm::AssetInfo::NativeToken { .. } => native_allocated += amount_for_split,
             amm::AssetInfo::Token { .. } => cw20_allocated += amount_for_split,
         }
@@ -889,6 +913,20 @@ fn execute_planned_swaps(
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
 
     for swap in swaps.iter().filter(|s| !s.amount.is_zero()) {
+        let offer_asset_info = get_operation_input(deps.as_ref(), &swap.operation)?;
+        // `None` => this hop provably yields nothing; skip the split entirely
+        // (don't burn a reply id or persist submsg state for a message we never send).
+        let msg = match create_swap_cosmos_msg(
+            deps,
+            &swap.operation,
+            &offer_asset_info,
+            swap.amount,
+            &env,
+        )? {
+            Some(msg) => msg,
+            None => continue,
+        };
+
         reply_id_counter += 1;
         let submsg_id = reply_id_counter;
 
@@ -901,10 +939,6 @@ fn execute_planned_swaps(
                 op_index: swap.op_index,
             },
         )?;
-
-        let offer_asset_info = get_operation_input(deps.as_ref(), &swap.operation)?;
-        let msg =
-            create_swap_cosmos_msg(deps, &swap.operation, &offer_asset_info, swap.amount, &env)?;
 
         submessages.push(SubMsg::reply_on_success(msg, submsg_id));
     }
@@ -979,13 +1013,17 @@ fn handle_path_conversion_reply(
         .ok_or_else(|| StdError::msg("Could not find pending op in route plan"))?;
 
     let converted_asset_info = get_operation_input(deps.as_ref(), &pending_op_details.operation)?;
-    let swap_msg = create_swap_cosmos_msg(
+    // `None` => the resumed hop provably yields nothing; end the path gracefully.
+    let swap_msg = match create_swap_cosmos_msg(
         &mut deps,
         &pending_op_details.operation,
         &converted_asset_info,
         converted_amount,
         &env,
-    )?;
+    )? {
+        Some(msg) => msg,
+        None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
+    };
 
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
     reply_id_counter += 1;

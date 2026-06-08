@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swaps through multiple AMM pools, orderbook contracts, and CLMM (Concentrated Liquidity) pools in parallel, multi-hop paths with automatic CW20/native token conversion. Cargo workspace with two members: `dex_aggregator` (main contract) and `mock_swap` (test helper). Deployed on Injective mainnet (Code ID 1892, address `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26`).
+CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swaps through multiple AMM pools, orderbook contracts, and CLMM (Concentrated Liquidity) pools in parallel, multi-hop paths with automatic CW20/native token conversion. Also supports **FlashRoute** — capital-free CLMM flash-arb (borrow from a CLMM pool's `Flash {}`, run a cycle through other venues, repay principal+fee, keep the surplus; see `docs/flash_route_plan.md`). Cargo workspace with three members: `dex_aggregator` (main contract), `mock_swap` (test helper), and `mock_clmm_flash` (test flash-pool helper). Deployed on Injective mainnet (Code ID 1892, address `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26`).
 
 ## Build, Test, and Deploy Commands
 
@@ -11,7 +11,9 @@ CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swap
 cargo build
 
 # Production WASM build (uses cosmwasm/workspace-optimizer:0.17.0 Docker image)
-# Outputs to ./artifacts/dex_aggregator.wasm and ./artifacts/mock_swap.wasm
+# Outputs dex_aggregator.wasm, mock_swap.wasm, mock_clmm_flash.wasm to ./artifacts/
+# (runs --locked; if you added a member/dep, refresh Cargo.lock with a local
+#  `cargo build` first, or the optimizer aborts on a stale lock)
 ./build_release.sh
 
 # Run tests (MUST run ./build_release.sh first — see note below)
@@ -43,11 +45,11 @@ cd contracts/dex_aggregator && cargo run --example schema
 
 | File | Purpose |
 |------|---------|
-| `contract.rs` | Entry points: `instantiate`, `execute`, `query`, `reply`. Routes `ExecuteMsg` variants to handlers. |
-| `msg.rs` | All message types. Submodules: `amm`, `orderbook`, `clmm`, `cw20_adapter`, `reflection`. Defines `Stage > Split > Operation` route structure. |
-| `execute.rs` | Core swap logic (`execute_aggregate_swaps_internal`, `create_swap_cosmos_msg`). Admin functions: `set_fee`, `remove_fee`, `update_fee_collector`, `update_admin`, `emergency_withdraw`, `register_tax_token`, `deregister_tax_token`. |
-| `reply.rs` | Submessage reply state machine. Manages `Awaiting` states. Core function `proceed_to_next_step` drives stage-by-stage execution. Fee deduction via `apply_fee` at path completion. |
-| `state.rs` | Storage: `CONFIG`, `FEE_MAP`, `ACTIVE_ROUTES`, `SUBMSG_REPLY_STATES`, `REPLY_ID_COUNTER`, `TAX_TOKEN_REGISTRY`. Defines `ExecutionState`, `SubmsgReplyState`, `Awaiting` enum. |
+| `contract.rs` | Entry points: `instantiate`, `execute`, `query`, `reply`. Routes `ExecuteMsg` variants to handlers (incl. `FlashRoute` / `FlashCallback`). |
+| `msg.rs` | All message types. Submodules: `amm`, `orderbook`, `clmm`, `cw20_adapter`, `reflection`. Defines `Stage > Split > Operation` route structure. `clmm::ClmmPoolFlashMsg` + `ExecuteMsg::FlashRoute`/`FlashCallback` for flash-arb. |
+| `execute.rs` | Core swap logic (`execute_aggregate_swaps_internal`, `create_swap_cosmos_msg`). Flash entry points: `execute_flash_route` (fires the pool's `Flash`), `execute_flash_callback` (borrower callback → runs the cycle via `proceed_to_next_step`). Admin functions: `set_fee`, `remove_fee`, `update_fee_collector`, `update_admin`, `emergency_withdraw`, `register_tax_token`, `deregister_tax_token`. |
+| `reply.rs` | Submessage reply state machine. Manages `Awaiting` states. Core function `proceed_to_next_step` drives stage-by-stage execution. Fee deduction via `apply_fee` at path completion. `finalize_route` disposes the final output: pay the user, or (flash) repay `principal+fee` to the pool and forward the surplus. |
+| `state.rs` | Storage: `CONFIG`, `FEE_MAP`, `ACTIVE_ROUTES`, `SUBMSG_REPLY_STATES`, `REPLY_ID_COUNTER`, `TAX_TOKEN_REGISTRY`, `PENDING_FLASH`. Defines `ExecutionState`, `SubmsgReplyState`, `Awaiting`, `RoutePlan` (with `flash_repayment`), `FlashRepayment`, `PendingFlashCtx`. |
 | `query.rs` | `simulate_route`, `query_config`, `query_fee_for_pool`, `query_all_fees`. Contains unit tests. |
 | `error.rs` | `ContractError` enum with `thiserror`. |
 
@@ -64,6 +66,7 @@ cd contracts/dex_aggregator && cargo run --example schema
 ### Supporting Contracts
 
 - `mock_swap` (`contracts/mock_swap/src/lib.rs`) — Mock DEX with configurable rates, supports AMM/Orderbook/CLMM protocol types, used in integration tests
+- `mock_clmm_flash` (`contracts/mock_clmm_flash/src/lib.rs`) — Mock CLMM flash-loan pool: faithfully mirrors `choice_clmm_pool`'s flash interface (lend → `FlashCallback` → balance-delta repayment check + reentrancy lock + `GetConfig`) at the JSON wire level. The flash source in the `FlashRoute` integration tests; the aggregator is the borrower, so no separate borrower mock is needed. (The real pool can't be embedded — `choice_exchange` is cosmwasm-std 2.x vs this workspace's 3.x.)
 - `cw20_adapter` and `cw20_base` — Pre-compiled WASMs in project root, not built from this workspace
 
 ## Code Conventions
@@ -109,4 +112,5 @@ cd contracts/dex_aggregator && cargo run --example schema
 - CLMM swaps support both native and CW20 tokens; no rounding needed. Pre-execution `Quote` query computes `minimum_amount_out` with 0.5% slippage
 - `FPDecimal` (from `injective-math`) for orderbook quantities; `Uint128`/`Decimal` (from `cosmwasm-std`) for everything else (including CLMM)
 - Fees deducted at path completion (end of a split's operation chain), not per-operation
+- **FlashRoute** (`docs/flash_route_plan.md`): a flash-arb cycle must repay in the *borrowed* asset, so it ends in `flash_asset` (gated by `min_profit`), not an A→B user swap. The whole cycle runs depth-first inside the pool's `FlashCallback`, so repayment settles before the pool's repay check — the pool reverts the tx if unrepaid. Repay uses the same Bank `Send` / CW20 `Transfer` (never CW20 `Send`) the pool requires. `FlashCallback` is gated on `PENDING_FLASH` + `info.sender == flash_pool`; the cycle may not route through `flash_pool` (reentrancy lock).
 - CI (`.github/workflows/test.yml`) runs `cargo build --verbose && cargo test --verbose` on push/PR to main

@@ -118,12 +118,37 @@ atomic tx — only one flash is ever in flight.
   space; the aggregator sees `FlashCallback` as a plain Execute, so it never
   collides with the aggregator's `REPLY_ID_COUNTER`.
 
-## Tests (deferred — heaviest lift)
+## Tests — DONE (2026-06-08)
 
-`mock_swap` can't lend, so flash tests need the **real `choice_clmm_pool.wasm`**
-`include_bytes!`'d into the aggregator harness, instantiated with seeded in-range
-liquidity:
-- happy path: borrow from a cheap pool, profitable cycle through a mock AMM/OB,
-  surplus ≥ `min_profit`;
-- reverts: no-profit cycle, repay shortfall, cycle that touches `flash_pool`,
-  `min_profit` below the flash fee, forged `FlashCallback` (no `PENDING_FLASH`).
+Embedding the **real** `choice_clmm_pool.wasm` was rejected: `choice_exchange` is
+cosmwasm-std 2.x vs this workspace's 3.x (no type sharing), and it would drag in
+the factory/manager deploy + tick-math liquidity seeding. Since the aggregator is
+itself the borrower, no separate borrower mock is needed either. Instead a new
+workspace member **`contracts/mock_clmm_flash`** faithfully mirrors the pool's
+flash interface at the JSON wire level (lend → `FlashCallback` → balance-delta
+repayment check + reentrancy lock + `GetConfig`). The happy-path test doubles as
+the wire-format proof: the aggregator's `ClmmPoolFlashMsg::Flash` must serialize
+into what the mock decodes, and the mock's `FlashCallbackMsg::FlashCallback` must
+decode into the aggregator's `ExecuteMsg::FlashCallback`.
+
+Four tests in `tests/integration.rs` (all green; 36/36 suite passes):
+- `test_flash_route_happy_path` — borrow 1000 USDT @30bps → 100 INJ → 1100 USDT;
+  repay 1003, 97 USDT surplus to caller, pool net +3 (the fee).
+- `test_flash_route_below_min_profit_reverts` — unreachable `min_profit` →
+  `FlashProfitNotMet`, whole tx reverts, nothing moves.
+- `test_flash_route_cycle_through_flash_pool_rejected` — a cycle hop on the flash
+  pool → `FlashPoolInCycle`, rejected pre-fire.
+- `test_flash_callback_without_pending_flash_rejected` — direct `FlashCallback`
+  with no in-flight flash → `NoPendingFlash`.
+
+Build/run notes: `./build_release.sh` (docker, `--locked`) rebuilds all members
+including `mock_clmm_flash.wasm` AND a fresh `dex_aggregator.wasm` — a stale
+artifact lacks the flash code. Adding the member/dev-dep makes `Cargo.lock` stale;
+run a local `cargo build` to refresh it before the optimizer (the serde_with
+3.12.0 / darling 0.20.11 pins must hold). Don't over-fund test accounts with INJ —
+gas fees make a full-balance `bank.send` fail.
+
+Not covered by these (the pool's own logic, tested in `choice_exchange`): the
+`FlashNotRepaid` shortfall path is unreachable via the aggregator, because
+`FlashProfitNotMet` (`required = repay + min_profit ≥ repay`) fires first — the
+aggregator never under-repays.

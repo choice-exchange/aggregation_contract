@@ -1,45 +1,80 @@
 # Orderbook-Merge — Progress / Resume Notes
 
 Living status doc for folding `inj-orderbook-swap-contract` into `dex_aggregator`.
-Last updated **2026-06-01** (resume target: 2026-06-02). Design lives in
+Last updated **2026-06-08**. Design lives in
 [orderbook_merge_plan.md](orderbook_merge_plan.md); optimization analysis in
 [orderbook_optimization_review.md](orderbook_optimization_review.md); the test-tube
 proof in [orderbook_proof_results.md](orderbook_proof_results.md).
 
 ## Where we are
 
-Working on branch **`orderbook-merge`** (off `clmm`) in this repo. Steps 1–2 done
-and committed; nothing pushed. Same-repo modification of `dex_aggregator` — **not** a
-new repo (it reuses the Stage→Split→Operation route, reply state machine, cw20_adapter
-conversions). Deploy is a fresh code ID, not a new repo.
+Working on branch **`orderbook-merge`** (off `clmm`) in this repo. Steps 1–2 are
+committed; **steps 3–6 are done in the working tree (UNCOMMITTED) as of 2026-06-08**.
+Same-repo modification of `dex_aggregator` — **not** a new repo (it reuses the
+Stage→Split→Operation route, reply state machine, cw20_adapter conversions). Deploy
+is a fresh code ID. Treated as a **new contract version not yet in use**, so the ABI
+took the full market-derived redesign (not the `offer_denom: String` fallback).
+
+> Note: an unrelated working-tree of per-op slippage + CLMM exact-output + orderbook
+> integration docs was split off to branch **`clmm-exact-output`** (commit `b2971c6`,
+> pushed) before resuming the merge. That branch's `OrderbookSwapOp` kept the *old*
+> `offer/ask/min_quantity_tick_size` shape — it is a different lineage and will need
+> reconciling if/when both land.
 
 | Step | State | Commit |
 |---|---|---|
 | 1. Bump/add deps + cosmwasm-std 2→3 migration; `build_release.sh` compiles MVP-clean | ✅ done | `51faaf6` |
 | 2. Port `orderbook_exec.rs` (estimators/helpers/types), compile in isolation | ✅ done | `8191592` |
-| 3. Change `OrderbookSwapOp`; thread querier into planner/input resolution | ⬜ next | — |
-| 4. Rewrite `create_swap_cosmos_msg` orderbook arm (atomic SpotOrder, self-relayer) | ⬜ | — |
-| 5. Rewrite `handle_swap_reply` orderbook branch + typed decode; delete dead event parse | ⬜ | — |
-| 6. Rewrite `simulate_single_operation` orderbook arm (shared estimator) | ⬜ | — |
-| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | ⬜ | — |
+| 3. Change `OrderbookSwapOp`; thread querier into planner/input resolution | ✅ done | uncommitted |
+| 4. Rewrite `create_swap_cosmos_msg` orderbook arm (atomic SpotOrder, self-relayer) | ✅ done | uncommitted |
+| 5. Rewrite `handle_swap_reply` orderbook branch + typed decode; delete dead event parse | ✅ done | uncommitted |
+| 6. Rewrite `simulate_single_operation` orderbook arm (shared estimator) | ✅ done | uncommitted |
+| 7. Tests (reconcile integration dev-deps; port buy/sell + mixed-route + sub-tick); rebuild artifacts | ⬜ next | — |
 
-Working tree is clean as of `8191592`. `cargo build` (workspace) and
-`cargo test -p dex_aggregator --lib` both green. Artifacts in `artifacts/` are from
-Step 1 (orderbook_exec isn't wired into entry points yet, so contract behaviour is
-unchanged) — rebuild via `./build_release.sh` once steps 3–6 land.
+`cargo build` (workspace), `cargo clippy --lib -p dex_aggregator`, and
+`cargo test -p dex_aggregator --lib` (15 tests) are all green. Artifacts in
+`artifacts/` are still the Step-1 build — **rebuild via `./build_release.sh` before
+`cargo test`** (integration tests `include_bytes!` them) once Step 7 lands.
+
+## What steps 3–6 actually did (2026-06-08)
+
+- **ABI (msg.rs):** `OrderbookSwapOp { market_id: MarketId, target_denom: String,
+  #[serde(default)] quantity: Option<FPDecimal>, #[serde(default)] worst_price:
+  Option<FPDecimal> }`. Removed `swap_contract`/`offer_asset_info`/`ask_asset_info`/
+  `min_quantity_tick_size`. Deleted the dead `msg::orderbook` module (external-contract
+  `GetOutputQuantity`/`SwapMinOutput`/`SwapEstimationResult`).
+- **orderbook_exec.rs:** added `load_market`, `offer_denom_for`, `is_buy_for_target`,
+  `build_swap_order_msg` (direct vs estimation mode; returns `Ok(None)` ⇒ caller raises
+  `AmountTooSmall`), `parse_order_output` (typed `MsgCreateSpotMarketOrderResponse`
+  decode, descale 10^18, buy⇒quantity / sell⇒quantity·price−fee).
+- **execute.rs:** orderbook arm places a native atomic `SpotOrder` via
+  `create_spot_market_order_msg`, subaccount = contract's default, fee recipient = self
+  (relayer discount). Validates the offer denom is the market side opposite
+  `target_denom` (`InvalidOrderbookDenom`).
+- **reply.rs:** `handle_swap_reply` decodes the typed order response for orderbook ops
+  (event-attr parse only for AMM/CLMM now); zero fill ⇒ existing zero-value-path. Final
+  op skips the `FEE_MAP`/`addr_validate` fee step for orderbook (no pool address; the
+  exchange already charges its own fee). `get_operation_input`/`plan_next_stage` now take
+  `Deps<InjectiveQueryWrapper>` to derive the offer denom from the market;
+  `get_operation_output`/`get_operation_address` need no query.
+- **query.rs + contract.rs:** query entry point is now `Deps<InjectiveQueryWrapper>`
+  (`.into_empty()` for the non-simulate handlers); `simulate_single_operation` orderbook
+  arm uses the **same** `estimate_single_swap_execution` as execution (sim/exec parity).
 
 ## How to resume
 
 ```bash
 cd choice/aggregation_contract
 git branch --show-current        # expect: orderbook-merge
-git log --oneline -2             # expect 8191592 then 51faaf6
-cargo build                      # fast local check (nightly 1.92)
-cargo test -p dex_aggregator --lib orderbook_exec   # 9 passing
+git status -s                    # steps 3-6 are uncommitted working-tree changes
+cargo build                      # fast local check
+cargo test -p dex_aggregator --lib   # 15 passing
 ```
 
-Then start **Step 3** (see plan §"Planner integration"): the ABI change the rest
-builds on.
+Then start **Step 7** (tests): the dev-dep blocker (`injective-test-tube` on cw-std 2 vs
+our cw-std 3) must be reconciled before `tests/integration.rs` compiles. Orderbook can't
+be mocked — needs a real local market (registered denom decimals + a min-notional via gov
+`BatchExchangeModificationProposal`), per the proof.
 
 ## Step 1 outcome — dependency reality (plan table was wrong in places)
 

@@ -64,4 +64,14 @@ pub enum ContractError {
 
     #[error("Failed to parse conversion reply: could not find a valid 'transfer' or 'wasm' event")]
     NoConversionEventInReply {},
+
+    // --- Orderbook (native spot-order) Errors ---
+    #[error("Orderbook order quantity rounds to zero (input below one tick)")]
+    AmountTooSmall {},
+
+    #[error("Failed to decode spot market order response: {err}")]
+    OrderResponseDecode { err: String },
+
+    #[error("Denom '{denom}' is not part of orderbook market {market_id}")]
+    InvalidOrderbookDenom { denom: String, market_id: String },
 }

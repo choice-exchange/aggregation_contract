@@ -135,17 +135,19 @@ pub fn execute(
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps<InjectiveQueryWrapper>, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
+        // SimulateRoute walks Injective spot markets, so it needs the typed querier.
         QueryMsg::SimulateRoute { stages, amount_in } => {
             crate::query::simulate_route(deps, env, stages, amount_in)
         }
-        QueryMsg::Config {} => crate::query::query_config(deps),
+        // The rest only touch generic storage; drop the custom query type.
+        QueryMsg::Config {} => crate::query::query_config(deps.into_empty()),
         QueryMsg::FeeForPool { pool_address } => {
-            crate::query::query_fee_for_pool(deps, pool_address)
+            crate::query::query_fee_for_pool(deps.into_empty(), pool_address)
         }
         QueryMsg::AllFees { start_after, limit } => {
-            crate::query::query_all_fees(deps, start_after, limit)
+            crate::query::query_all_fees(deps.into_empty(), start_after, limit)
         }
     }
 }

@@ -3,6 +3,8 @@ use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
 use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
 use crate::cw20::Cw20ReceiveMsg;
+use injective_cosmwasm::MarketId;
+use injective_math::FPDecimal;
 
 pub mod cw20_adapter {
     use super::*;
@@ -84,40 +86,6 @@ pub mod amm {
     }
 }
 
-pub mod orderbook {
-    use super::*;
-    use injective_math::FPDecimal;
-
-    #[cw_serde]
-    pub struct FPCoin {
-        pub amount: FPDecimal,
-        pub denom: String,
-    }
-
-    #[cw_serde]
-    pub enum QueryMsg {
-        GetOutputQuantity {
-            from_quantity: FPDecimal,
-            source_denom: String,
-            target_denom: String,
-        },
-    }
-
-    #[cw_serde]
-    pub struct SwapEstimationResult {
-        pub expected_fees: Vec<FPCoin>,
-        pub result_quantity: FPDecimal,
-    }
-
-    #[cw_serde]
-    pub enum OrderbookExecuteMsg {
-        SwapMinOutput {
-            target_denom: String,
-            min_output_quantity: FPDecimal,
-        },
-    }
-}
-
 pub mod reflection {
     use super::*;
     use cosmwasm_std::Binary;
@@ -180,12 +148,29 @@ pub struct AmmSwapOp {
     pub ask_asset_info: amm::AssetInfo,
 }
 
+/// A single Injective spot-market hop, executed natively by the aggregator (it
+/// places the atomic spot order itself — there is no external swap contract).
+///
+/// `market_id` + `target_denom` are sufficient: the offer denom is the market's
+/// *other* side, `is_buy = (target_denom == market.base_denom)`, and the ticks
+/// come from the market — all derived on-chain.
+///
+/// - **Estimation mode** (`quantity`/`worst_price` omitted): the contract walks
+///   the book to size the order. Used by the Choice dApp (backs `SimulateRoute`).
+/// - **Direct mode** (both supplied): the caller fixes the base `quantity` and the
+///   `worst_price` bound, so no orderbook-walk queries run. Used by the arb bot;
+///   the route-level `minimum_receive` is the only net.
 #[cw_serde]
 pub struct OrderbookSwapOp {
-    pub swap_contract: String,
-    pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
-    pub min_quantity_tick_size: Uint128,
+    pub market_id: MarketId,
+    /// Native denom this hop must produce (the market's base for a buy, quote for a sell).
+    pub target_denom: String,
+    /// Direct mode: base quantity to trade. `None` => estimate from the book.
+    #[serde(default)]
+    pub quantity: Option<FPDecimal>,
+    /// Direct mode: worst acceptable price bound. `None` => estimate from the book.
+    #[serde(default)]
+    pub worst_price: Option<FPDecimal>,
 }
 
 #[cw_serde]

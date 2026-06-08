@@ -13,12 +13,17 @@
 //! - cosmwasm-std 3.0: `generic_err` -> `msg`; `Coin.amount` is `Uint256`
 //!   (`FPDecimal: From<Uint256>` exists, so balance reads still `.into()` cleanly).
 
-use cosmwasm_std::{Addr, Deps, StdError, StdResult};
+use cosmwasm_std::{Addr, CosmosMsg, Deps, StdError, StdResult, SubMsgResponse, Uint128};
 use injective_cosmwasm::{
-    InjectiveQuerier, InjectiveQueryWrapper, MarketId, OrderSide, PriceLevel, SpotMarket,
+    create_spot_market_order_msg, get_default_subaccount_id_for_checked_address, InjectiveMsgWrapper,
+    InjectiveQuerier, InjectiveQueryWrapper, MarketId, OrderSide, OrderType, PriceLevel, SpotMarket,
+    SpotOrder,
 };
 use injective_math::utils::round_to_min_tick;
 use injective_math::FPDecimal;
+use injective_std::types::injective::exchange::v1beta1::MsgCreateSpotMarketOrderResponse;
+use prost::Message as _;
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -348,6 +353,145 @@ fn estimate_execution_sell_from_source(
             amount: fee_estimate,
         }),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Market resolution + native order construction / reply decoding
+// ---------------------------------------------------------------------------
+
+/// Load a spot market by id (errors if the market does not exist).
+pub fn load_market(
+    deps: Deps<InjectiveQueryWrapper>,
+    market_id: &MarketId,
+) -> StdResult<SpotMarket> {
+    InjectiveQuerier::new(&deps.querier)
+        .query_spot_market(market_id)?
+        .market
+        .ok_or_else(|| StdError::msg(format!("spot market {} not found", market_id.as_str())))
+}
+
+/// The denom paid *into* a hop that produces `target_denom` on `market`.
+/// Buying base (target = base) pays quote; selling base (target = quote) pays base.
+pub fn offer_denom_for(market: &SpotMarket, target_denom: &str) -> StdResult<String> {
+    if target_denom == market.base_denom {
+        Ok(market.quote_denom.clone())
+    } else if target_denom == market.quote_denom {
+        Ok(market.base_denom.clone())
+    } else {
+        Err(StdError::msg(format!(
+            "target denom {target_denom} is not in market {}",
+            market.market_id.as_str()
+        )))
+    }
+}
+
+/// `true` if a hop producing `target_denom` is a BUY (the aggregator receives base).
+pub fn is_buy_for_target(market: &SpotMarket, target_denom: &str) -> bool {
+    target_denom == market.base_denom
+}
+
+/// Build the atomic spot-market-order message for a single orderbook hop.
+///
+/// `quantity`/`worst_price` both `Some` => **direct mode**: the order is placed
+/// with the caller's exact base quantity and price bound, with no orderbook-walk
+/// queries. Otherwise => **estimation mode**: the book is walked to size the order
+/// (buy => estimated base quantity; sell => the base input rounded down to tick).
+///
+/// `input_amount` is the funds (chain scale, `offer_denom`) the contract holds for
+/// this hop; the order debits the contract's default subaccount, and the aggregator
+/// is its own fee recipient (self-relayer). Returns `Ok(None)` when the order
+/// quantity rounds to zero, so the caller can surface `AmountTooSmall`.
+pub fn build_swap_order_msg(
+    deps: Deps<InjectiveQueryWrapper>,
+    contract: &Addr,
+    market: &SpotMarket,
+    offer_denom: &str,
+    input_amount: Uint128,
+    quantity: Option<FPDecimal>,
+    worst_price: Option<FPDecimal>,
+) -> StdResult<Option<CosmosMsg<InjectiveMsgWrapper>>> {
+    // Paying quote => buying base; paying base => selling.
+    let is_buy = offer_denom != market.base_denom;
+
+    let (price, order_qty) = match (quantity, worst_price) {
+        (Some(q), Some(p)) => (p, q),
+        _ => {
+            let input = FPCoin {
+                amount: FPDecimal::from(input_amount),
+                denom: offer_denom.to_string(),
+            };
+            let est =
+                estimate_single_swap_execution(&deps, contract, &market.market_id, input, false)?;
+            let qty = if est.is_buy_order {
+                // estimator already rounds the base quantity to tick
+                est.result_quantity
+            } else {
+                // sells trade the base input directly; round it down to the tick
+                round_to_min_tick(FPDecimal::from(input_amount), market.min_quantity_tick_size)
+            };
+            (est.worst_price, qty)
+        }
+    };
+
+    if order_qty.is_negative() || order_qty.is_zero() {
+        return Ok(None);
+    }
+
+    let order = SpotOrder::new(
+        price,
+        order_qty,
+        if is_buy {
+            OrderType::BuyAtomic
+        } else {
+            OrderType::SellAtomic
+        },
+        &market.market_id,
+        get_default_subaccount_id_for_checked_address(contract),
+        Some(contract.clone()), // self-relayer => keeps the fee-share discount
+        None,
+    );
+
+    Ok(Some(create_spot_market_order_msg(contract.clone(), order)))
+}
+
+/// Decode the filled output (in `target_denom`, chain scale) from an atomic spot
+/// market order reply. Returns zero when nothing filled (IOC orders may fill
+/// partially or not at all — the route-level `minimum_receive` is the net).
+pub fn parse_order_output(
+    market: &SpotMarket,
+    target_denom: &str,
+    response: &SubMsgResponse,
+) -> StdResult<Uint128> {
+    let first = match response.msg_responses.first() {
+        Some(r) => r,
+        None => return Ok(Uint128::zero()),
+    };
+    let decoded = MsgCreateSpotMarketOrderResponse::decode(first.value.as_slice())
+        .map_err(|e| StdError::msg(format!("decode failed (type_url={}): {e}", first.type_url)))?;
+    let trade = match decoded.results {
+        Some(t) => t,
+        None => return Ok(Uint128::zero()),
+    };
+
+    // protobuf serializes Dec values with an extra 10^18 factor; descale to chain units.
+    let scale = dec_scale_factor();
+    let price = FPDecimal::from_str(&trade.price).map_err(|_| StdError::msg("bad price"))? / scale;
+    let quantity =
+        FPDecimal::from_str(&trade.quantity).map_err(|_| StdError::msg("bad quantity"))? / scale;
+    let fee = FPDecimal::from_str(&trade.fee).map_err(|_| StdError::msg("bad fee"))? / scale;
+
+    // buy => base received; sell => quote received net of the trading fee.
+    let out = if is_buy_for_target(market, target_denom) {
+        quantity
+    } else {
+        quantity * price - fee
+    };
+
+    if out.is_negative() || out.is_zero() {
+        Ok(Uint128::zero())
+    } else {
+        Ok(Uint128::from(out))
+    }
 }
 
 #[cfg(test)]

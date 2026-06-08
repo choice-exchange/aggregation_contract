@@ -1,13 +1,13 @@
 use crate::msg::{
-    amm, clmm, orderbook, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse,
-    Stage,
+    amm, clmm, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse, Stage,
 };
+use crate::orderbook_exec::{self, FPCoin};
 use crate::state::{Config, FEE_MAP};
 use cosmwasm_std::{
-    to_json_binary, Binary, Coin, Deps, Env, Order, QuerierWrapper, StdError, StdResult, Uint128,
-    WasmQuery,
+    to_json_binary, Binary, Coin, Deps, Env, Order, StdError, StdResult, Uint128, WasmQuery,
 };
 use cw_storage_plus::Bound;
+use injective_cosmwasm::InjectiveQueryWrapper;
 
 pub fn query_config(deps: Deps) -> StdResult<Binary> {
     let config: Config = crate::state::CONFIG.load(deps.storage)?;
@@ -15,8 +15,8 @@ pub fn query_config(deps: Deps) -> StdResult<Binary> {
 }
 
 pub fn simulate_route(
-    deps: Deps,
-    _env: Env,
+    deps: Deps<InjectiveQueryWrapper>,
+    env: Env,
     stages: Vec<Stage>,
     amount_in: Coin,
 ) -> StdResult<Binary> {
@@ -53,7 +53,7 @@ pub fn simulate_route(
         let mut amounts_allocated: Vec<(amm::AssetInfo, Uint128)> = vec![];
 
         for (i, split) in stage.splits.iter().enumerate() {
-            let path_input_info = get_path_start_info(&split.path)?;
+            let path_input_info = get_path_start_info(deps, &split.path)?;
 
             let total_amount_for_type = grouped_inputs
                 .iter()
@@ -90,7 +90,7 @@ pub fn simulate_route(
 
             for operation in &split.path {
                 let output_asset =
-                    simulate_single_operation(&deps.querier, operation, &current_path_asset)?;
+                    simulate_single_operation(deps, &env, operation, &current_path_asset)?;
                 current_path_asset = output_asset;
             }
 
@@ -110,7 +110,8 @@ pub fn simulate_route(
 
 /// Simulates a single swap operation.
 fn simulate_single_operation(
-    querier: &QuerierWrapper,
+    deps: Deps<InjectiveQueryWrapper>,
+    env: &Env,
     operation: &Operation,
     offer_asset: &amm::Asset,
 ) -> StdResult<amm::Asset> {
@@ -121,7 +122,7 @@ fn simulate_single_operation(
             };
             let contract_addr = op.pool_address.to_string();
 
-            let sim_response: amm::SimulationResponse = querier.query(
+            let sim_response: amm::SimulationResponse = deps.querier.query(
                 &WasmQuery::Smart {
                     contract_addr,
                     msg: to_json_binary(&pair_query)?,
@@ -135,6 +136,9 @@ fn simulate_single_operation(
             })
         }
         Operation::OrderbookSwap(op) => {
+            // Same estimator the execution path uses, so the quote can't diverge
+            // from the fill. `result_quantity` is already in `target_denom`
+            // (base for a buy, quote-minus-fee for a sell).
             let source_denom = match &offer_asset.info {
                 amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
@@ -143,33 +147,32 @@ fn simulate_single_operation(
                     ))
                 }
             };
-            let target_denom = match &op.ask_asset_info {
-                amm::AssetInfo::NativeToken { denom } => denom.clone(),
-                _ => {
-                    return Err(StdError::msg(
-                        "Orderbook simulation only supports native token outputs",
-                    ))
-                }
-            };
 
-            let orderbook_query = orderbook::QueryMsg::GetOutputQuantity {
-                from_quantity: offer_asset.amount.into(),
-                source_denom,
-                target_denom,
-            };
-            let contract_addr = op.swap_contract.to_string();
+            let market = orderbook_exec::load_market(deps, &op.market_id)?;
+            let expected_offer = orderbook_exec::offer_denom_for(&market, &op.target_denom)?;
+            if source_denom != expected_offer {
+                return Err(StdError::msg(format!(
+                    "offer denom {source_denom} is not valid for orderbook market {}",
+                    op.market_id.as_str()
+                )));
+            }
 
-            let sim_response: orderbook::SwapEstimationResult = querier.query(
-                &WasmQuery::Smart {
-                    contract_addr,
-                    msg: to_json_binary(&orderbook_query)?,
-                }
-                .into(),
+            let est = orderbook_exec::estimate_single_swap_execution(
+                &deps,
+                &env.contract.address,
+                &op.market_id,
+                FPCoin {
+                    amount: offer_asset.amount.into(),
+                    denom: source_denom,
+                },
+                true,
             )?;
 
             Ok(amm::Asset {
-                info: op.ask_asset_info.clone(),
-                amount: sim_response.result_quantity.into(),
+                info: amm::AssetInfo::NativeToken {
+                    denom: op.target_denom.clone(),
+                },
+                amount: est.result_quantity.into(),
             })
         }
         Operation::ClmmSwap(op) => {
@@ -179,7 +182,7 @@ fn simulate_single_operation(
             };
             let contract_addr = op.pool_address.to_string();
 
-            let quote_response: clmm::QuoteResponse = querier.query(
+            let quote_response: clmm::QuoteResponse = deps.querier.query(
                 &WasmQuery::Smart {
                     contract_addr,
                     msg: to_json_binary(&quote_query)?,
@@ -195,13 +198,21 @@ fn simulate_single_operation(
     }
 }
 
-fn get_path_start_info(path: &[Operation]) -> StdResult<amm::AssetInfo> {
+fn get_path_start_info(
+    deps: Deps<InjectiveQueryWrapper>,
+    path: &[Operation],
+) -> StdResult<amm::AssetInfo> {
     let first_op = path
         .first()
         .ok_or_else(|| StdError::msg("Path cannot be empty"))?;
     Ok(match first_op {
         Operation::AmmSwap(op) => op.offer_asset_info.clone(),
-        Operation::OrderbookSwap(op) => op.offer_asset_info.clone(),
+        Operation::OrderbookSwap(op) => {
+            let market = orderbook_exec::load_market(deps, &op.market_id)?;
+            amm::AssetInfo::NativeToken {
+                denom: orderbook_exec::offer_denom_for(&market, &op.target_denom)?,
+            }
+        }
         Operation::ClmmSwap(op) => op.offer_asset_info.clone(),
     })
 }
@@ -257,16 +268,29 @@ mod tests {
     use crate::contract::query;
     use crate::msg::{AmmSwapOp, QueryMsg, Split, Stage};
     use amm::AssetInfo;
-    use cosmwasm_std::testing::{mock_dependencies, mock_env, MockApi, MockQuerier};
-    use cosmwasm_std::{from_json, ContractResult, Decimal, SystemResult};
+    use cosmwasm_std::testing::{mock_env, MockApi, MockQuerier, MockStorage};
+    use cosmwasm_std::{from_json, ContractResult, OwnedDeps, Decimal, SystemResult};
+    use std::marker::PhantomData;
     use std::str::FromStr;
 
     const POOL_A_ADDR: &str = "inj1hkhdaj2ts42k2x53h3w0f26g2xvy3a52e0u4gp";
     const POOL_B_ADDR: &str = "inj12sqy2n5qt52n5q2n5qt52n5q2n5qt52n5q2n5qt";
 
+    /// Injective-typed mock deps (the query path now needs `Deps<InjectiveQueryWrapper>`).
+    /// Orderbook isn't exercised here, so the default wasm-only `MockQuerier` suffices.
+    fn inj_mock_deps() -> OwnedDeps<MockStorage, MockApi, MockQuerier<InjectiveQueryWrapper>, InjectiveQueryWrapper>
+    {
+        OwnedDeps {
+            storage: MockStorage::default(),
+            api: MockApi::default(),
+            querier: MockQuerier::new(&[]),
+            custom_query_type: PhantomData,
+        }
+    }
+
     #[test]
     fn test_simulate_simple_path() {
-        let mut querier = MockQuerier::new(&[]);
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
         let mock_response = amm::SimulationResponse {
             return_amount: Uint128::new(50000),
             spread_amount: Uint128::zero(),
@@ -291,7 +315,7 @@ mod tests {
                 }
             },
         );
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.querier = querier;
 
         let stages = vec![Stage {
@@ -322,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_simulate_multi_hop_path() {
-        let mut querier = MockQuerier::new(&[]);
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
 
         let mock_response_hop1 = amm::SimulationResponse {
             return_amount: Uint128::new(20000), // 1000 INJ -> 20000 USDT
@@ -359,7 +383,7 @@ mod tests {
             _ => panic!("Unsupported query type"),
         });
 
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.querier = querier;
 
         let stages = vec![Stage {
@@ -401,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_simulate_multi_split_multi_stage() {
-        let mut querier = MockQuerier::new(&[]);
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
 
         // Mock responses for all 4 swaps
         querier.update_wasm(move |q: &WasmQuery| match q {
@@ -432,7 +456,7 @@ mod tests {
             _ => panic!("Unsupported query type"),
         });
 
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.querier = querier;
 
         let stages = vec![
@@ -511,7 +535,7 @@ mod tests {
     #[test]
     fn test_query_fee_for_pool() {
         // --- Setup using the proven litmus test pattern ---
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.api = MockApi::default().with_prefix("inj");
 
         // Use the API to generate valid addresses for the test
@@ -544,7 +568,7 @@ mod tests {
     #[test]
     fn test_query_all_fees_with_pagination() {
         // --- Setup using the proven litmus test pattern ---
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.api = MockApi::default().with_prefix("inj");
 
         // Use the API to generate valid addresses for the test.
@@ -585,7 +609,7 @@ mod tests {
     #[test]
     fn test_query_all_fees_empty() {
         // --- Setup using the proven litmus test pattern ---
-        let mut deps = mock_dependencies();
+        let mut deps = inj_mock_deps();
         deps.api = MockApi::default().with_prefix("inj");
 
         let msg = QueryMsg::AllFees {

@@ -4,11 +4,10 @@ use cosmwasm_std::{
 };
 use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
-use injective_math::FPDecimal;
-use std::str::FromStr;
 
 use crate::error::ContractError;
-use crate::msg::{self, amm, clmm, orderbook, Operation, Stage};
+use crate::msg::{amm, clmm, Operation, Stage};
+use crate::orderbook_exec;
 use crate::reply::proceed_to_next_step;
 use crate::state::{
     Awaiting, ExecutionState, RoutePlan, CONFIG, FEE_MAP, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
@@ -142,76 +141,45 @@ pub fn create_swap_cosmos_msg(
             }
         }
         Operation::OrderbookSwap(ob_op) => {
-            let tick_size_atomic = ob_op.min_quantity_tick_size;
-
-            if tick_size_atomic.is_zero() {
-                return Err(ContractError::Std(StdError::msg(
-                    "min_quantity_tick_size cannot be zero",
-                )));
-            }
-
-            let ratio = amount / tick_size_atomic;
-            let rounded_atomic_amount = ratio * tick_size_atomic;
-
-            if rounded_atomic_amount.is_zero() {
-                return Ok(CosmosMsg::Wasm(WasmMsg::Execute {
-                    contract_addr: env.contract.address.to_string(),
-                    msg: to_json_binary(&{})?,
-                    funds: vec![],
-                }));
-            }
-
-            let quantity_for_query_fp = FPDecimal::from(rounded_atomic_amount);
-
-            let offer_denom =
-                match &ob_op.offer_asset_info {
-                    amm::AssetInfo::NativeToken { denom } => denom.clone(),
-                    _ => return Err(ContractError::Std(StdError::msg(
-                        "This OrderbookSwapOp implementation only supports native token inputs.",
-                    ))),
-                };
-
-            let target_denom = match &ob_op.ask_asset_info {
+            // Orderbook hops are placed natively: the contract submits an atomic
+            // spot market order that debits its own default subaccount. The order's
+            // direction, denoms and ticks are all derived from the market.
+            let offer_denom = match offer_asset_info {
                 amm::AssetInfo::NativeToken { denom } => denom.clone(),
                 _ => {
                     return Err(ContractError::Std(StdError::msg(
-                        "Orderbook swaps only support native token (bank) outputs.",
+                        "Orderbook swaps only support native token inputs.",
                     )))
                 }
             };
 
-            let simulate_msg = msg::orderbook::QueryMsg::GetOutputQuantity {
-                from_quantity: quantity_for_query_fp,
-                source_denom: offer_denom,
-                target_denom: target_denom.clone(),
-            };
-            let simulation_response: msg::orderbook::SwapEstimationResult = deps
-                .querier
-                .query_wasm_smart(&ob_op.swap_contract, &simulate_msg)?;
-            let expected_output_fp = simulation_response.result_quantity;
-            let slippage = FPDecimal::from_str("0.005")?;
+            let market = orderbook_exec::load_market(deps.as_ref(), &ob_op.market_id)?;
 
-            let min_output_with_slippage_fp = expected_output_fp * (FPDecimal::ONE - slippage);
-            let floored_min_output_fp = min_output_with_slippage_fp.int();
+            // The offer must be the side of the market opposite `target_denom`.
+            let expected_offer = orderbook_exec::offer_denom_for(&market, &ob_op.target_denom)
+                .map_err(|_| ContractError::InvalidOrderbookDenom {
+                    denom: ob_op.target_denom.clone(),
+                    market_id: ob_op.market_id.as_str().to_string(),
+                })?;
+            if offer_denom != expected_offer {
+                return Err(ContractError::InvalidOrderbookDenom {
+                    denom: offer_denom,
+                    market_id: ob_op.market_id.as_str().to_string(),
+                });
+            }
 
-            let swap_msg = orderbook::OrderbookExecuteMsg::SwapMinOutput {
-                target_denom,
-                min_output_quantity: floored_min_output_fp,
-            };
-
-            let funds = vec![Coin {
-                denom: match &ob_op.offer_asset_info {
-                    amm::AssetInfo::NativeToken { denom } => denom.clone(),
-                    _ => unreachable!(),
-                },
-                amount: rounded_atomic_amount.into(),
-            }];
-
-            CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: ob_op.swap_contract.clone(),
-                msg: to_json_binary(&swap_msg)?,
-                funds,
-            })
+            match orderbook_exec::build_swap_order_msg(
+                deps.as_ref(),
+                &env.contract.address,
+                &market,
+                &offer_denom,
+                amount,
+                ob_op.quantity,
+                ob_op.worst_price,
+            )? {
+                Some(order_msg) => order_msg,
+                None => return Err(ContractError::AmountTooSmall {}),
+            }
         }
         Operation::ClmmSwap(clmm_op) => {
             // Query the pool for expected output

@@ -317,6 +317,19 @@ pub enum ExecuteMsg {
     DeregisterTaxToken {
         contract_addr: String,
     },
+    /// Adds `signer` to the `FlashRoute` allowlist. Admin-only.
+    AuthorizeFlashSigner {
+        signer: String,
+    },
+    /// Removes `signer` from the `FlashRoute` allowlist. Admin-only.
+    RevokeFlashSigner {
+        signer: String,
+    },
+    /// Escape hatch: when `open` is `true`, `FlashRoute` is permissionless (the
+    /// signer allowlist is bypassed). Admin-only.
+    SetFlashUnrestricted {
+        open: bool,
+    },
     /// Capital-free CLMM flash-arb. Borrows `flash_amount` of `flash_asset` from
     /// `flash_pool`, runs the `stages` cycle (must end in `flash_asset` and must
     /// not route through `flash_pool`), repays principal + flash fee, and forwards
@@ -370,6 +383,27 @@ pub enum QueryMsg {
         start_after: Option<String>,
         limit: Option<u32>,
     },
+    /// Whether `signer` may call `FlashRoute` (true if explicitly allowlisted or
+    /// if flash is unrestricted).
+    #[returns(IsFlashSignerResponse)]
+    IsFlashSigner { signer: String },
+    /// All allowlisted flash signers, plus the unrestricted flag.
+    #[returns(FlashSignersResponse)]
+    FlashSigners {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
+}
+
+#[cw_serde]
+pub struct IsFlashSignerResponse {
+    pub authorized: bool,
+}
+
+#[cw_serde]
+pub struct FlashSignersResponse {
+    pub signers: Vec<String>,
+    pub unrestricted: bool,
 }
 
 #[cw_serde]

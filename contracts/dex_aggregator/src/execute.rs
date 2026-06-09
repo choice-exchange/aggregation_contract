@@ -11,7 +11,7 @@ use crate::orderbook_exec;
 use crate::reply::proceed_to_next_step;
 use crate::state::{
     Awaiting, ExecutionState, FlashRepayment, PendingFlashCtx, RoutePlan, CONFIG, FEE_MAP,
-    PENDING_FLASH, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
+    FLASH_SIGNERS, FLASH_UNRESTRICTED, PENDING_FLASH, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
 };
 
 pub fn update_admin(
@@ -34,6 +34,60 @@ pub fn update_admin(
     Ok(Response::new()
         .add_attribute("action", "update_admin")
         .add_attribute("new_admin", new_admin_addr.to_string()))
+}
+
+/// Admin-only: add `signer` to the `FlashRoute` allowlist.
+pub fn authorize_flash_signer(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    signer: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    let signer_addr = deps.api.addr_validate(&signer)?;
+    FLASH_SIGNERS.save(deps.storage, &signer_addr, &())?;
+
+    Ok(Response::new()
+        .add_attribute("action", "authorize_flash_signer")
+        .add_attribute("signer", signer_addr.to_string()))
+}
+
+/// Admin-only: remove `signer` from the `FlashRoute` allowlist.
+pub fn revoke_flash_signer(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    signer: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    let signer_addr = deps.api.addr_validate(&signer)?;
+    FLASH_SIGNERS.remove(deps.storage, &signer_addr);
+
+    Ok(Response::new()
+        .add_attribute("action", "revoke_flash_signer")
+        .add_attribute("signer", signer_addr.to_string()))
+}
+
+/// Admin-only: toggle the `FlashRoute` signer gate on/off. When `open` is true,
+/// `FlashRoute` is permissionless.
+pub fn set_flash_unrestricted(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    open: bool,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+    FLASH_UNRESTRICTED.save(deps.storage, &open)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "set_flash_unrestricted")
+        .add_attribute("open", open.to_string()))
 }
 
 pub fn execute_aggregate_swaps_internal(
@@ -107,6 +161,15 @@ pub fn execute_flash_route(
     let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
     if total_percentage != 100 {
         return Err(ContractError::InvalidPercentageSum {});
+    }
+
+    // Signer allowlist gate: only authorized EOAs may flash-borrow through the
+    // aggregator (unless flash is unrestricted). `info.sender` here is the real
+    // originating signer — the only layer where it is visible.
+    if !FLASH_UNRESTRICTED.may_load(deps.storage)?.unwrap_or(false)
+        && FLASH_SIGNERS.may_load(deps.storage, &info.sender)?.is_none()
+    {
+        return Err(ContractError::Unauthorized {});
     }
 
     let flash_pool_addr = deps.api.addr_validate(&flash_pool)?;

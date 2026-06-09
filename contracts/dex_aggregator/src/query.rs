@@ -1,8 +1,9 @@
 use crate::msg::{
-    amm, clmm, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse, Stage,
+    amm, clmm, AllFeesResponse, FeeInfo, FeeResponse, FlashSignersResponse, IsFlashSignerResponse,
+    Operation, SimulateRouteResponse, Stage,
 };
 use crate::orderbook_exec::{self, FPCoin};
-use crate::state::{apply_fee, Config, FEE_MAP};
+use crate::state::{apply_fee, Config, FEE_MAP, FLASH_SIGNERS, FLASH_UNRESTRICTED};
 use cosmwasm_std::{
     to_json_binary, Addr, Binary, Coin, Deps, Env, Order, StdError, StdResult, Uint128, WasmQuery,
 };
@@ -310,6 +311,47 @@ pub fn query_all_fees(
         .collect::<StdResult<_>>()?;
 
     to_json_binary(&AllFeesResponse { fees })
+}
+
+/// Whether `signer` may call `FlashRoute` (explicitly allowlisted, or flash is
+/// unrestricted).
+pub fn query_is_flash_signer(deps: Deps, signer: String) -> StdResult<Binary> {
+    let signer_addr = deps.api.addr_validate(&signer)?;
+    let unrestricted = FLASH_UNRESTRICTED.may_load(deps.storage)?.unwrap_or(false);
+    let authorized = unrestricted || FLASH_SIGNERS.has(deps.storage, &signer_addr);
+    to_json_binary(&IsFlashSignerResponse { authorized })
+}
+
+/// Lists allowlisted flash signers (paginated) plus the unrestricted flag.
+pub fn query_flash_signers(
+    deps: Deps,
+    start_after: Option<String>,
+    limit: Option<u32>,
+) -> StdResult<Binary> {
+    let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT) as usize;
+    let start = start_after
+        .map(|addr| deps.api.addr_validate(&addr))
+        .transpose()?;
+
+    let signers: Vec<String> = FLASH_SIGNERS
+        .range(
+            deps.storage,
+            start.as_ref().map(Bound::exclusive),
+            None,
+            Order::Ascending,
+        )
+        .take(limit)
+        .map(|item| {
+            let (signer_addr, _) = item?;
+            Ok(signer_addr.to_string())
+        })
+        .collect::<StdResult<_>>()?;
+
+    let unrestricted = FLASH_UNRESTRICTED.may_load(deps.storage)?.unwrap_or(false);
+    to_json_binary(&FlashSignersResponse {
+        signers,
+        unrestricted,
+    })
 }
 
 #[cfg(test)]

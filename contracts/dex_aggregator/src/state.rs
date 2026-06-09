@@ -148,3 +148,15 @@ pub const REPLY_ID_COUNTER: Item<u64> = Item::new("reply_id_counter");
 /// The key is the token's contract address.
 /// The value is a simple boolean `true` to indicate it's registered.
 pub const TAX_TOKEN_REGISTRY: Map<&Addr, bool> = Map::new("tax_tokens");
+
+/// Allowlist of signers (EOAs) permitted to call `FlashRoute`. The key is the
+/// signer address; presence == authorized. Mutated by the admin via
+/// `AuthorizeFlashSigner` / `RevokeFlashSigner` and checked in
+/// `execute_flash_route`. An empty map means no one may flash-borrow through the
+/// aggregator (deny-all) unless `FLASH_UNRESTRICTED` is set.
+pub const FLASH_SIGNERS: Map<&Addr, ()> = Map::new("flash_signers");
+
+/// Escape hatch: when `true`, the `FLASH_SIGNERS` gate in `execute_flash_route`
+/// is skipped and `FlashRoute` is permissionless again. Admin-settable via
+/// `SetFlashUnrestricted`. Absent == `false` (gate enforced).
+pub const FLASH_UNRESTRICTED: Item<bool> = Item::new("flash_unrestricted");

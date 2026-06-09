@@ -131,6 +131,15 @@ pub fn execute(
         ExecuteMsg::DeregisterTaxToken { contract_addr } => {
             crate::execute::deregister_tax_token(deps, info, contract_addr)
         }
+        ExecuteMsg::AuthorizeFlashSigner { signer } => {
+            crate::execute::authorize_flash_signer(deps, info, signer)
+        }
+        ExecuteMsg::RevokeFlashSigner { signer } => {
+            crate::execute::revoke_flash_signer(deps, info, signer)
+        }
+        ExecuteMsg::SetFlashUnrestricted { open } => {
+            crate::execute::set_flash_unrestricted(deps, info, open)
+        }
         ExecuteMsg::FlashRoute {
             flash_pool,
             flash_asset,
@@ -169,6 +178,12 @@ pub fn query(deps: Deps<InjectiveQueryWrapper>, env: Env, msg: QueryMsg) -> StdR
         }
         QueryMsg::AllFees { start_after, limit } => {
             crate::query::query_all_fees(deps.into_empty(), start_after, limit)
+        }
+        QueryMsg::IsFlashSigner { signer } => {
+            crate::query::query_is_flash_signer(deps.into_empty(), signer)
+        }
+        QueryMsg::FlashSigners { start_after, limit } => {
+            crate::query::query_flash_signers(deps.into_empty(), start_after, limit)
         }
     }
 }

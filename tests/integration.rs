@@ -7,8 +7,9 @@ use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
-    OrderbookSwapOp, QueryMsg, SimulateRouteResponse, Split, Stage,
+    amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg,
+    IsFlashSignerResponse, Operation, OrderbookSwapOp, QueryMsg, SimulateRouteResponse, Split,
+    Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
 use injective_cosmwasm::{get_default_subaccount_id_for_checked_address, MarketId};
@@ -4153,6 +4154,7 @@ fn test_clmm_multi_hop() {
 
 struct FlashEnv {
     app: InjectiveTestApp,
+    admin: SigningAccount,
     user: SigningAccount,
     aggregator_addr: String,
     /// token0 = usdt, token1 = inj, 0.30% flash fee.
@@ -4230,6 +4232,17 @@ fn setup_for_flash_test() -> FlashEnv {
         .unwrap()
         .data
         .address;
+
+    // Allowlist the flash caller; FlashRoute is gated on the signer allowlist.
+    wasm.execute(
+        &aggregator_addr,
+        &ExecuteMsg::AuthorizeFlashSigner {
+            signer: user.address(),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
 
     let flash_pool_addr = wasm
         .instantiate(
@@ -4328,6 +4341,7 @@ fn setup_for_flash_test() -> FlashEnv {
 
     FlashEnv {
         app,
+        admin,
         user,
         aggregator_addr,
         flash_pool_addr,
@@ -4530,4 +4544,153 @@ fn test_flash_callback_without_pending_flash_rejected() {
         err.contains("no flash in flight"),
         "expected NoPendingFlash, got: {err}"
     );
+}
+
+#[test]
+fn test_flash_route_unauthorized_signer_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A signer NOT on the allowlist may not flash-borrow through the aggregator,
+    // even with an otherwise-valid, profitable cycle.
+    let outsider = env
+        .app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized, got: {err}"
+    );
+
+    // After the admin authorizes them, the same call succeeds.
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::AuthorizeFlashSigner {
+            signer: outsider.address(),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_ok());
+
+    // And revoking shuts them out again.
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::RevokeFlashSigner {
+            signer: outsider.address(),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized after revoke, got: {err}"
+    );
+}
+
+#[test]
+fn test_authorize_flash_signer_admin_only() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A non-admin cannot mutate the allowlist.
+    let err = wasm
+        .execute(
+            &env.aggregator_addr,
+            &ExecuteMsg::AuthorizeFlashSigner {
+                signer: env.user.address(),
+            },
+            &[],
+            &env.user,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized, got: {err}"
+    );
+
+    // The IsFlashSigner query reflects the seeded allowlist (user authorized in
+    // setup; a fresh account is not).
+    let outsider = env.app.init_account(&[]).unwrap();
+    let user_auth: IsFlashSignerResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::IsFlashSigner {
+                signer: env.user.address(),
+            },
+        )
+        .unwrap();
+    assert!(user_auth.authorized);
+    let outsider_auth: IsFlashSignerResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::IsFlashSigner {
+                signer: outsider.address(),
+            },
+        )
+        .unwrap();
+    assert!(!outsider_auth.authorized);
+}
+
+#[test]
+fn test_flash_unrestricted_bypasses_signer_gate() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    let outsider = env
+        .app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000),
+    };
+
+    // Blocked while gated...
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_err());
+
+    // ...admin opens flash globally...
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFlashUnrestricted { open: true },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    // ...and now any signer may flash-borrow.
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_ok());
 }

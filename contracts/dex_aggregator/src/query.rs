@@ -2,9 +2,9 @@ use crate::msg::{
     amm, clmm, AllFeesResponse, FeeInfo, FeeResponse, Operation, SimulateRouteResponse, Stage,
 };
 use crate::orderbook_exec::{self, FPCoin};
-use crate::state::{Config, FEE_MAP};
+use crate::state::{apply_fee, Config, FEE_MAP};
 use cosmwasm_std::{
-    to_json_binary, Binary, Coin, Deps, Env, Order, StdError, StdResult, Uint128, WasmQuery,
+    to_json_binary, Addr, Binary, Coin, Deps, Env, Order, StdError, StdResult, Uint128, WasmQuery,
 };
 use cw_storage_plus::Bound;
 use injective_cosmwasm::InjectiveQueryWrapper;
@@ -92,6 +92,27 @@ pub fn simulate_route(
                 let output_asset =
                     simulate_single_operation(deps, &env, operation, &current_path_asset)?;
                 current_path_asset = output_asset;
+            }
+
+            // Mirror the executor: the aggregator's per-pool fee (FEE_MAP) is
+            // deducted once at each split path's terminal hop (see
+            // `handle_swap_reply` in reply.rs). Orderbook terminals carry no
+            // aggregator fee. Without this the simulation over-reports output vs
+            // the executed fill for any pool with a configured fee.
+            let fee_pool: Option<String> = match split.path.last() {
+                Some(Operation::AmmSwap(o)) => Some(o.pool_address.clone()),
+                Some(Operation::ClmmSwap(o)) => Some(o.pool_address.clone()),
+                Some(Operation::OrderbookSwap(_)) | None => None,
+            };
+            if let Some(addr) = fee_pool {
+                // Read-only fee lookup: `Addr::unchecked` yields the same FEE_MAP
+                // storage key as the validated address the executor uses (an
+                // invalid address simply isn't in the map → zero fee), so we skip
+                // bech32 validation here.
+                let pool_addr = Addr::unchecked(addr);
+                let (after_fee, _fee) =
+                    apply_fee(deps.storage, &pool_addr, current_path_asset.amount)?;
+                current_path_asset.amount = after_fee;
             }
 
             next_stage_outputs.push(current_path_asset);

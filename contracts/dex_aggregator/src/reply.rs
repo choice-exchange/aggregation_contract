@@ -10,11 +10,9 @@ use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
 use crate::orderbook_exec;
 use crate::state::{
-    Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, SwapLeg, ACTIVE_ROUTES,
-    CONFIG, FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
+    apply_fee, Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, SwapLeg,
+    ACTIVE_ROUTES, CONFIG, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
 };
-
-const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
 
 pub fn handle_reply(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -261,7 +259,7 @@ fn handle_swap_reply(
             Operation::OrderbookSwap(_) => (received_amount, Uint128::zero(), None),
             _ => {
                 let pool_addr = deps.api.addr_validate(&get_operation_address(replied_op))?;
-                let (after_fee, fee) = apply_fee(&deps, &pool_addr, received_amount)?;
+                let (after_fee, fee) = apply_fee(deps.storage, &pool_addr, received_amount)?;
                 (after_fee, fee, Some(pool_addr.to_string()))
             }
         };
@@ -300,20 +298,6 @@ fn handle_swap_reply(
         }
         Ok(response)
     }
-}
-
-fn apply_fee(
-    deps: &DepsMut<InjectiveQueryWrapper>,
-    pool_addr: &Addr,
-    amount: Uint128,
-) -> Result<(Uint128, Uint128), StdError> {
-    let fee = match FEE_MAP.may_load(deps.storage, pool_addr)? {
-        Some(fee_percent) => amount.multiply_ratio(fee_percent.atomics(), DECIMAL_FRACTIONAL),
-        None => Uint128::zero(),
-    };
-
-    let amount_after_fee = amount.checked_sub(fee)?;
-    Ok((amount_after_fee, fee))
 }
 
 // A helper to create the final transfer message.

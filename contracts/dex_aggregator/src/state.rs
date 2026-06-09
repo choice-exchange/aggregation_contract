@@ -1,6 +1,6 @@
 use crate::msg::{amm, Operation, PlannedSwap, Stage};
 use cosmwasm_schema::cw_serde;
-use cosmwasm_std::{Addr, Decimal, Uint128};
+use cosmwasm_std::{Addr, Decimal, StdError, Storage, Uint128};
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,29 @@ pub enum Awaiting {
 
 pub const CONFIG: Item<Config> = Item::new("config");
 pub const FEE_MAP: Map<&Addr, Decimal> = Map::new("fee_map");
+
+/// `FEE_MAP` denominator: fees are stored as `Decimal` (18-dp), so the raw
+/// `atomics()` are scaled by 1e18.
+const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
+
+/// The aggregator's per-pool fee for `pool_addr` applied to `amount`, returning
+/// `(amount_after_fee, fee)`. SHARED by the executor (`reply.rs`, at each split
+/// path's terminal hop) and the simulator (`query.rs`) so a `SimulateRoute`
+/// quote can't silently diverge from the executed fill. Orderbook hops carry no
+/// aggregator fee (the exchange takes its own trading fee) and must not call
+/// this. A pool with no `FEE_MAP` entry yields a zero fee.
+pub fn apply_fee(
+    storage: &dyn Storage,
+    pool_addr: &Addr,
+    amount: Uint128,
+) -> Result<(Uint128, Uint128), StdError> {
+    let fee = match FEE_MAP.may_load(storage, pool_addr)? {
+        Some(fee_percent) => amount.multiply_ratio(fee_percent.atomics(), DECIMAL_FRACTIONAL),
+        None => Uint128::zero(),
+    };
+    let amount_after_fee = amount.checked_sub(fee)?;
+    Ok((amount_after_fee, fee))
+}
 
 #[cw_serde]
 pub struct PendingPathOp {

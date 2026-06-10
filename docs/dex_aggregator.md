@@ -97,7 +97,7 @@ Used throughout to represent any token. The contract checks asset type mismatche
 | `ExecuteRoute { stages, minimum_receive }` | Any | Start swap with native token (exactly 1 coin in `funds`) |
 | `Receive(Cw20ReceiveMsg)` | Any | CW20 hook entry. Inner msg is `Cw20HookMsg::ExecuteRoute`. Also handles internal conversion receipts (non-hook CW20 receives emit a normalization event). |
 | `UpdateAdmin { new_admin }` | Admin | Transfer admin |
-| `SetFee { pool_address, fee_percent }` | Admin | Set/update per-pool fee (must be < 100%) |
+| `SetFee { pool_address, fee_fraction }` | Admin | Set/update per-pool fee (decimal fraction of output, e.g. 0.003 = 0.3%; must be < 1) |
 | `RemoveFee { pool_address }` | Admin | Remove fee for a pool |
 | `UpdateFeeCollector { new_fee_collector }` | Admin | Change fee recipient address |
 | `EmergencyWithdraw { asset_info }` | Admin | Withdraw all of a specific asset from the contract |
@@ -253,7 +253,7 @@ After all stages complete:
 
 - Fees are configured per pool address in `FEE_MAP` as `Decimal` percentages (must be < 1.0 / 100%)
 - Deducted at **path completion** — when the last operation in a split's path returns a result
-- Formula: `fee = amount * fee_percent`, `amount_after_fee = amount - fee`
+- Formula: `fee = amount * fee_fraction`, `amount_after_fee = amount - fee`
 - Fee is sent to `config.fee_collector` as a separate message appended to the response
 - Pools with no entry in `FEE_MAP` have zero fee
 

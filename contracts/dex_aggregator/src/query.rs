@@ -302,10 +302,10 @@ pub fn query_all_fees(
         )
         .take(limit)
         .map(|item| {
-            let (pool_addr, fee_percent) = item?;
+            let (pool_addr, fee_fraction) = item?;
             Ok(FeeInfo {
                 pool_address: pool_addr.to_string(),
-                fee_percent,
+                fee_fraction,
             })
         })
         .collect::<StdResult<_>>()?;

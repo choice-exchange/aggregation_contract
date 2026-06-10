@@ -298,7 +298,10 @@ pub enum ExecuteMsg {
     },
     SetFee {
         pool_address: String,
-        fee_percent: Decimal,
+        /// Aggregator fee as a decimal FRACTION of the hop's output (e.g.
+        /// "0.003" = 0.3%), NOT a percent. Renamed from the misleading
+        /// `fee_percent`. Must be < 1.
+        fee_fraction: Decimal,
     },
     RemoveFee {
         pool_address: String,
@@ -356,7 +359,8 @@ pub enum ExecuteMsg {
 #[cw_serde]
 pub struct FeeInfo {
     pub pool_address: String,
-    pub fee_percent: Decimal,
+    /// Decimal fraction of output (e.g. "0.003" = 0.3%), not a percent.
+    pub fee_fraction: Decimal,
 }
 
 #[cw_serde]

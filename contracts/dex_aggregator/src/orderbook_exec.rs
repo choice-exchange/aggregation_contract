@@ -223,8 +223,8 @@ pub fn estimate_single_swap_execution(
     // discounted net fee over-commits the held quote and the order is rejected
     // ("insufficient funds"). SELL output uses the net fee (what the self-relaying
     // contract actually nets, discount included).
-    let gross_fee_percent = market.taker_fee_rate * fee_multiplier;
-    let net_fee_percent = gross_fee_percent
+    let gross_fee_fraction = market.taker_fee_rate * fee_multiplier;
+    let net_fee_fraction = gross_fee_fraction
         * (FPDecimal::ONE - get_effective_fee_discount_rate(market, is_self_relayer));
 
     // from-source: paying quote => buying base; paying base => selling.
@@ -237,11 +237,11 @@ pub fn estimate_single_swap_execution(
             contract_address,
             market,
             input.amount,
-            gross_fee_percent,
+            gross_fee_fraction,
             is_simulation,
         )
     } else {
-        estimate_execution_sell_from_source(&querier, market, input.amount, net_fee_percent)
+        estimate_execution_sell_from_source(&querier, market, input.amount, net_fee_fraction)
     }
 }
 
@@ -253,10 +253,10 @@ fn estimate_execution_buy_from_source(
     contract_address: &Addr,
     market: &SpotMarket,
     input_quote_quantity: FPDecimal,
-    fee_percent: FPDecimal,
+    fee_fraction: FPDecimal,
     is_simulation: bool,
 ) -> StdResult<StepExecutionEstimate> {
-    let available_swap_quote_funds = input_quote_quantity / (FPDecimal::ONE + fee_percent);
+    let available_swap_quote_funds = input_quote_quantity / (FPDecimal::ONE + fee_fraction);
 
     let orders = querier.query_spot_market_orderbook(
         &market.market_id,
@@ -295,7 +295,7 @@ fn estimate_execution_buy_from_source(
     // NOT require the aggregator to be pre-seeded with the quote denom.
     if !is_simulation {
         // Check against the rounded quantity actually placed (margin basis).
-        let required_funds = worst_price * result_quantity * (FPDecimal::ONE + fee_percent);
+        let required_funds = worst_price * result_quantity * (FPDecimal::ONE + fee_fraction);
         let funds_in_contract: FPDecimal = deps
             .querier
             .query_balance(contract_address, &market.quote_denom)
@@ -327,7 +327,7 @@ fn estimate_execution_sell_from_source(
     querier: &InjectiveQuerier,
     market: &SpotMarket,
     input_base_quantity: FPDecimal,
-    fee_percent: FPDecimal,
+    fee_fraction: FPDecimal,
 ) -> StdResult<StepExecutionEstimate> {
     let orders = querier.query_spot_market_orderbook(
         &market.market_id,
@@ -349,7 +349,7 @@ fn estimate_execution_sell_from_source(
     let worst_price = get_worst_price_from_orders(&top_orders)?;
 
     let expected_exchange_quantity = input_base_quantity * average_price;
-    let fee_estimate = expected_exchange_quantity * fee_percent;
+    let fee_estimate = expected_exchange_quantity * fee_fraction;
     let expected_quantity = expected_exchange_quantity - fee_estimate;
 
     Ok(StepExecutionEstimate {

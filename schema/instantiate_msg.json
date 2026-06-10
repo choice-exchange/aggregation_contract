@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InstantiateMsg",
+  "type": "object",
+  "required": [
+    "admin",
+    "cw20_adapter_address",
+    "fee_collector_address"
+  ],
+  "properties": {
+    "admin": {
+      "type": "string"
+    },
+    "cw20_adapter_address": {
+      "type": "string"
+    },
+    "fee_collector_address": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

@@ -489,7 +489,7 @@ pub fn set_fee(
     deps: DepsMut<InjectiveQueryWrapper>,
     info: MessageInfo,
     pool_address: String,
-    fee_percent: Decimal,
+    fee_fraction: Decimal,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     let config = CONFIG.load(deps.storage)?;
     if info.sender != config.admin {
@@ -497,19 +497,19 @@ pub fn set_fee(
     }
 
     // Validate that the fee is reasonable (e.g., less than 100%)
-    if fee_percent >= Decimal::one() {
+    if fee_fraction >= Decimal::one() {
         return Err(ContractError::Std(StdError::msg(
             "Fee percentage must be less than 100%",
         )));
     }
 
     let pool_addr = deps.api.addr_validate(&pool_address)?;
-    FEE_MAP.save(deps.storage, &pool_addr, &fee_percent)?;
+    FEE_MAP.save(deps.storage, &pool_addr, &fee_fraction)?;
 
     Ok(Response::new()
         .add_attribute("action", "set_fee")
         .add_attribute("pool_address", pool_addr)
-        .add_attribute("fee_percent", fee_percent.to_string()))
+        .add_attribute("fee_fraction", fee_fraction.to_string()))
 }
 
 /// Admin-only. Removes the fee for a given pool address.

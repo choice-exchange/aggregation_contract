@@ -39,7 +39,7 @@ pub fn apply_fee(
     amount: Uint128,
 ) -> Result<(Uint128, Uint128), StdError> {
     let fee = match FEE_MAP.may_load(storage, pool_addr)? {
-        Some(fee_percent) => amount.multiply_ratio(fee_percent.atomics(), DECIMAL_FRACTIONAL),
+        Some(fee_fraction) => amount.multiply_ratio(fee_fraction.atomics(), DECIMAL_FRACTIONAL),
         None => Uint128::zero(),
     };
     let amount_after_fee = amount.checked_sub(fee)?;

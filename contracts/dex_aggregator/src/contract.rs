@@ -116,8 +116,8 @@ pub fn execute(
         }
         ExecuteMsg::SetFee {
             pool_address,
-            fee_percent,
-        } => set_fee(deps, info, pool_address, fee_percent),
+            fee_fraction,
+        } => set_fee(deps, info, pool_address, fee_fraction),
         ExecuteMsg::RemoveFee { pool_address } => remove_fee(deps, info, pool_address),
         ExecuteMsg::UpdateFeeCollector { new_fee_collector } => {
             update_fee_collector(deps, info, new_fee_collector)

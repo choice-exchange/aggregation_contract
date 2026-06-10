@@ -2698,13 +2698,13 @@ fn test_fee_collection_on_single_swap() {
 
     // --- 1. SETUP: Admin sets a 0.3% fee on the first mock AMM pool ---
     let fee_pool_address = env.mock_amm_1_addr.clone();
-    let fee_percent = Decimal::from_str("0.003").unwrap(); // 0.3%
+    let fee_fraction = Decimal::from_str("0.003").unwrap(); // 0.3%
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2830,13 +2830,13 @@ fn test_fee_collection_on_cw20_output() {
 
     // --- 1. SETUP: Admin sets a 1.5% fee on the INJ -> CW20 SHROOM pool ---
     let fee_pool_address = setup.mock_inj_to_cw20_shroom_amm.clone();
-    let fee_percent = Decimal::from_str("0.015").unwrap(); // 1.5%
+    let fee_fraction = Decimal::from_str("0.015").unwrap(); // 1.5%
 
     wasm.execute(
         &setup.env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2912,7 +2912,7 @@ fn test_admin_functions_fail_for_unauthorized_user() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: env.mock_amm_1_addr.clone(),
-            fee_percent: Decimal::from_str("0.01").unwrap(),
+            fee_fraction: Decimal::from_str("0.01").unwrap(),
         },
         &[],
         unauthorized_user,
@@ -2973,7 +2973,7 @@ fn test_full_admin_fee_lifecycle() {
     let original_collector = &env.fee_collector;
 
     let fee_pool_address = env.mock_amm_1_addr.clone();
-    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+    let fee_fraction = Decimal::from_str("0.01").unwrap(); // 1%
     let expected_fee = Uint128::new(10_000_000); // 10 USDT fee
 
     // --- 1. Admin sets a fee ---
@@ -2981,7 +2981,7 @@ fn test_full_admin_fee_lifecycle() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -3062,7 +3062,7 @@ fn test_full_admin_fee_lifecycle() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -3122,13 +3122,13 @@ fn test_multi_split_with_mixed_fees() {
     // --- 1. SETUP: Admin sets a 1% fee on AMM1, but NO fee on AMM2 ---
     let taxed_pool = env.mock_amm_1_addr.clone();
     let untaxed_pool = env.mock_amm_2_addr.clone();
-    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+    let fee_fraction = Decimal::from_str("0.01").unwrap(); // 1%
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: taxed_pool.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -3229,13 +3229,13 @@ fn test_fee_truncates_to_zero() {
     // --- 1. SETUP: Admin sets a tiny fee on a pool ---
     let fee_pool_address = env.mock_amm_1_addr.clone();
     // This fee is 0.0001%, which is 0.000001 as a decimal.
-    let tiny_fee_percent = Decimal::from_str("0.000001").unwrap();
+    let tiny_fee_fraction = Decimal::from_str("0.000001").unwrap();
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent: tiny_fee_percent,
+            fee_fraction: tiny_fee_fraction,
         },
         &[],
         admin,

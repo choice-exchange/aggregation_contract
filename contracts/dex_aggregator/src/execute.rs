@@ -106,7 +106,9 @@ pub fn execute_aggregate_swaps_internal(
     }
 
     let first_stage = stages.first().unwrap();
-    let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
+    // Sum in u32: `percent` is u8, and a malformed split set can sum past 255 and
+    // wrap (or, with overflow-checks, panic) if summed in u8.
+    let total_percentage: u32 = first_stage.splits.iter().map(|s| s.percent as u32).sum();
     if total_percentage != 100 {
         return Err(ContractError::InvalidPercentageSum {});
     }
@@ -158,7 +160,7 @@ pub fn execute_flash_route(
         return Err(ContractError::NoStages {});
     }
     let first_stage = stages.first().unwrap();
-    let total_percentage: u8 = first_stage.splits.iter().map(|s| s.percent).sum();
+    let total_percentage: u32 = first_stage.splits.iter().map(|s| s.percent as u32).sum();
     if total_percentage != 100 {
         return Err(ContractError::InvalidPercentageSum {});
     }

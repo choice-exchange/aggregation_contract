@@ -298,8 +298,7 @@ fn estimate_execution_buy_from_source(
         let required_funds = worst_price * result_quantity * (FPDecimal::ONE + fee_fraction);
         let funds_in_contract: FPDecimal = deps
             .querier
-            .query_balance(contract_address, &market.quote_denom)
-            .expect("query own balance should not fail")
+            .query_balance(contract_address, &market.quote_denom)?
             .amount
             .into();
         if required_funds > funds_in_contract {

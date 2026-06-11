@@ -822,7 +822,6 @@ dependencies = [
  "cosmwasm-std",
  "cw-storage-plus",
  "cw2",
- "hex",
  "injective-cosmwasm",
  "injective-math",
  "injective-std",
@@ -834,7 +833,6 @@ dependencies = [
  "serde",
  "serde-json-wasm",
  "serde_json",
- "serde_repr",
  "thiserror 2.0.18",
 ]
 

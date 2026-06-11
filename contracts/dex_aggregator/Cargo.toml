@@ -34,17 +34,14 @@ prost               = { version = "0.13" }
 schemars           = { version = "0.8.22" }
 serde              = { version = "1.0.219", default-features = false, features = ["derive"] }
 serde-json-wasm    = { version = "1.0.0" }   # wasm-safe JSON for the aggregator_swap leg blob
-serde_json         = { version = "1.0.140" }
-serde_repr         = { version = "0.1.20" }
 
 thiserror         = { version = "2.0.12" }
-
-hex               = { version = "0.4.3" }
 
 [dev-dependencies]
 injective-test-tube = { version = "1.19.0" }
 mock_swap = { path = "../mock_swap" }
 mock_clmm_flash = { path = "../mock_clmm_flash" }
+serde_json = { version = "1.0.140" }   # integration tests only (parse swap_results JSON)
 
 [[test]]
 name = "integration"

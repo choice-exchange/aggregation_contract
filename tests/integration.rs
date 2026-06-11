@@ -8,8 +8,8 @@ use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
     amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg,
-    IsFlashSignerResponse, Operation, OrderbookSwapOp, QueryMsg, SimulateRouteResponse, Split,
-    Stage,
+    IsFlashSignerResponse, MigrateMsg, Operation, OrderbookSwapOp, QueryMsg, SimulateRouteResponse,
+    Split, Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
 use injective_cosmwasm::{get_default_subaccount_id_for_checked_address, MarketId};
@@ -3319,6 +3319,48 @@ fn test_fee_truncates_to_zero() {
         Uint128::zero(),
         "Fee collector should have a zero balance"
     );
+}
+
+#[test]
+fn test_migrate_preserves_state_and_is_admin_gated() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Capture pre-migrate state we expect to survive the migration untouched.
+    let before: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+
+    // Upload the same wasm again to get a fresh code id to migrate onto.
+    let new_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+
+    // A non-admin cannot migrate (chain-enforced on the wasm module).
+    let unauthorized = wasm.migrate(new_code_id, &env.aggregator_addr, &MigrateMsg {}, &env.user);
+    assert!(
+        unauthorized.is_err(),
+        "migrate by a non-admin must be rejected"
+    );
+
+    // The code admin can migrate; the entry point runs cw2's identity/version guard.
+    wasm.migrate(
+        new_code_id,
+        &env.aggregator_addr,
+        &MigrateMsg {},
+        &env.admin,
+    )
+    .expect("admin migrate should succeed");
+
+    // Persistent state (CONFIG) is untouched by the no-op migration.
+    let after: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(after.admin, before.admin);
+    assert_eq!(after.cw20_adapter_address, before.cw20_adapter_address);
+    assert_eq!(after.fee_collector, before.fee_collector);
 }
 
 #[test]

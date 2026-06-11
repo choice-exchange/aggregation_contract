@@ -931,6 +931,8 @@ fn plan_next_stage(
             amount: amount_for_split,
             split_index: i,
             op_index: 0,
+            // Already resolved above (loads the spot market once for orderbook ops).
+            offer_info: offer_infos[i].clone(),
         });
     }
 
@@ -973,7 +975,9 @@ fn execute_planned_swaps(
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
 
     for swap in swaps.iter().filter(|s| !s.amount.is_zero()) {
-        let offer_asset_info = get_operation_input(deps.as_ref(), &swap.operation)?;
+        // Resolved at plan time (see `PlannedSwap.offer_info`) — avoids re-running
+        // `get_operation_input`, which for an orderbook op is a `load_market` query.
+        let offer_asset_info = swap.offer_info.clone();
         // `None` => this hop provably yields nothing; skip the split entirely
         // (don't burn a reply id or persist submsg state for a message we never send).
         let msg = match create_swap_cosmos_msg(

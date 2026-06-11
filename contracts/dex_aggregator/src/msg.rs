@@ -263,6 +263,10 @@ pub struct PlannedSwap {
     pub amount: Uint128,
     pub split_index: usize,
     pub op_index: usize,
+    /// The hop's offer (input) asset, resolved once when the stage is planned.
+    /// Carried so `execute_planned_swaps` doesn't re-derive it — for an orderbook
+    /// op that re-derivation is a spot-market chain query (`load_market`).
+    pub offer_info: amm::AssetInfo,
 }
 
 pub struct StagePlan {
@@ -284,6 +288,14 @@ pub struct InstantiateMsg {
     pub cw20_adapter_address: String,
     pub fee_collector_address: String,
 }
+
+/// No-op migrate payload. The route engine's state (`ACTIVE_ROUTES`,
+/// `SUBMSG_REPLY_STATES`, ...) is transient within a single atomic tx, and the
+/// persistent stores (`CONFIG`, `FEE_MAP`, `FLASH_SIGNERS`, `TAX_TOKEN_REGISTRY`)
+/// are structurally unchanged, so no data migration is required — the `migrate`
+/// entry point only guards the contract identity and bumps the stored version.
+#[cw_serde]
+pub struct MigrateMsg {}
 
 #[cw_serde]
 pub enum ExecuteMsg {

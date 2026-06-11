@@ -1,0 +1,7 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MigrateMsg",
+  "description": "No-op migrate payload. The route engine's state (`ACTIVE_ROUTES`, `SUBMSG_REPLY_STATES`, ...) is transient within a single atomic tx, and the persistent stores (`CONFIG`, `FEE_MAP`, `FLASH_SIGNERS`, `TAX_TOKEN_REGISTRY`) are structurally unchanged, so no data migration is required — the `migrate` entry point only guards the contract identity and bumps the stored version.",
+  "type": "object",
+  "additionalProperties": false
+}

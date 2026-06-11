@@ -92,6 +92,58 @@
         }
       },
       "additionalProperties": false
+    },
+    {
+      "description": "Whether `signer` may call `FlashRoute` (true if explicitly allowlisted or if flash is unrestricted).",
+      "type": "object",
+      "required": [
+        "is_flash_signer"
+      ],
+      "properties": {
+        "is_flash_signer": {
+          "type": "object",
+          "required": [
+            "signer"
+          ],
+          "properties": {
+            "signer": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "All allowlisted flash signers, plus the unrestricted flag.",
+      "type": "object",
+      "required": [
+        "flash_signers"
+      ],
+      "properties": {
+        "flash_signers": {
+          "type": "object",
+          "properties": {
+            "limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "start_after": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
     }
   ],
   "definitions": {

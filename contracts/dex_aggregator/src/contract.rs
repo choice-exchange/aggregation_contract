@@ -7,7 +7,7 @@ use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
-use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::state::{Config, CONFIG, REPLY_ID_COUNTER};
 
 pub const CONTRACT_NAME: &str = "crates.io:dex-aggregator";
@@ -195,4 +195,22 @@ pub fn reply(
     msg: Reply,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     crate::reply::handle_reply(deps, env, msg)
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn migrate(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    _env: Env,
+    _msg: MigrateMsg,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    // Rejects migrating from a different contract name or a newer version, and
+    // bumps the stored `cw2` version to CONTRACT_VERSION. No state migration is
+    // needed (see `MigrateMsg`). Only the code admin can invoke this (chain-enforced).
+    let prev_version =
+        cw2::ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "migrate")
+        .add_attribute("from_version", prev_version.to_string())
+        .add_attribute("to_version", CONTRACT_VERSION))
 }

@@ -167,7 +167,9 @@ pub fn execute_flash_route(
     // aggregator (unless flash is unrestricted). `info.sender` here is the real
     // originating signer — the only layer where it is visible.
     if !FLASH_UNRESTRICTED.may_load(deps.storage)?.unwrap_or(false)
-        && FLASH_SIGNERS.may_load(deps.storage, &info.sender)?.is_none()
+        && FLASH_SIGNERS
+            .may_load(deps.storage, &info.sender)?
+            .is_none()
     {
         return Err(ContractError::Unauthorized {});
     }

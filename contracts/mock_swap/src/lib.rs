@@ -1,15 +1,17 @@
+use crate::cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{
     entry_point, from_json, to_json_binary, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps,
     DepsMut, Env, Event, MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
-use cw20::{Cw20ExecuteMsg, Cw20ReceiveMsg};
 use cw_storage_plus::Item;
 use injective_cosmwasm::InjectiveQueryWrapper;
 use injective_math::FPDecimal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
+
+pub mod cw20;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -51,6 +53,11 @@ pub enum ExecuteMsg {
         target_denom: String,
         min_output_quantity: String,
     },
+    SwapExactInput {
+        minimum_amount_out: Uint128,
+        recipient: Option<String>,
+        deadline: Option<u64>,
+    },
     Receive(Cw20ReceiveMsg),
 }
 
@@ -58,6 +65,7 @@ pub enum ExecuteMsg {
 pub enum ProtocolType {
     Amm,
     Orderbook,
+    Clmm,
 }
 
 #[cw_serde]
@@ -90,12 +98,48 @@ pub struct MockSwapHookSwapField {
 }
 
 #[cw_serde]
+pub struct ClmmCw20HookMsg {
+    pub minimum_amount_out: Uint128,
+    pub recipient: Option<String>,
+    pub deadline: Option<u64>,
+}
+
+#[cw_serde]
+pub struct QuoteResponse {
+    pub amount_out: Uint128,
+    pub amount_in_consumed: Uint128,
+    pub fee_amount: Uint128,
+}
+
+/// Mirrors the legacy pair's `PairInfo` (partial) so the aggregator's
+/// `SimulateRoute` can derive a hop's output asset from `Pair {}`.
+#[cw_serde]
+pub struct PairInfo {
+    pub asset_infos: [AssetInfo; 2],
+}
+
+/// Mirrors the CLMM pool's `PoolConfig` (partial) for `GetConfig {}`.
+#[cw_serde]
+pub struct ConfigResponse {
+    pub token0: AssetInfo,
+    pub token1: AssetInfo,
+}
+
+#[cw_serde]
 pub enum QueryMsg {
     GetOutputQuantity {
         from_quantity: FPDecimal,
         source_denom: String,
         target_denom: String,
     },
+    Quote {
+        token_in: AssetInfo,
+        amount_in: Uint128,
+    },
+    /// Legacy-AMM pair info (output-asset derivation in `SimulateRoute`).
+    Pair {},
+    /// CLMM pool config (output-asset derivation in `SimulateRoute`).
+    GetConfig {},
 }
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
@@ -132,11 +176,26 @@ pub fn execute(
             (offer_asset.amount, offer_asset.info)
         }
         ExecuteMsg::SwapMinOutput { .. } => (
-            info.funds[0].amount,
+            Uint128::try_from(info.funds[0].amount)
+                .map_err(|_| StdError::msg("funds amount exceeds Uint128"))?,
             AssetInfo::NativeToken {
                 denom: info.funds[0].denom.clone(),
             },
         ),
+        ExecuteMsg::SwapExactInput {
+            recipient: recip, ..
+        } => {
+            if let Some(recip_addr) = recip {
+                recipient = recip_addr;
+            }
+            (
+                Uint128::try_from(info.funds[0].amount)
+                    .map_err(|_| StdError::msg("funds amount exceeds Uint128"))?,
+                AssetInfo::NativeToken {
+                    denom: info.funds[0].denom.clone(),
+                },
+            )
+        }
         ExecuteMsg::Receive(Cw20ReceiveMsg {
             sender,
             amount,
@@ -144,6 +203,8 @@ pub fn execute(
         }) => {
             if let Ok(hook) = from_json::<MockSwapHookMsg>(&msg) {
                 recipient = hook.swap.to.unwrap_or(sender);
+            } else if let Ok(clmm_hook) = from_json::<ClmmCw20HookMsg>(&msg) {
+                recipient = clmm_hook.recipient.unwrap_or(sender);
             } else {
                 recipient = sender;
             }
@@ -158,7 +219,7 @@ pub fn execute(
 
     let final_return_amount = if offer_info == config.input_asset_info {
         let offer_decimal = Decimal::from_atomics(offer_amount, config.input_decimals as u32)
-            .map_err(|_| StdError::generic_err("Failed to create decimal from offer amount"))?;
+            .map_err(|_| StdError::msg("Failed to create decimal from offer amount"))?;
 
         let rate_decimal = Decimal::from_str(&config.rate)?;
         let return_decimal = offer_decimal * rate_decimal;
@@ -190,7 +251,7 @@ pub fn execute(
             to_address: recipient,
             amount: vec![Coin {
                 denom: denom.clone(),
-                amount: final_return_amount,
+                amount: final_return_amount.into(),
             }],
         }),
     };
@@ -199,9 +260,13 @@ pub fn execute(
     let (output_denom_str, _) = get_denom_and_addr(&config.output_asset_info);
 
     let event = match config.protocol_type {
+        // `ask_asset` mirrors the real pair/pool swap event: it carries the output
+        // asset's key (denom or CW20 address) so the aggregator can recover the
+        // output `AssetInfo` from the reply without an explicit op field.
         ProtocolType::Amm => Event::new("wasm")
             .add_attribute("action", "swap")
-            .add_attribute("return_amount", final_return_amount.to_string()),
+            .add_attribute("return_amount", final_return_amount.to_string())
+            .add_attribute("ask_asset", output_denom_str.clone()),
         ProtocolType::Orderbook => Event::new("atomic_swap_execution")
             .add_attribute("sender", info.sender.to_string())
             .add_attribute("swap_input_amount", offer_amount)
@@ -209,6 +274,11 @@ pub fn execute(
             .add_attribute("refund_amount", "0")
             .add_attribute("swap_final_amount", final_return_amount)
             .add_attribute("swap_final_denom", output_denom_str),
+        ProtocolType::Clmm => Event::new("wasm")
+            .add_attribute("action", "swap")
+            .add_attribute("amount_in", offer_amount.to_string())
+            .add_attribute("amount_out", final_return_amount.to_string())
+            .add_attribute("ask_asset", output_denom_str.clone()),
     };
 
     Ok(Response::new().add_message(send_msg).add_event(event))
@@ -236,17 +306,17 @@ pub fn query(
             let config = CONFIG.load(deps.storage)?;
 
             // 1. Validation: Ensure the query matches the contract's configured trading pair.
-            let config_source_denom = match config.input_asset_info {
-                AssetInfo::NativeToken { denom } => denom,
-                AssetInfo::Token { contract_addr } => contract_addr,
+            let config_source_denom = match &config.input_asset_info {
+                AssetInfo::NativeToken { denom } => denom.clone(),
+                AssetInfo::Token { contract_addr } => contract_addr.clone(),
             };
-            let config_target_denom = match config.output_asset_info {
-                AssetInfo::NativeToken { denom } => denom,
-                AssetInfo::Token { contract_addr } => contract_addr,
+            let config_target_denom = match &config.output_asset_info {
+                AssetInfo::NativeToken { denom } => denom.clone(),
+                AssetInfo::Token { contract_addr } => contract_addr.clone(),
             };
 
             if source_denom != config_source_denom || target_denom != config_target_denom {
-                return Err(StdError::generic_err(format!(
+                return Err(StdError::msg(format!(
                     "Invalid trading pair for this mock contract. Expected {} -> {}, got {} -> {}",
                     config_source_denom, config_target_denom, source_denom, target_denom
                 )));
@@ -267,6 +337,46 @@ pub fn query(
             };
 
             to_json_binary(&response)
+        }
+        QueryMsg::Quote {
+            token_in,
+            amount_in,
+        } => {
+            let config = CONFIG.load(deps.storage)?;
+
+            if token_in != config.input_asset_info {
+                return Err(StdError::msg("Invalid token_in for this mock contract"));
+            }
+
+            let offer_decimal = Decimal::from_atomics(amount_in, config.input_decimals as u32)
+                .map_err(|_| StdError::msg("Failed to create decimal from amount_in"))?;
+            let rate_decimal = Decimal::from_str(&config.rate)?;
+            let return_decimal = offer_decimal * rate_decimal;
+            let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.output_decimals as u32);
+            let scaling_factor = Uint128::from(10u128.pow(decimal_diff));
+            let amount_out = return_decimal
+                .atomics()
+                .checked_div(scaling_factor)
+                .unwrap_or_default();
+
+            to_json_binary(&QuoteResponse {
+                amount_out,
+                amount_in_consumed: amount_in,
+                fee_amount: Uint128::zero(),
+            })
+        }
+        QueryMsg::Pair {} => {
+            let config = CONFIG.load(deps.storage)?;
+            to_json_binary(&PairInfo {
+                asset_infos: [config.input_asset_info, config.output_asset_info],
+            })
+        }
+        QueryMsg::GetConfig {} => {
+            let config = CONFIG.load(deps.storage)?;
+            to_json_binary(&ConfigResponse {
+                token0: config.input_asset_info,
+                token1: config.output_asset_info,
+            })
         }
     }
 }

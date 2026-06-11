@@ -1,7 +1,10 @@
 use cosmwasm_std::{StdError, Uint128};
 use thiserror::Error;
 
-#[derive(Error, Debug, PartialEq)]
+// cosmwasm-std 3.0 made `StdError` opaque (no longer `PartialEq`), so the
+// `Std(StdError)` variant can no longer derive `PartialEq`. Tests that compared
+// errors by value must switch to `matches!`.
+#[derive(Error, Debug)]
 pub enum ContractError {
     // --- Standard & Authorization Errors ---
     #[error("{0}")]
@@ -61,4 +64,30 @@ pub enum ContractError {
 
     #[error("Failed to parse conversion reply: could not find a valid 'transfer' or 'wasm' event")]
     NoConversionEventInReply {},
+
+    #[error("Failed to parse swap reply: wasm event did not contain an 'ask_asset' attribute")]
+    NoAskAssetInReply {},
+
+    // --- Orderbook (native spot-order) Errors ---
+    #[error("Orderbook order quantity rounds to zero (input below one tick)")]
+    AmountTooSmall {},
+
+    #[error("Failed to decode spot market order response: {err}")]
+    OrderResponseDecode { err: String },
+
+    #[error("Denom '{denom}' is not part of orderbook market {market_id}")]
+    InvalidOrderbookDenom { denom: String, market_id: String },
+
+    // --- Flash-arb (FlashRoute) Errors ---
+    #[error("FlashCallback received with no flash in flight (forged or stray call)")]
+    NoPendingFlash {},
+
+    #[error("Flash-arb cycle may not route through the flash-source pool")]
+    FlashPoolInCycle {},
+
+    #[error("flash_asset is neither token0 nor token1 of the flash pool")]
+    FlashAssetNotInPool {},
+
+    #[error("Flash-arb profit floor not met. Required (principal+fee+min_profit): {required}, produced: {actual}")]
+    FlashProfitNotMet { required: Uint128, actual: Uint128 },
 }

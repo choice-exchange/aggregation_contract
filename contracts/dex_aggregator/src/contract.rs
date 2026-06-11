@@ -1,12 +1,13 @@
+use crate::cw20::Cw20ReceiveMsg;
 use cosmwasm_std::{
-    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdResult,
+    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdError,
+    StdResult, Uint128,
 };
-use cw20::Cw20ReceiveMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::{self, remove_fee, set_fee, update_fee_collector};
-use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, QueryMsg};
+use crate::msg::{amm, Cw20HookMsg, ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
 use crate::state::{Config, CONFIG, REPLY_ID_COUNTER};
 
 pub const CONTRACT_NAME: &str = "crates.io:dex-aggregator";
@@ -58,7 +59,8 @@ pub fn execute(
                 info: amm::AssetInfo::NativeToken {
                     denom: info.funds[0].denom.clone(),
                 },
-                amount: info.funds[0].amount,
+                // cosmwasm-std 3.0: Coin.amount is Uint256; our assets are Uint128.
+                amount: Uint128::try_from(info.funds[0].amount).map_err(StdError::from)?,
             };
             execute::execute_aggregate_swaps_internal(
                 deps,
@@ -114,8 +116,8 @@ pub fn execute(
         }
         ExecuteMsg::SetFee {
             pool_address,
-            fee_percent,
-        } => set_fee(deps, info, pool_address, fee_percent),
+            fee_fraction,
+        } => set_fee(deps, info, pool_address, fee_fraction),
         ExecuteMsg::RemoveFee { pool_address } => remove_fee(deps, info, pool_address),
         ExecuteMsg::UpdateFeeCollector { new_fee_collector } => {
             update_fee_collector(deps, info, new_fee_collector)
@@ -129,21 +131,59 @@ pub fn execute(
         ExecuteMsg::DeregisterTaxToken { contract_addr } => {
             crate::execute::deregister_tax_token(deps, info, contract_addr)
         }
+        ExecuteMsg::AuthorizeFlashSigner { signer } => {
+            crate::execute::authorize_flash_signer(deps, info, signer)
+        }
+        ExecuteMsg::RevokeFlashSigner { signer } => {
+            crate::execute::revoke_flash_signer(deps, info, signer)
+        }
+        ExecuteMsg::SetFlashUnrestricted { open } => {
+            crate::execute::set_flash_unrestricted(deps, info, open)
+        }
+        ExecuteMsg::FlashRoute {
+            flash_pool,
+            flash_asset,
+            flash_amount,
+            stages,
+            min_profit,
+        } => execute::execute_flash_route(
+            deps,
+            env,
+            info,
+            flash_pool,
+            flash_asset,
+            flash_amount,
+            stages,
+            min_profit,
+        ),
+        ExecuteMsg::FlashCallback {
+            fee0,
+            fee1,
+            data: _,
+        } => execute::execute_flash_callback(deps, env, info, fee0, fee1),
     }
 }
 
 #[cfg_attr(not(feature = "library"), entry_point)]
-pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
+pub fn query(deps: Deps<InjectiveQueryWrapper>, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
+        // SimulateRoute walks Injective spot markets, so it needs the typed querier.
         QueryMsg::SimulateRoute { stages, amount_in } => {
             crate::query::simulate_route(deps, env, stages, amount_in)
         }
-        QueryMsg::Config {} => crate::query::query_config(deps),
+        // The rest only touch generic storage; drop the custom query type.
+        QueryMsg::Config {} => crate::query::query_config(deps.into_empty()),
         QueryMsg::FeeForPool { pool_address } => {
-            crate::query::query_fee_for_pool(deps, pool_address)
+            crate::query::query_fee_for_pool(deps.into_empty(), pool_address)
         }
         QueryMsg::AllFees { start_after, limit } => {
-            crate::query::query_all_fees(deps, start_after, limit)
+            crate::query::query_all_fees(deps.into_empty(), start_after, limit)
+        }
+        QueryMsg::IsFlashSigner { signer } => {
+            crate::query::query_is_flash_signer(deps.into_empty(), signer)
+        }
+        QueryMsg::FlashSigners { start_after, limit } => {
+            crate::query::query_flash_signers(deps.into_empty(), start_after, limit)
         }
     }
 }
@@ -155,4 +195,22 @@ pub fn reply(
     msg: Reply,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     crate::reply::handle_reply(deps, env, msg)
+}
+
+#[cfg_attr(not(feature = "library"), entry_point)]
+pub fn migrate(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    _env: Env,
+    _msg: MigrateMsg,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    // Rejects migrating from a different contract name or a newer version, and
+    // bumps the stored `cw2` version to CONTRACT_VERSION. No state migration is
+    // needed (see `MigrateMsg`). Only the code admin can invoke this (chain-enforced).
+    let prev_version =
+        cw2::ensure_from_older_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "migrate")
+        .add_attribute("from_version", prev_version.to_string())
+        .add_attribute("to_version", CONTRACT_VERSION))
 }

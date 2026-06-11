@@ -3,4 +3,13 @@ resolver = "2"
 members = [
     "contracts/dex_aggregator",
     "contracts/mock_swap",
+    "contracts/mock_clmm_flash",
 ]
+
+# Fail closed on native-integer overflow/underflow in the optimized wasm. Money
+# math already uses Uint128/FPDecimal (checked internally), but the route engine's
+# u64 counters/indices use native arithmetic; without this they wrap silently in
+# release. Keeps the percentage-sum validation and `replies_expected` bookkeeping
+# fail-safe.
+[profile.release]
+overflow-checks = true

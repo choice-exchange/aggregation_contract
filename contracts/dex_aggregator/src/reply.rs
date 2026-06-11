@@ -1,19 +1,18 @@
+use crate::cw20::Cw20ExecuteMsg;
 use cosmwasm_std::{
-    to_json_binary, Addr, Coin, CosmosMsg, DepsMut, Env, Reply, Response, StdError, SubMsg,
-    Uint128, WasmMsg,
+    to_json_binary, Addr, Coin, CosmosMsg, Deps, DepsMut, Env, Event, Reply, Response, StdError,
+    SubMsg, Uint128, WasmMsg,
 };
-use cw20::Cw20ExecuteMsg;
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
 use crate::execute::create_swap_cosmos_msg;
 use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
+use crate::orderbook_exec;
 use crate::state::{
-    Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, ACTIVE_ROUTES, CONFIG,
-    FEE_MAP, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
+    apply_fee, Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, SwapLeg,
+    ACTIVE_ROUTES, CONFIG, REPLY_ID_COUNTER, SUBMSG_REPLY_STATES, TAX_TOKEN_REGISTRY,
 };
-
-const DECIMAL_FRACTIONAL: u128 = 1_000_000_000_000_000_000;
 
 pub fn handle_reply(
     deps: DepsMut<InjectiveQueryWrapper>,
@@ -38,11 +37,33 @@ pub fn handle_reply(
             Awaiting::PathConversion => {
                 handle_path_conversion_reply(deps, env, msg, &mut exec_state)
             }
-            Awaiting::Swaps => Err(ContractError::Std(StdError::generic_err(format!(
+            Awaiting::Swaps => Err(ContractError::Std(StdError::msg(format!(
                 "Unregistered swap reply ID received: {}",
                 msg.id
             )))),
         }
+    }
+}
+
+/// Finish an in-flight split that produced nothing (a zero fill, an IOC no-fill,
+/// or a hop whose dispatch resolved to "no message"). Drops the path's pending
+/// reply: if it was the last one in the stage, advance to the next step; otherwise
+/// keep accumulating the remaining splits.
+fn complete_zero_value_path(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
+    env: Env,
+    exec_state: &mut ExecutionState,
+    master_reply_id: u64,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    exec_state.replies_expected -= 1;
+    if exec_state.replies_expected == 0 {
+        exec_state.current_stage_index += 1;
+        proceed_to_next_step(deps, env, exec_state, master_reply_id)
+    } else {
+        ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
+        Ok(Response::new()
+            .add_attribute("action", "accumulating_path_outputs")
+            .add_attribute("info", "zero_value_path_completed"))
     }
 }
 
@@ -61,7 +82,11 @@ pub(crate) fn proceed_to_next_step(
         .get(exec_state.current_stage_index as usize)
         .unwrap();
 
-    let stage_plan = plan_next_stage(&exec_state.accumulated_assets, next_stage_to_execute)?;
+    let stage_plan = plan_next_stage(
+        deps.as_ref(),
+        &exec_state.accumulated_assets,
+        next_stage_to_execute,
+    )?;
     exec_state.accumulated_assets.clear();
 
     if stage_plan.conversions_needed.is_empty() {
@@ -111,39 +136,49 @@ fn handle_swap_reply(
 
     let replied_op = &current_stage.splits[split_index].path[op_index];
 
-    let events = &match msg.result.into_result() {
-        Ok(response) => response.events,
+    let result = match msg.result.into_result() {
+        Ok(response) => response,
         Err(e) => {
             return Err(ContractError::SubmessageFailed {
                 split_index,
                 op_index,
-                contract_addr: get_operation_address(replied_op).to_string(),
+                contract_addr: get_operation_address(replied_op),
                 error: e,
             });
         }
     };
 
-    let swap_event_opt = events.iter().rev().find(|e| {
-        e.ty.starts_with("wasm")
-            && (e.attributes.iter().any(|a| a.key == "return_amount")
-                || e.attributes.iter().any(|a| a.key == "swap_final_amount"))
-    });
-
-    if swap_event_opt.is_none() {
-        exec_state.replies_expected -= 1;
-        if exec_state.replies_expected == 0 {
-            exec_state.current_stage_index += 1;
-            return proceed_to_next_step(&mut deps, env, exec_state, master_reply_id);
-        } else {
-            ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
-            return Ok(Response::new()
-                .add_attribute("action", "accumulating_path_outputs")
-                .add_attribute("info", "zero_value_path_completed"));
+    // The produced amount comes from the typed spot-order response for orderbook
+    // hops, and from wasm event attributes for AMM/CLMM hops.
+    let received_amount = match replied_op {
+        Operation::OrderbookSwap(ob) => {
+            let market = orderbook_exec::load_market(deps.as_ref(), &ob.market_id)?;
+            orderbook_exec::parse_order_output(&market, &ob.target_denom, &result)
+                .map_err(|e| ContractError::OrderResponseDecode { err: e.to_string() })?
         }
+        _ => parse_amount_from_swap_reply(&result.events, &env)?,
+    };
+
+    // A zero fill (no liquidity, IOC no-fill, or a zero-value path) ends this path
+    // without contributing an asset.
+    if received_amount.is_zero() {
+        return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id);
     }
 
-    let received_amount = parse_amount_from_swap_reply(events, &env)?;
-    let received_asset_info = get_operation_output(replied_op)?;
+    let received_asset_info = get_operation_output(deps.api, replied_op, &result.events)?;
+
+    // Record this venue trade for the terminal `aggregator_swap` event. A
+    // fee-bearing terminal hop patches `fee_amount` in below; intermediate and
+    // orderbook hops keep zero.
+    exec_state.legs.push(SwapLeg {
+        kind: operation_kind(replied_op).to_string(),
+        venue: get_operation_address(replied_op),
+        offer_denom: submsg_state.in_denom.clone(),
+        offer_amount: submsg_state.in_amount,
+        ask_denom: asset_key(&received_asset_info),
+        ask_amount: received_amount,
+        fee_amount: Uint128::zero(),
+    });
 
     let replied_path = &current_stage.splits[split_index].path;
 
@@ -155,7 +190,7 @@ fn handle_swap_reply(
         };
 
         // Before dispatching the next message, check for asset mismatch.
-        let required_input_info = get_operation_input(next_op)?;
+        let required_input_info = get_operation_input(deps.as_ref(), next_op)?;
         if offer_asset_for_next_op.info != required_input_info {
             // A mid-path conversion is needed.
             exec_state.awaiting = Awaiting::PathConversion;
@@ -175,14 +210,19 @@ fn handle_swap_reply(
                 .add_attribute("action", "performing_path_conversion"));
         }
 
-        // Create the message for the next step.
-        let next_msg = create_swap_cosmos_msg(
+        // Create the message for the next step. `None` => the next hop provably
+        // yields nothing (e.g. a CLMM quote of zero), so this path ends here as a
+        // zero-value path rather than reverting.
+        let next_msg = match create_swap_cosmos_msg(
             &mut deps,
             next_op,
             &offer_asset_for_next_op.info,
             offer_asset_for_next_op.amount,
             &env,
-        )?;
+        )? {
+            Some(msg) => msg,
+            None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
+        };
 
         let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
         reply_id_counter += 1;
@@ -196,6 +236,8 @@ fn handle_swap_reply(
                 master_reply_id,
                 split_index,
                 op_index: op_index + 1,
+                in_denom: asset_key(&offer_asset_for_next_op.info),
+                in_amount: offer_asset_for_next_op.amount,
             },
         )?;
 
@@ -209,9 +251,26 @@ fn handle_swap_reply(
             .add_attribute("split_index", split_index.to_string())
             .add_attribute("op_index", (op_index + 1).to_string()))
     } else {
-        let replying_pool_addr = deps.api.addr_validate(get_operation_address(replied_op))?;
+        // The aggregator's per-pool fee (FEE_MAP) is keyed by a pool/contract
+        // address. Orderbook hops have no such address (the order is placed
+        // natively, and the exchange already takes its own trading fee), so they
+        // carry no aggregator fee.
+        let (amount_after_fee, fee, fee_pool_label) = match replied_op {
+            Operation::OrderbookSwap(_) => (received_amount, Uint128::zero(), None),
+            _ => {
+                let pool_addr = deps.api.addr_validate(&get_operation_address(replied_op))?;
+                let (after_fee, fee) = apply_fee(deps.storage, &pool_addr, received_amount)?;
+                (after_fee, fee, Some(pool_addr.to_string()))
+            }
+        };
 
-        let (amount_after_fee, fee) = apply_fee(&deps, &replying_pool_addr, received_amount)?;
+        // Patch the fee onto this hop's leg record *before* `proceed_to_next_step`
+        // can finalize and emit the `aggregator_swap` event.
+        if !fee.is_zero() {
+            if let Some(last_leg) = exec_state.legs.last_mut() {
+                last_leg.fee_amount = fee;
+            }
+        }
 
         exec_state.accumulated_assets.push(amm::Asset {
             info: received_asset_info.clone(),
@@ -235,24 +294,10 @@ fn handle_swap_reply(
             response = response
                 .add_message(fee_send_msg)
                 .add_attribute("fee_collected", fee.to_string())
-                .add_attribute("fee_pool", replying_pool_addr.to_string());
+                .add_attribute("fee_pool", fee_pool_label.unwrap_or_default());
         }
         Ok(response)
     }
-}
-
-fn apply_fee(
-    deps: &DepsMut<InjectiveQueryWrapper>,
-    pool_addr: &Addr,
-    amount: Uint128,
-) -> Result<(Uint128, Uint128), StdError> {
-    let fee = match FEE_MAP.may_load(deps.storage, pool_addr)? {
-        Some(fee_percent) => amount.multiply_ratio(fee_percent.atomics(), DECIMAL_FRACTIONAL),
-        None => Uint128::zero(),
-    };
-
-    let amount_after_fee = amount.checked_sub(fee)?;
-    Ok((amount_after_fee, fee))
 }
 
 // A helper to create the final transfer message.
@@ -267,7 +312,7 @@ fn create_send_msg(
             to_address: recipient.to_string(),
             amount: vec![Coin {
                 denom: denom.clone(),
-                amount,
+                amount: amount.into(),
             }],
         })),
         amm::AssetInfo::Token { contract_addr } => {
@@ -298,6 +343,130 @@ fn create_send_msg(
     }
 }
 
+/// Terminal disposition of a completed route's output. For an ordinary swap the
+/// whole `total_amount` goes to the route's sender (gated by `minimum_receive`).
+/// For a flash-arb cycle it repays `principal + fee` to the flash pool by direct
+/// transfer and forwards the surplus to the initiator (gated by `min_profit`).
+fn finalize_route(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
+    reply_id: u64,
+    exec_state: &ExecutionState,
+    total_amount: Uint128,
+    asset_info: &amm::AssetInfo,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    if let Some(flash) = &exec_state.plan.flash_repayment {
+        let required = flash
+            .repay_amount
+            .checked_add(flash.min_profit)
+            .map_err(StdError::from)?;
+        if total_amount < required {
+            return Err(ContractError::FlashProfitNotMet {
+                required,
+                actual: total_amount,
+            });
+        }
+        let surplus = total_amount
+            .checked_sub(flash.repay_amount)
+            .map_err(StdError::from)?;
+
+        // Repay the pool by direct transfer. `create_send_msg` uses Bank `Send` /
+        // CW20 `Transfer` (never CW20 `Send`), which is exactly what the pool's
+        // reentrancy-locked flash requires.
+        let mut response = Response::new().add_message(create_send_msg(
+            deps,
+            &flash.pool,
+            asset_info,
+            flash.repay_amount,
+        )?);
+        if !surplus.is_zero() {
+            response = response.add_message(create_send_msg(
+                deps,
+                &exec_state.plan.sender,
+                asset_info,
+                surplus,
+            )?);
+        }
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
+        Ok(response
+            .add_attribute("action", "flash_route_complete")
+            .add_attribute("repaid", flash.repay_amount.to_string())
+            .add_attribute("profit", surplus.to_string()))
+    } else {
+        if total_amount < exec_state.plan.minimum_receive {
+            return Err(ContractError::MinimumReceiveNotMet {
+                minimum_receive: exec_state.plan.minimum_receive,
+                actual_receive: total_amount,
+            });
+        }
+        let mut response = Response::new();
+        if !total_amount.is_zero() {
+            response = response.add_message(create_send_msg(
+                deps,
+                &exec_state.plan.sender,
+                asset_info,
+                total_amount,
+            )?);
+        }
+        ACTIVE_ROUTES.remove(deps.storage, reply_id);
+        Ok(response
+            .add_event(build_swap_event(exec_state, asset_info, total_amount))
+            .add_attribute("action", "aggregate_swap_complete")
+            .add_attribute("final_received", total_amount.to_string()))
+    }
+}
+
+/// The single consolidated event emitted once per completed user swap. Lets an
+/// indexer record one row per route — who swapped what for what — instead of
+/// stitching together the underlying pool/market events. `swap_results` carries the
+/// per-venue leg breakdown (JSON array of [`SwapLeg`]) for per-pool attribution.
+///
+/// Field names for the top-line (`sender`, `swap_input_*`, `swap_final_*`,
+/// `swap_results`) mirror the legacy `inj-orderbook-swap-contract`
+/// `atomic_swap_execution` event so existing indexer plumbing maps over directly.
+/// On-chain the event type is `wasm-aggregator_swap`.
+fn build_swap_event(
+    exec_state: &ExecutionState,
+    final_asset: &amm::AssetInfo,
+    final_amount: Uint128,
+) -> Event {
+    let route_json = serde_json_wasm::to_string(&exec_state.legs).unwrap_or_default();
+    Event::new("aggregator_swap")
+        .add_attribute("sender", exec_state.plan.sender.to_string())
+        .add_attribute("recipient", exec_state.plan.sender.to_string())
+        .add_attribute("swap_input_denom", asset_key(&exec_state.plan.offer.info))
+        .add_attribute(
+            "swap_input_amount",
+            exec_state.plan.offer.amount.to_string(),
+        )
+        .add_attribute("swap_final_denom", asset_key(final_asset))
+        .add_attribute("swap_final_amount", final_amount.to_string())
+        .add_attribute(
+            "minimum_receive",
+            exec_state.plan.minimum_receive.to_string(),
+        )
+        .add_attribute("stage_count", exec_state.plan.stages.len().to_string())
+        .add_attribute("leg_count", exec_state.legs.len().to_string())
+        .add_attribute("swap_results", route_json)
+}
+
+/// String key for an asset: the bank denom for natives, the contract address for
+/// CW20s. Used in leg records and the consolidated swap event.
+fn asset_key(info: &amm::AssetInfo) -> String {
+    match info {
+        amm::AssetInfo::NativeToken { denom } => denom.clone(),
+        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+    }
+}
+
+/// Venue-kind tag for a leg record: `"amm"`, `"clmm"`, or `"orderbook"`.
+fn operation_kind(op: &Operation) -> &'static str {
+    match op {
+        Operation::AmmSwap(_) => "amm",
+        Operation::OrderbookSwap(_) => "orderbook",
+        Operation::ClmmSwap(_) => "clmm",
+    }
+}
+
 fn handle_final_stage(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
     env: Env,
@@ -305,6 +474,18 @@ fn handle_final_stage(
     exec_state: &mut ExecutionState,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
     if exec_state.accumulated_assets.is_empty() {
+        if let Some(flash) = &exec_state.plan.flash_repayment {
+            // The cycle produced nothing, so the loan can't be repaid. (The pool's
+            // `reply_flash` would revert the tx anyway; surface a precise error.)
+            let required = flash
+                .repay_amount
+                .checked_add(flash.min_profit)
+                .map_err(StdError::from)?;
+            return Err(ContractError::FlashProfitNotMet {
+                required,
+                actual: Uint128::zero(),
+            });
+        }
         if !exec_state.plan.minimum_receive.is_zero() {
             return Err(ContractError::MinimumReceiveNotMet {
                 minimum_receive: exec_state.plan.minimum_receive,
@@ -315,8 +496,14 @@ fn handle_final_stage(
         return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty"));
     }
 
-    // The target asset for normalization is the type of the first asset in the final list.
-    let target_asset_info = exec_state.accumulated_assets[0].info.clone();
+    // Normalization target: the borrowed asset for a flash cycle (so the route
+    // closes in the token it must repay), otherwise the first accumulated asset.
+    let target_asset_info = exec_state
+        .plan
+        .flash_repayment
+        .as_ref()
+        .map(|f| f.asset.clone())
+        .unwrap_or_else(|| exec_state.accumulated_assets[0].info.clone());
 
     let mut conversion_submsgs = Vec::with_capacity(exec_state.accumulated_assets.len());
     let mut ready_amount = Uint128::zero();
@@ -332,33 +519,8 @@ fn handle_final_stage(
     }
 
     if conversion_submsgs.is_empty() {
-        // SCENARIO A: All assets were already the same type. We are done.
-        let total_final_amount = ready_amount;
-        // Check against minimum_receive from the immutable plan
-        if total_final_amount < exec_state.plan.minimum_receive {
-            return Err(ContractError::MinimumReceiveNotMet {
-                minimum_receive: exec_state.plan.minimum_receive,
-                actual_receive: total_final_amount,
-            });
-        }
-
-        let mut response = Response::new();
-        if !total_final_amount.is_zero() {
-            // Use the sender address from the immutable plan
-            let send_msg = create_send_msg(
-                deps,
-                &exec_state.plan.sender,
-                &target_asset_info,
-                total_final_amount,
-            )?;
-            response = response.add_message(send_msg);
-        }
-
-        ACTIVE_ROUTES.remove(deps.storage, reply_id);
-
-        Ok(response
-            .add_attribute("action", "aggregate_swap_complete")
-            .add_attribute("final_received", total_final_amount.to_string()))
+        // SCENARIO A: All assets were already the target type. We are done.
+        finalize_route(deps, reply_id, exec_state, ready_amount, &target_asset_info)
     } else {
         // SCENARIO B: Conversions are needed. Set up the exec_state for the final reply.
         exec_state.awaiting = Awaiting::FinalConversions;
@@ -377,7 +539,7 @@ fn handle_final_stage(
 }
 
 fn handle_final_conversion_reply(
-    deps: DepsMut<InjectiveQueryWrapper>,
+    mut deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
     msg: Reply,
     exec_state: &mut ExecutionState,
@@ -394,7 +556,7 @@ fn handle_final_conversion_reply(
     let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let running_total_asset = exec_state.accumulated_assets.get_mut(0).ok_or_else(|| {
-        StdError::generic_err("Final conversion state is invalid: no accumulated asset found")
+        StdError::msg("Final conversion state is invalid: no accumulated asset found")
     })?;
 
     running_total_asset.amount += converted_amount;
@@ -410,29 +572,13 @@ fn handle_final_conversion_reply(
     let total_final_amount = running_total_asset.amount;
     let final_asset_info = running_total_asset.info.clone();
 
-    if total_final_amount < exec_state.plan.minimum_receive {
-        return Err(ContractError::MinimumReceiveNotMet {
-            minimum_receive: exec_state.plan.minimum_receive,
-            actual_receive: total_final_amount,
-        });
-    }
-
-    let mut response = Response::new();
-    if !total_final_amount.is_zero() {
-        let send_msg = create_send_msg(
-            &deps,
-            &exec_state.plan.sender,
-            &final_asset_info,
-            total_final_amount,
-        )?;
-        response = response.add_message(send_msg);
-    }
-
-    ACTIVE_ROUTES.remove(deps.storage, reply_id);
-
-    Ok(response
-        .add_attribute("action", "aggregate_swap_complete")
-        .add_attribute("final_received", total_final_amount.to_string()))
+    finalize_route(
+        &mut deps,
+        reply_id,
+        exec_state,
+        total_final_amount,
+        &final_asset_info,
+    )
 }
 
 fn handle_conversion_reply(
@@ -497,16 +643,56 @@ fn create_conversion_msg(
             })?,
             funds: vec![Coin {
                 denom: denom.clone(),
-                amount: from.amount,
+                amount: from.amount.into(),
             }],
         })),
     }
 }
 
-fn get_operation_output(op: &Operation) -> Result<amm::AssetInfo, ContractError> {
+/// The asset a completed hop produced. AMM/CLMM ops no longer carry an explicit
+/// `ask_asset_info`; instead both pools emit an `ask_asset` attribute on their
+/// swap event, which we read back here at zero query cost. Orderbook output is
+/// always the native `target_denom`.
+fn get_operation_output(
+    api: &dyn cosmwasm_std::Api,
+    op: &Operation,
+    events: &[cosmwasm_std::Event],
+) -> Result<amm::AssetInfo, ContractError> {
     Ok(match op {
-        Operation::AmmSwap(o) => o.ask_asset_info.clone(),
-        Operation::OrderbookSwap(o) => o.ask_asset_info.clone(),
+        Operation::AmmSwap(_) | Operation::ClmmSwap(_) => parse_ask_asset_from_events(api, events)?,
+        Operation::OrderbookSwap(o) => amm::AssetInfo::NativeToken {
+            denom: o.target_denom.clone(),
+        },
+    })
+}
+
+/// Reconstruct the output `AssetInfo` from a pool swap reply. Both the legacy AMM
+/// pair and the CLMM pool emit an `ask_asset` attribute equal to the output
+/// asset's key — a bank denom or a CW20 contract address. The variant is recovered
+/// by bech32 validation: a value that validates as an address is a CW20
+/// (`Token`), anything else is a native bank denom (`NativeToken`). This is
+/// unambiguous on Injective — native denoms (`inj`, `peggy0x..`, `factory/..`,
+/// `ibc/..`, ...) are never bare bech32 addresses, so they can't be mistaken for a
+/// CW20 contract.
+fn parse_ask_asset_from_events(
+    api: &dyn cosmwasm_std::Api,
+    events: &[cosmwasm_std::Event],
+) -> Result<amm::AssetInfo, ContractError> {
+    let key = events
+        .iter()
+        .filter(|e| e.ty.starts_with("wasm"))
+        .find_map(|e| {
+            e.attributes
+                .iter()
+                .find(|a| a.key == "ask_asset")
+                .map(|a| a.value.clone())
+        })
+        .ok_or(ContractError::NoAskAssetInReply {})?;
+
+    Ok(if api.addr_validate(&key).is_ok() {
+        amm::AssetInfo::Token { contract_addr: key }
+    } else {
+        amm::AssetInfo::NativeToken { denom: key }
     })
 }
 
@@ -540,19 +726,16 @@ fn parse_amount_from_swap_reply(
     }
 
     // 2. Fallback to original logic for standard, non-taxable tokens.
+    //    AMM emits "return_amount", CLMM emits "amount_out". (Orderbook hops are
+    //    decoded from the typed spot-order response, not from events.)
     let amount_str_opt = events.iter().find_map(|event| {
         if !event.ty.starts_with("wasm") {
             return None;
         }
-        let key = if event.ty == "wasm-atomic_swap_execution" {
-            "swap_final_amount"
-        } else {
-            "return_amount"
-        };
         event
             .attributes
             .iter()
-            .find(|attr| attr.key == key)
+            .find(|attr| attr.key == "return_amount" || attr.key == "amount_out")
             .map(|attr| attr.value.clone())
     });
 
@@ -624,24 +807,35 @@ fn parse_amount_from_conversion_reply(
 }
 
 fn plan_next_stage(
+    deps: Deps<InjectiveQueryWrapper>,
     accumulated_assets: &[amm::Asset],
     next_stage: &Stage,
 ) -> Result<StagePlan, ContractError> {
+    // Resolve each split's offer asset once. For orderbook ops this loads the spot
+    // market, so caching it here avoids re-querying the same market in the needs and
+    // allocation passes below.
+    let offer_infos: Vec<amm::AssetInfo> = next_stage
+        .splits
+        .iter()
+        .map(|split| {
+            let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
+            get_operation_input(deps, first_op)
+        })
+        .collect::<Result<_, _>>()?;
+
     let mut native_info: Option<amm::AssetInfo> = None;
     let mut cw20_info: Option<amm::AssetInfo> = None;
 
-    for split in &next_stage.splits {
-        let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(first_op)?;
+    for offer_info in &offer_infos {
         match offer_info {
             amm::AssetInfo::NativeToken { .. } => {
                 if native_info.is_none() {
-                    native_info = Some(offer_info);
+                    native_info = Some(offer_info.clone());
                 }
             }
             amm::AssetInfo::Token { .. } => {
                 if cw20_info.is_none() {
-                    cw20_info = Some(offer_info);
+                    cw20_info = Some(offer_info.clone());
                 }
             }
         }
@@ -663,11 +857,9 @@ fn plan_next_stage(
 
     let mut total_native_needs = Uint128::zero();
     let mut total_cw20_needs = Uint128::zero();
-    for split in &next_stage.splits {
+    for (i, split) in next_stage.splits.iter().enumerate() {
         let amount_for_split = total_logical_amount.multiply_ratio(split.percent as u128, 100u128);
-        let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(first_op)?;
-        match offer_info {
+        match offer_infos[i] {
             amm::AssetInfo::NativeToken { .. } => total_native_needs += amount_for_split,
             amm::AssetInfo::Token { .. } => total_cw20_needs += amount_for_split,
         }
@@ -681,7 +873,7 @@ fn plan_next_stage(
                 .find(|a| matches!(a.info, amm::AssetInfo::NativeToken { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
-                    StdError::generic_err(
+                    StdError::msg(
                         "State inconsistency: have native amount but no native asset info found",
                     )
                 })?;
@@ -702,7 +894,7 @@ fn plan_next_stage(
                 .find(|a| matches!(a.info, amm::AssetInfo::Token { .. }))
                 .map(|a| a.info.clone())
                 .ok_or_else(|| {
-                    StdError::generic_err(
+                    StdError::msg(
                         "State inconsistency: have cw20 amount but no cw20 asset info found",
                     )
                 })?;
@@ -722,7 +914,6 @@ fn plan_next_stage(
     let mut cw20_allocated = Uint128::zero();
     for (i, split) in next_stage.splits.iter().enumerate() {
         let first_op = split.path.first().ok_or(ContractError::EmptyRoute {})?;
-        let offer_info = get_operation_input(first_op)?;
         let amount_for_split = if i < next_stage.splits.len() - 1 {
             total_logical_amount.multiply_ratio(split.percent as u128, 100u128)
         } else {
@@ -731,7 +922,7 @@ fn plan_next_stage(
                 .checked_sub(already_allocated)
                 .map_err(StdError::from)?
         };
-        match offer_info {
+        match offer_infos[i] {
             amm::AssetInfo::NativeToken { .. } => native_allocated += amount_for_split,
             amm::AssetInfo::Token { .. } => cw20_allocated += amount_for_split,
         }
@@ -740,6 +931,8 @@ fn plan_next_stage(
             amount: amount_for_split,
             split_index: i,
             op_index: 0,
+            // Already resolved above (loads the spot market once for orderbook ops).
+            offer_info: offer_infos[i].clone(),
         });
     }
 
@@ -749,10 +942,25 @@ fn plan_next_stage(
     })
 }
 
-fn get_operation_input(op: &Operation) -> Result<amm::AssetInfo, ContractError> {
+fn get_operation_input(
+    deps: Deps<InjectiveQueryWrapper>,
+    op: &Operation,
+) -> Result<amm::AssetInfo, ContractError> {
     Ok(match op {
         Operation::AmmSwap(o) => o.offer_asset_info.clone(),
-        Operation::OrderbookSwap(o) => o.offer_asset_info.clone(),
+        // The orderbook offer denom is the market side opposite `target_denom`.
+        Operation::OrderbookSwap(o) => {
+            let market = orderbook_exec::load_market(deps, &o.market_id)?;
+            let offer_denom =
+                orderbook_exec::offer_denom_for(&market, &o.target_denom).map_err(|_| {
+                    ContractError::InvalidOrderbookDenom {
+                        denom: o.target_denom.clone(),
+                        market_id: o.market_id.as_str().to_string(),
+                    }
+                })?;
+            amm::AssetInfo::NativeToken { denom: offer_denom }
+        }
+        Operation::ClmmSwap(o) => o.offer_asset_info.clone(),
     })
 }
 
@@ -767,6 +975,22 @@ fn execute_planned_swaps(
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
 
     for swap in swaps.iter().filter(|s| !s.amount.is_zero()) {
+        // Resolved at plan time (see `PlannedSwap.offer_info`) — avoids re-running
+        // `get_operation_input`, which for an orderbook op is a `load_market` query.
+        let offer_asset_info = swap.offer_info.clone();
+        // `None` => this hop provably yields nothing; skip the split entirely
+        // (don't burn a reply id or persist submsg state for a message we never send).
+        let msg = match create_swap_cosmos_msg(
+            deps,
+            &swap.operation,
+            &offer_asset_info,
+            swap.amount,
+            &env,
+        )? {
+            Some(msg) => msg,
+            None => continue,
+        };
+
         reply_id_counter += 1;
         let submsg_id = reply_id_counter;
 
@@ -777,12 +1001,10 @@ fn execute_planned_swaps(
                 master_reply_id,
                 split_index: swap.split_index,
                 op_index: swap.op_index,
+                in_denom: asset_key(&offer_asset_info),
+                in_amount: swap.amount,
             },
         )?;
-
-        let offer_asset_info = get_operation_input(&swap.operation)?;
-        let msg =
-            create_swap_cosmos_msg(deps, &swap.operation, &offer_asset_info, swap.amount, &env)?;
 
         submessages.push(SubMsg::reply_on_success(msg, submsg_id));
     }
@@ -805,10 +1027,14 @@ fn execute_planned_swaps(
         .add_attribute("stage_index", exec_state.current_stage_index.to_string()))
 }
 
-fn get_operation_address(op: &Operation) -> &String {
+/// A label identifying the contract/market a swap op routes through. AMM/CLMM ops
+/// return their pool address (also the `FEE_MAP` key); orderbook ops have no
+/// contract, so the market id is returned for diagnostics only.
+fn get_operation_address(op: &Operation) -> String {
     match op {
-        Operation::AmmSwap(o) => &o.pool_address,
-        Operation::OrderbookSwap(o) => &o.swap_contract,
+        Operation::AmmSwap(o) => o.pool_address.clone(),
+        Operation::OrderbookSwap(o) => o.market_id.as_str().to_string(),
+        Operation::ClmmSwap(o) => o.pool_address.clone(),
     }
 }
 
@@ -830,7 +1056,7 @@ fn handle_path_conversion_reply(
     let converted_amount = parse_amount_from_conversion_reply(events, &env)?;
 
     let pending_op_details = exec_state.pending_path_op.take().ok_or_else(|| {
-        StdError::generic_err("Path conversion state is invalid: no pending operation found")
+        StdError::msg("Path conversion state is invalid: no pending operation found")
     })?;
 
     let current_stage = exec_state
@@ -850,16 +1076,20 @@ fn handle_path_conversion_reply(
                 .find(|(_, op)| **op == pending_op_details.operation)
                 .map(|(oi, _)| (si, oi))
         })
-        .ok_or_else(|| StdError::generic_err("Could not find pending op in route plan"))?;
+        .ok_or_else(|| StdError::msg("Could not find pending op in route plan"))?;
 
-    let converted_asset_info = get_operation_input(&pending_op_details.operation)?;
-    let swap_msg = create_swap_cosmos_msg(
+    let converted_asset_info = get_operation_input(deps.as_ref(), &pending_op_details.operation)?;
+    // `None` => the resumed hop provably yields nothing; end the path gracefully.
+    let swap_msg = match create_swap_cosmos_msg(
         &mut deps,
         &pending_op_details.operation,
         &converted_asset_info,
         converted_amount,
         &env,
-    )?;
+    )? {
+        Some(msg) => msg,
+        None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
+    };
 
     let mut reply_id_counter = REPLY_ID_COUNTER.load(deps.storage)?;
     reply_id_counter += 1;
@@ -873,6 +1103,8 @@ fn handle_path_conversion_reply(
             master_reply_id,
             split_index,
             op_index,
+            in_denom: asset_key(&converted_asset_info),
+            in_amount: converted_amount,
         },
     )?;
 

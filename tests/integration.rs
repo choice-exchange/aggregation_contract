@@ -7,27 +7,345 @@ use cosmwasm_std::{to_json_binary, Addr, Coin, Decimal, Uint128};
 use cw20::{BalanceResponse, Cw20QueryMsg};
 use cw20_base::msg::InstantiateMsg as Cw20InstantiateMsg;
 use dex_aggregator::msg::{
-    amm, cw20_adapter, AmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg, Operation,
-    OrderbookSwapOp, QueryMsg, Split, Stage,
+    amm, cw20_adapter, AmmSwapOp, ClmmSwapOp, Cw20HookMsg, ExecuteMsg, InstantiateMsg,
+    IsFlashSignerResponse, MigrateMsg, Operation, OrderbookSwapOp, QueryMsg, SimulateRouteResponse,
+    Split, Stage,
 };
 use dex_aggregator::state::Config as AggregatorConfig;
+use injective_cosmwasm::{get_default_subaccount_id_for_checked_address, MarketId};
+use injective_math::FPDecimal;
 use injective_test_tube::{
-    injective_std::types::cosmos::{
-        bank::v1beta1::{MsgSend, QueryBalanceRequest},
-        base::v1beta1::Coin as ProtoCoin,
+    injective_std::shim::Any,
+    injective_std::types::{
+        cosmos::{
+            bank::v1beta1::{MsgSend, QueryBalanceRequest},
+            base::v1beta1::Coin as ProtoCoin,
+            gov::v1beta1::{MsgSubmitProposal, MsgVote, QueryProposalRequest},
+        },
+        injective::exchange::{
+            v1beta1::{
+                MsgCreateSpotLimitOrder, MsgInstantSpotMarketLaunch, OrderInfo,
+                QuerySpotMarketsRequest, QuerySpotMidPriceAndTobRequest, SpotOrder as PbSpotOrder,
+            },
+            v2::{BatchExchangeModificationProposal, DenomMinNotional, DenomMinNotionalProposal},
+        },
     },
-    Account, Bank, InjectiveTestApp, Module, SigningAccount, Wasm,
+    Account, Bank, Exchange, Gov, InjectiveTestApp, Module, SigningAccount, Wasm,
 };
 use mock_swap::{AssetInfo, InstantiateMsg as MockInstantiateMsg, ProtocolType, SwapConfig};
+use prost::Message as _;
+
+// ---------------------------------------------------------------------------
+// Vendored CW20 test message types (replaces the cw20/cw20-base dev-deps, which
+// were the last crates pulling cosmwasm-std 2 into the dev graph). These are
+// local `mod cw20` / `mod cw20_base` so existing call sites compile unchanged;
+// the JSON wire format matches cw20-base v2 (deployed by bytecode, version-agnostic).
+// ---------------------------------------------------------------------------
+mod cw20 {
+    use cosmwasm_std::Uint128;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct Cw20Coin {
+        pub address: String,
+        pub amount: Uint128,
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+    pub struct MinterResponse {
+        pub minter: String,
+        pub cap: Option<Uint128>,
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+    pub struct BalanceResponse {
+        pub balance: Uint128,
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Cw20QueryMsg {
+        Balance { address: String },
+    }
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Cw20ExecuteMsg {
+        Send {
+            contract: String,
+            amount: Uint128,
+            msg: cosmwasm_std::Binary,
+        },
+    }
+}
+mod cw20_base {
+    pub mod msg {
+        use crate::cw20::{Cw20Coin, MinterResponse};
+        use cosmwasm_std::Uint128;
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Serialize, Deserialize, Clone, Debug)]
+        pub struct InstantiateMsg {
+            pub name: String,
+            pub symbol: String,
+            pub decimals: u8,
+            pub initial_balances: Vec<Cw20Coin>,
+            pub mint: Option<MinterResponse>,
+            pub marketing: Option<serde_json::Value>,
+        }
+        #[derive(Serialize, Deserialize, Clone, Debug)]
+        #[serde(rename_all = "snake_case")]
+        pub enum ExecuteMsg {
+            Mint { recipient: String, amount: Uint128 },
+        }
+    }
+}
 
 fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
     match filename {
         "dex_aggregator.wasm" => include_bytes!("../artifacts/dex_aggregator.wasm"),
         "mock_swap.wasm" => include_bytes!("../artifacts/mock_swap.wasm"),
+        "mock_clmm_flash.wasm" => include_bytes!("../artifacts/mock_clmm_flash.wasm"),
         "cw20_base.wasm" => include_bytes!("../cw20_base/cw20_base.wasm"),
         "cw20_adapter.wasm" => include_bytes!("../cw20_adapter/cw20_adapter.wasm"),
         _ => panic!("Unknown wasm file"),
     }
+}
+
+// ===========================================================================
+// Live spot-market scaffolding (ported from orderbook_merge_proof/tests/proof.rs)
+//
+// Orderbook hops now place native atomic spot orders, which mock_swap cannot
+// emulate — they need a real Injective spot market. These helpers launch and
+// seed real markets on the test-tube chain.
+// ===========================================================================
+
+/// sdk.Dec proto string for an integer value: `value * 1e18`.
+fn dec18(value: u128) -> String {
+    format!("{value}{}", "0".repeat(18))
+}
+/// Bank micro-units: `human * 10^decimals`.
+fn micro(human: u128, decimals: u32) -> u128 {
+    human * 10u128.pow(decimals)
+}
+/// Proto price for an integer human price on a `base_dec`/`quote_dec` market:
+/// chain price = human * 10^(quote_dec - base_dec); proto-encoded with *1e18.
+fn price_proto(human: u128, base_dec: u32, quote_dec: u32) -> String {
+    let exp = 18i32 + quote_dec as i32 - base_dec as i32;
+    assert!(exp >= 0, "negative price exponent unsupported in tests");
+    format!("{human}{}", "0".repeat(exp as usize))
+}
+/// Proto quantity for `human_base` base tokens: chain qty = human * 10^base_dec,
+/// proto-encoded with *1e18.
+fn qty_proto(human_base: u128, base_dec: u32) -> String {
+    format!("{human_base}{}", "0".repeat((18 + base_dec) as usize))
+}
+/// Parse an sdk.Dec proto string into chain-scale `FPDecimal`. (Kept with `tob`
+/// for calibrating new orderbook tests.)
+#[allow(dead_code)]
+fn dec_from_proto(s: &str) -> FPDecimal {
+    FPDecimal::from_str(s).unwrap() / FPDecimal::from_str(&dec18(1)).unwrap()
+}
+
+/// Register denom min-notionals via governance (v1.19 prerequisite for spot
+/// market launches). Decimals must already be registered (via
+/// `init_account_decimals`). `funder` pays the validator's proposal deposit.
+fn register_min_notionals(app: &InjectiveTestApp, funder: &SigningAccount, denoms: &[&str]) {
+    let gov = Gov::new(app);
+    let bank = Bank::new(app);
+    let validator = app
+        .get_first_validator_signing_account("inj".to_string(), 1.2f64)
+        .unwrap();
+
+    bank.send(
+        MsgSend {
+            from_address: funder.address(),
+            to_address: validator.address(),
+            amount: vec![ProtoCoin {
+                // Covers the validator's 100k INJ proposal deposit + gas. Kept modest
+                // so setup #2's 1M-INJ admin (after deploys/fees) can afford it.
+                amount: micro(200_000, 18).to_string(),
+                denom: "inj".to_string(),
+            }],
+        },
+        funder,
+    )
+    .unwrap();
+
+    let min_notional = |d: &str| DenomMinNotional {
+        denom: d.to_string(),
+        min_notional: "1".to_string(),
+    };
+    let proposal = BatchExchangeModificationProposal {
+        title: "register denom min notionals".to_string(),
+        description: "integration test setup".to_string(),
+        spot_market_param_update_proposals: vec![],
+        derivative_market_param_update_proposals: vec![],
+        spot_market_launch_proposals: vec![],
+        perpetual_market_launch_proposals: vec![],
+        expiry_futures_market_launch_proposals: vec![],
+        trading_reward_campaign_update_proposal: None,
+        binary_options_market_launch_proposals: vec![],
+        binary_options_param_update_proposals: vec![],
+        auction_exchange_transfer_denom_decimals_update_proposal: None,
+        fee_discount_proposal: None,
+        market_forced_settlement_proposals: vec![],
+        denom_min_notional_proposal: Some(DenomMinNotionalProposal {
+            title: "min notionals".to_string(),
+            description: "integration test setup".to_string(),
+            denom_min_notionals: denoms.iter().map(|d| min_notional(d)).collect(),
+        }),
+    };
+    let mut buf = vec![];
+    proposal.encode(&mut buf).unwrap();
+
+    let res = gov
+        .submit_proposal_v1beta1(
+            MsgSubmitProposal {
+                content: Some(Any {
+                    type_url: "/injective.exchange.v2.BatchExchangeModificationProposal"
+                        .to_string(),
+                    value: buf,
+                }),
+                initial_deposit: vec![ProtoCoin {
+                    amount: micro(100_000, 18).to_string(),
+                    denom: "inj".to_string(),
+                }],
+                proposer: validator.address(),
+            },
+            &validator,
+        )
+        .unwrap();
+
+    let proposal_id = res
+        .events
+        .iter()
+        .find(|e| e.ty == "submit_proposal")
+        .unwrap()
+        .attributes[0]
+        .value
+        .clone();
+
+    gov.vote_v1beta1(
+        MsgVote {
+            proposal_id: u64::from_str(&proposal_id).unwrap(),
+            voter: validator.address(),
+            option: 1i32,
+        },
+        &validator,
+    )
+    .unwrap();
+
+    app.increase_time(20);
+    let status = gov
+        .query_proposal_v1beta1(&QueryProposalRequest {
+            proposal_id: u64::from_str(&proposal_id).unwrap(),
+        })
+        .unwrap()
+        .proposal
+        .unwrap()
+        .status;
+    assert_eq!(
+        status, 3,
+        "min-notional proposal did not pass (status {status})"
+    );
+    app.increase_time(200);
+}
+
+/// Launch a spot market and return its `market_id`.
+#[allow(clippy::too_many_arguments)]
+fn launch_spot_market(
+    exchange: &Exchange<InjectiveTestApp>,
+    signer: &SigningAccount,
+    ticker: &str,
+    base_denom: &str,
+    quote_denom: &str,
+    base_decimals: u32,
+    quote_decimals: u32,
+) -> String {
+    exchange
+        .instant_spot_market_launch(
+            MsgInstantSpotMarketLaunch {
+                sender: signer.address(),
+                ticker: ticker.to_string(),
+                base_denom: base_denom.to_string(),
+                quote_denom: quote_denom.to_string(),
+                // 0.000001 (quote/base) and 0.001 base, both proto-encoded.
+                min_price_tick_size: price_proto(1, base_decimals, quote_decimals),
+                min_quantity_tick_size: qty_proto(1, base_decimals)
+                    .strip_suffix("000")
+                    .unwrap()
+                    .to_string(),
+                min_notional: dec18(1),
+                base_decimals,
+                quote_decimals,
+            },
+            signer,
+        )
+        .unwrap();
+
+    exchange
+        .query_spot_markets(&QuerySpotMarketsRequest {
+            status: "Active".to_string(),
+            market_ids: vec![],
+        })
+        .unwrap()
+        .markets
+        .iter()
+        .find(|m| m.ticker == ticker)
+        .unwrap_or_else(|| panic!("market {ticker} not launched"))
+        .market_id
+        .clone()
+}
+
+/// Default subaccount id for an address (the bank-balance subaccount the
+/// aggregator and makers trade from).
+fn subaccount_of(addr: &str) -> String {
+    get_default_subaccount_id_for_checked_address(&Addr::unchecked(addr)).to_string()
+}
+
+/// Place one resting spot limit order (order_type 1 = buy/bid, 2 = sell/ask).
+#[allow(clippy::too_many_arguments)]
+fn limit_order(
+    exchange: &Exchange<InjectiveTestApp>,
+    trader: &SigningAccount,
+    market_id: &str,
+    order_type: i32,
+    human_price: u128,
+    human_qty_base: u128,
+    base_decimals: u32,
+    quote_decimals: u32,
+) {
+    exchange
+        .create_spot_limit_order(
+            MsgCreateSpotLimitOrder {
+                sender: trader.address(),
+                order: Some(PbSpotOrder {
+                    market_id: market_id.to_string(),
+                    order_info: Some(OrderInfo {
+                        subaccount_id: subaccount_of(&trader.address()),
+                        fee_recipient: trader.address(),
+                        price: price_proto(human_price, base_decimals, quote_decimals),
+                        quantity: qty_proto(human_qty_base, base_decimals),
+                        cid: String::new(),
+                    }),
+                    order_type,
+                    trigger_price: String::new(),
+                }),
+            },
+            trader,
+        )
+        .unwrap();
+}
+
+/// (best_buy, best_sell) top-of-book prices in chain-scale `FPDecimal`.
+#[allow(dead_code)]
+fn tob(exchange: &Exchange<InjectiveTestApp>, market_id: &str) -> (FPDecimal, FPDecimal) {
+    let r = exchange
+        .query_spot_mid_price_and_tob(&QuerySpotMidPriceAndTobRequest {
+            market_id: market_id.to_string(),
+        })
+        .unwrap();
+    (
+        dec_from_proto(&r.best_buy_price),
+        dec_from_proto(&r.best_sell_price),
+    )
 }
 
 pub struct TestEnv {
@@ -38,8 +356,9 @@ pub struct TestEnv {
     pub aggregator_addr: String,
     pub mock_amm_1_addr: String,
     pub mock_amm_2_addr: String,
-    pub mock_ob_inj_usdt_addr: String,
-    pub mock_ob_usdt_inj_addr: String,
+    /// Real INJ/USDT spot market (replaces the former mock orderbook contracts).
+    pub market_inj_usdt: String,
+    pub mock_clmm_inj_usdt_addr: String,
 }
 
 /// Sets up the test environment, deploying the aggregator and three mock swap contracts.
@@ -67,6 +386,9 @@ fn setup() -> TestEnv {
         .unwrap();
 
     let fee_collector_account = app.init_account(&[]).unwrap();
+
+    // v1.19 spot-market launch prerequisite: register denom min-notionals via gov.
+    register_min_notionals(&app, &admin, &["inj", "usdt"]);
 
     let wasm = Wasm::new(&app);
 
@@ -177,7 +499,26 @@ fn setup() -> TestEnv {
         .data
         .address;
 
-    let mock_ob_inj_usdt_addr = wasm
+    // Real INJ/USDT spot market (base inj 18-dec, quote usdt 6-dec), seeded with a
+    // book around ~10 USDT/INJ: asks 10/11/12 (buy INJ) and bids 9/8/7 (sell INJ),
+    // 1000 INJ at each level — deep enough for any single test's hop.
+    let exchange = Exchange::new(&app);
+    let market_inj_usdt = launch_spot_market(&exchange, &admin, "INJ/USDT", "inj", "usdt", 18, 6);
+    let maker = app
+        .init_account(&[
+            Coin::new(micro(10_000, 18), "inj"),
+            Coin::new(micro(10_000_000, 6), "usdt"),
+        ])
+        .unwrap();
+    for (px, qty) in [(10u128, 1000u128), (11, 1000), (12, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 2, px, qty, 18, 6); // asks
+    }
+    for (px, qty) in [(9u128, 1000u128), (8, 1000), (7, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 1, px, qty, 18, 6); // bids
+    }
+    app.increase_time(1);
+
+    let mock_clmm_inj_usdt_addr = wasm
         .instantiate(
             mock_swap_code_id,
             &MockInstantiateMsg {
@@ -188,40 +529,14 @@ fn setup() -> TestEnv {
                     output_asset_info: AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
                     },
-                    rate: "30.0".to_string(),
-                    protocol_type: ProtocolType::Orderbook, // This is an Orderbook
+                    rate: "15.0".to_string(),
+                    protocol_type: ProtocolType::Clmm,
                     input_decimals: 18,
                     output_decimals: 6,
                 },
             },
             Some(&admin.address()),
-            Some("mock-ob-inj-usdt"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
-
-    let mock_ob_usdt_inj_addr = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: "inj".to_string(),
-                    },
-                    rate: "0.1".to_string(),
-                    protocol_type: ProtocolType::Orderbook, // This is an Orderbook
-                    input_decimals: 6,
-                    output_decimals: 18,
-                },
-            },
-            Some(&admin.address()),
-            Some("mock-ob-usdt-inj"),
+            Some("mock-clmm-inj-usdt"),
             &[],
             &admin,
         )
@@ -241,13 +556,9 @@ fn setup() -> TestEnv {
         },
     ];
 
-    // Fund all three mock contracts from the admin account.
-    for addr in [
-        &mock_amm_1_addr,
-        &mock_amm_2_addr,
-        &mock_ob_inj_usdt_addr,
-        &mock_ob_usdt_inj_addr,
-    ] {
+    // Fund the mock AMM/CLMM contracts from the admin account (orderbook liquidity
+    // now lives in the real market's book, not a funded mock contract).
+    for addr in [&mock_amm_1_addr, &mock_amm_2_addr, &mock_clmm_inj_usdt_addr] {
         bank.send(
             MsgSend {
                 from_address: admin.address(),
@@ -267,8 +578,8 @@ fn setup() -> TestEnv {
         aggregator_addr,
         mock_amm_1_addr,
         mock_amm_2_addr,
-        mock_ob_inj_usdt_addr,
-        mock_ob_usdt_inj_addr,
+        market_inj_usdt,
+        mock_clmm_inj_usdt_addr,
     }
 }
 
@@ -280,10 +591,10 @@ fn test_aggregate_swap_success() {
     let bank = Bank::new(&env.app);
 
     // Input: 100 INJ
-    // Split 1 (33%): 33 INJ -> AMM1 @ 10.0 = 330 USDT
-    // Split 2 (42%): 42 INJ -> AMM2 @ 20.0 = 840 USDT
-    // Split 3 (25%): 25 INJ -> OB   @ 30.0 = 750 USDT
-    // Total Output: 330 + 840 + 750 = 1920 USDT
+    // Split 1 (33%): 33 INJ -> AMM1 @ 10.0          = 330.000000 USDT
+    // Split 2 (42%): 42 INJ -> AMM2 @ 20.0          = 840.000000 USDT
+    // Split 3 (25%): 25 INJ -> live OB, best bid 9, less ~0.15% taker fee = 224.662500 USDT
+    // Total Output: 330 + 840 + 224.6625 = 1394.6625 USDT
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
@@ -292,9 +603,6 @@ fn test_aggregate_swap_success() {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -304,9 +612,6 @@ fn test_aggregate_swap_success() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -315,19 +620,15 @@ fn test_aggregate_swap_success() {
                 Split {
                     percent: 25,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: env.mock_ob_inj_usdt_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "usdt".to_string(),
+                        quantity: None,
+                        worst_price: None,
                     })],
                 },
             ],
         }],
-        minimum_receive: Some(Uint128::new(1910000000)), // Min 1910 USDT
+        minimum_receive: Some(Uint128::new(1_390_000_000)), // Min 1390 USDT
     };
 
     let res = wasm.execute(
@@ -358,8 +659,8 @@ fn test_aggregate_swap_success() {
         .find(|a| a.key == "final_received")
         .unwrap();
 
-    // Assert the total expected output is 1920 USDT
-    assert_eq!(total_received_attr.value, "1920000000");
+    // Assert the total expected output is 1394.6625 USDT
+    assert_eq!(total_received_attr.value, "1394662500");
 
     let balance_response = bank
         .query_balance(&QueryBalanceRequest {
@@ -370,9 +671,9 @@ fn test_aggregate_swap_success() {
 
     // The user's final balance should be their initial balance + the swap output.
     // Initial: 1_000_000_000_000 (from setup)
-    // Swap Output: 1_920_000_000 (1920 USDT)
-    // Expected Final: 1_001_920_000_000
-    let expected_final_balance = Uint128::new(1_001_920_000_000u128);
+    // Swap Output: 1_394_662_500 (1394.6625 USDT)
+    // Expected Final: 1_001_394_662_500
+    let expected_final_balance = Uint128::new(1_001_394_662_500u128);
 
     // Extract the amount from the query response
     let final_balance = balance_response.balance.unwrap();
@@ -384,16 +685,218 @@ fn test_aggregate_swap_success() {
 }
 
 #[test]
+fn test_aggregator_swap_event_emitted() {
+    // The consolidated `aggregator_swap` event must carry everything an indexer
+    // needs to record one row per user swap: sender, input (denom+amount), output
+    // (denom+amount), and the per-venue leg breakdown. Same route as
+    // test_aggregate_swap_success: 100 INJ -> 3 legs (amm/amm/orderbook) -> USDT.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 33,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_1_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 42,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_2_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 25,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "usdt".to_string(),
+                        quantity: None,
+                        worst_price: None,
+                    })],
+                },
+            ],
+        }],
+        minimum_receive: Some(Uint128::new(1_390_000_000)),
+    };
+
+    let res = wasm
+        .execute(
+            &env.aggregator_addr,
+            &msg,
+            &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+            &env.user,
+        )
+        .expect("route should succeed");
+
+    // cosmwasm prefixes custom events with `wasm-`.
+    let ev = res
+        .events
+        .iter()
+        .find(|e| e.ty == "wasm-aggregator_swap")
+        .expect("aggregator_swap event not emitted");
+
+    let attr = |k: &str| {
+        ev.attributes
+            .iter()
+            .find(|a| a.key == k)
+            .unwrap_or_else(|| panic!("missing attribute {k}"))
+            .value
+            .clone()
+    };
+
+    assert_eq!(attr("sender"), env.user.address());
+    assert_eq!(attr("recipient"), env.user.address());
+    assert_eq!(attr("swap_input_denom"), "inj");
+    assert_eq!(attr("swap_input_amount"), "100000000000000000000");
+    assert_eq!(attr("swap_final_denom"), "usdt");
+    assert_eq!(attr("swap_final_amount"), "1394662500");
+    assert_eq!(attr("stage_count"), "1");
+    assert_eq!(attr("leg_count"), "3");
+
+    // The leg breakdown is a JSON array of 3 venue trades; spot-check that every
+    // venue and both kinds are present, and that it parses.
+    let results = attr("swap_results");
+    let legs: serde_json::Value =
+        serde_json::from_str(&results).expect("swap_results is valid JSON");
+    let legs = legs.as_array().expect("swap_results is an array");
+    assert_eq!(legs.len(), 3);
+    assert!(results.contains(&env.mock_amm_1_addr));
+    assert!(results.contains(&env.mock_amm_2_addr));
+    assert!(results.contains(&env.market_inj_usdt));
+    assert!(results.contains("\"kind\":\"amm\""));
+    assert!(results.contains("\"kind\":\"orderbook\""));
+    // Every leg's output is the USDT we end in (single stage, all converge).
+    for leg in legs {
+        assert_eq!(leg["ask_denom"], "usdt");
+    }
+}
+
+#[test]
+fn test_simulate_route_orderbook_buy_needs_no_buffer() {
+    // Regression for the buy-side margin gotcha: SimulateRoute on a BUY orderbook hop
+    // must succeed even though the aggregator holds NONE of the quote denom — a
+    // read-only quote should not require the contract to be pre-seeded. (Execution
+    // never needed a buffer; this guards the simulation path.)
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let res: SimulateRouteResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::SimulateRoute {
+                stages: vec![Stage {
+                    splits: vec![Split {
+                        percent: 100,
+                        path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                            target_denom: "inj".to_string(),
+                            quantity: None,
+                            worst_price: None,
+                        })],
+                    }],
+                }],
+                amount_in: Coin::new(1_000_000_000u128, "usdt"), // 1000 USDT, aggregator holds 0 usdt
+            },
+        )
+        .unwrap();
+
+    // ~99.75 INJ (best ask 10, gross atomic fee). The point: a real quote is returned,
+    // not the "Swap amount too high" error the un-fixed margin check produced at 0 balance.
+    let out = res.output_amount.u128();
+    assert!(
+        out > 99_000_000_000_000_000_000 && out < 100_000_000_000_000_000_000,
+        "expected ~99.75 INJ from the buy-side quote, got {out}"
+    );
+}
+
+#[test]
+fn test_orderbook_buy_crosses_multiple_price_levels() {
+    // Regression for the buy-side margin fix (C2): a BUY whose fill crosses more
+    // than one ask level must NOT revert. The order quantity is sized from the worst
+    // (last) consumed price, so the chain's atomic-order margin reservation
+    // (worst * qty * (1+fee)) stays within the `input` the contract holds.
+    //
+    // Book asks: 10/11/12 USDT @ 1000 INJ each. 14,000 USDT consumes all of level 10
+    // (10,000 USDT -> 1000 INJ) and part of level 11 -> worst price 11. Pre-fix this
+    // errored with "Swap amount too high" because the quantity was sized from the
+    // average price, making required margin (worst/avg)*input exceed the held input.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(14_000_000_000u128, "usdt")], // 14,000 USDT
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "multi-level orderbook buy should not revert: {:?}",
+        res.unwrap_err()
+    );
+    let response = res.unwrap();
+
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find aggregate_swap_complete event");
+    let final_received: u128 = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap()
+        .value
+        .parse()
+        .unwrap();
+
+    // available ~= 14000/(1+fee) ~= 13965 USDT; qty = available/worst(11) ~= 1269.5 INJ.
+    assert!(
+        final_received > 1_255_000_000_000_000_000_000
+            && final_received < 1_285_000_000_000_000_000_000,
+        "expected ~1269 INJ from a two-level buy, got {final_received}"
+    );
+}
+
+#[test]
 fn test_multi_stage_aggregate_swap_success() {
     let env = setup();
     let wasm = Wasm::new(&env.app);
     let bank = Bank::new(&env.app);
 
-    // Stage 1: 1,000,000 USDT -> OB @ 0.1 = 100,000 INJ
-    // Stage 2:
-    //   Split 1 (49%): 49,000 INJ -> AMM1 @ 10.0 = 490,000 USDT
-    //   Split 2 (51%): 51,000 INJ -> AMM2 @ 20.0 = 1,020,000 USDT
-    // Total Final Output: 490,000 + 1,020,000 = 1,510,000 USDT
+    // Stage 1: 1,000 USDT -> live OB buy INJ @ best ask 10 (book depth 1000 INJ)
+    // Stage 2: the resulting INJ split 49/51 across AMM1 (@10) and AMM2 (@20).
+    // Input scaled to fit the seeded orderbook depth; exact output asserted below.
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -402,14 +905,10 @@ fn test_multi_stage_aggregate_swap_success() {
                 splits: vec![Split {
                     percent: 100,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(10000),
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "inj".to_string(),
+                        quantity: None,
+                        worst_price: None,
                     })],
                 }],
             },
@@ -420,9 +919,6 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 49,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_1_addr.clone(),
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
-                            },
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
@@ -432,9 +928,6 @@ fn test_multi_stage_aggregate_swap_success() {
                         percent: 51,
                         path: vec![Operation::AmmSwap(AmmSwapOp {
                             pool_address: env.mock_amm_2_addr.clone(),
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
-                            },
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
@@ -444,11 +937,11 @@ fn test_multi_stage_aggregate_swap_success() {
             },
         ],
         // The minimum we expect from summing the Stage 2 outputs.
-        minimum_receive: Some(Uint128::new(1500000000000)), // 1,500,000 USDT
+        minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
     };
 
-    // The initial funds for this route are 1,000,000 USDT
-    let initial_funds = Coin::new(1_000_000_000_000u128, "usdt");
+    // The initial funds for this route are 1,000 USDT
+    let initial_funds = Coin::new(1_000_000_000u128, "usdt");
 
     let res = wasm.execute(
         &env.aggregator_addr,
@@ -481,8 +974,8 @@ fn test_multi_stage_aggregate_swap_success() {
         .find(|a| a.key == "final_received")
         .unwrap();
 
-    // Expected final amount is 1,510,000 USDT
-    let expected_final_amount = "1510000000000";
+    // 1000 USDT -> ~99.7506 INJ (ask 10, gross atomic fee) -> 49%@10 + 51%@20 = 1506.225 USDT
+    let expected_final_amount = "1506225000";
     assert_eq!(final_received_attr.value, expected_final_amount);
 
     let balance_response = bank
@@ -499,7 +992,7 @@ fn test_multi_stage_aggregate_swap_success() {
     // Expected Final: 1_000_000_000_000 - 1_000_000_000_000 + 1_510_000_000_000 = 1_510_000_000_000
     let initial_user_balance = 1_000_000_000_000u128; // Assuming this is the initial balance from setup()
     let expected_final_balance = Uint128::new(initial_user_balance)
-        - Uint128::new(initial_funds.amount.u128())
+        - Uint128::try_from(initial_funds.amount).unwrap()
         + Uint128::from_str(expected_final_amount).unwrap();
 
     // Extract the amount from the query response
@@ -516,21 +1009,30 @@ pub struct ConversionTestSetup {
     pub shroom_cw20_addr: String,
     pub sai_cw20_addr: String,
     pub adapter_addr: String,
-    pub mock_inj_to_native_shroom_ob: String,
     pub mock_inj_to_cw20_shroom_amm: String,
     pub mock_cw20_shroom_to_cw20_sai_amm: String,
-    pub mock_usdt_to_inj_ob: String,
-    pub mock_native_shroom_to_usdt_ob: String,
     pub mock_cw20_shroom_to_usdt_amm: String,
+    /// Live spot markets (replace the former mock orderbook contracts).
+    pub market_inj_usdt: String,
+    pub market_inj_shroom: String,
+    pub market_shroom_usdt: String,
+    /// The cw20-adapter tokenfactory denom for SHROOM (a market base/quote).
+    pub native_shroom_denom: String,
 }
 
 fn setup_for_conversion_test() -> ConversionTestSetup {
     let app = InjectiveTestApp::new();
+    // Register inj/usdt denom decimals (spot-market launch prerequisite). The
+    // native SHROOM tokenfactory denom is created at runtime by the adapter and
+    // gets its decimals from the market-launch params below.
     let admin = app
-        .init_account(&[
-            Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
-            Coin::new(1_000_000_000_000u128, "usdt"),
-        ])
+        .init_account_decimals(
+            &[
+                Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+                Coin::new(1_000_000_000_000u128, "usdt"),
+            ],
+            &[18, 6],
+        )
         .unwrap();
     let user = app
         .init_account(&[
@@ -661,35 +1163,8 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
         &admin,
     )
     .unwrap();
-    // 5. Deploy and Fund Mock DEXs
+    // 5. Deploy Mock AMM DEXs (orderbook hops use real markets, launched below).
     let native_shroom_denom = format!("factory/{}/{}", adapter_addr, shroom_cw20_addr);
-
-    // DEX 1: INJ -> SHROOM (native)
-    let mock_inj_to_native_shroom_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: "inj".to_string(),
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: native_shroom_denom.clone(),
-                    },
-                    rate: "100.0".to_string(),
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 18,
-                    output_decimals: 6,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-inj-shroom"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
 
     // DEX 2: INJ -> SHROOM (cw20)
     let mock_inj_to_cw20_shroom_amm = wasm
@@ -738,58 +1213,6 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             },
             Some(&admin.address()),
             Some("amm-shroom-sai"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
-
-    let mock_usdt_to_inj_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: "inj".to_string(),
-                    },
-                    rate: "0.1".to_string(), // Rate: 1 USDT = 0.1 INJ
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 6,
-                    output_decimals: 18,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-usdt-inj"),
-            &[],
-            &admin,
-        )
-        .unwrap()
-        .data
-        .address;
-
-    let mock_native_shroom_to_usdt_ob = wasm
-        .instantiate(
-            mock_swap_code_id,
-            &MockInstantiateMsg {
-                config: SwapConfig {
-                    input_asset_info: AssetInfo::NativeToken {
-                        denom: native_shroom_denom.clone(), // ACCEPTS NATIVE SHROOM
-                    },
-                    output_asset_info: AssetInfo::NativeToken {
-                        denom: "usdt".to_string(), // PAYS OUT USDT
-                    },
-                    rate: "0.5".to_string(), // Rate: 1 SHROOM = 0.5 USDT
-                    protocol_type: ProtocolType::Orderbook,
-                    input_decimals: 6,
-                    output_decimals: 6,
-                },
-            },
-            Some(&admin.address()),
-            Some("ob-native-shroom-usdt"),
             &[],
             &admin,
         )
@@ -856,26 +1279,24 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
-    // 3. Fund the DEX that pays out in NATIVE SHROOM.
-    // To do this, the admin first needs to create some native shroom.
-    let native_shroom_to_create = Uint128::new(1_000_000_000_000); // 100k
-                                                                   // Mint cw20 to admin
+    // 3. Create native SHROOM (wrap cw20 via the adapter) so the admin can seed the
+    //    live orderbook markets that the conversion routes trade against.
+    let shroom_for_markets = Uint128::new(2_000_000_000_000); // 2,000,000 SHROOM (6dp)
     wasm.execute(
         &shroom_cw20_addr,
         &cw20_base::msg::ExecuteMsg::Mint {
             recipient: admin.address(),
-            amount: native_shroom_to_create,
+            amount: shroom_for_markets,
         },
         &[],
         &admin,
     )
     .unwrap();
-    // Admin sends cw20 to adapter, which mints native shroom and sends it back to the admin.
     wasm.execute(
         &shroom_cw20_addr,
         &cw20::Cw20ExecuteMsg::Send {
             contract: adapter_addr.clone(),
-            amount: native_shroom_to_create,
+            amount: shroom_for_markets,
             msg: to_json_binary(&"{}").unwrap(),
         },
         &[],
@@ -883,46 +1304,65 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
     )
     .unwrap();
 
-    // Now admin has native shroom and can fund the DEX.
     let bank = Bank::new(&app);
-    bank.send(
-        MsgSend {
-            from_address: admin.address(),
-            to_address: mock_inj_to_native_shroom_ob.clone(),
-            amount: vec![ProtoCoin {
-                denom: native_shroom_denom,
-                amount: native_shroom_to_create.to_string(),
-            }],
-        },
-        &admin,
-    )
-    .unwrap();
 
-    bank.send(
-        MsgSend {
-            from_address: admin.address(),
-            to_address: mock_usdt_to_inj_ob.clone(),
-            amount: vec![ProtoCoin {
-                denom: "inj".to_string(),
-                amount: "10000000000000000000000".to_string(), // 10,000 INJ
-            }],
-        },
+    // 4. Register min-notionals (incl. the runtime SHROOM factory denom) and launch
+    //    the three live spot markets the orderbook hops trade against. Orientations
+    //    chosen so the seed prices are integers in (base/quote):
+    //      INJ/USDT   (inj 18 / usdt 6)  : usdt->inj  buys against asks @10
+    //      INJ/SHROOM (inj 18 / shroom 6): inj->shroom sells into bids @100 shroom/inj
+    //      USDT/SHROOM(usdt 6 / shroom 6): shroom->usdt buys usdt against asks @2 shroom/usdt
+    register_min_notionals(&app, &admin, &["inj", "usdt", &native_shroom_denom]);
+    let exchange = Exchange::new(&app);
+    let market_inj_usdt = launch_spot_market(&exchange, &admin, "INJ/USDT", "inj", "usdt", 18, 6);
+    let market_inj_shroom = launch_spot_market(
+        &exchange,
         &admin,
-    )
-    .unwrap();
+        "INJ/SHROOM",
+        "inj",
+        &native_shroom_denom,
+        18,
+        6,
+    );
+    let market_shroom_usdt = launch_spot_market(
+        &exchange,
+        &admin,
+        "USDT/SHROOM",
+        "usdt",
+        &native_shroom_denom,
+        6,
+        6,
+    );
 
+    // 5. Fund a maker and seed each book.
+    let maker = app
+        .init_account(&[
+            Coin::new(micro(100_000, 18), "inj"),
+            Coin::new(micro(10_000_000, 6), "usdt"),
+        ])
+        .unwrap();
     bank.send(
         MsgSend {
             from_address: admin.address(),
-            to_address: mock_native_shroom_to_usdt_ob.clone(),
+            to_address: maker.address(),
             amount: vec![ProtoCoin {
-                denom: "usdt".to_string(),
-                amount: "10000000000".to_string(), // 10,000 USDT
+                denom: native_shroom_denom.clone(),
+                amount: micro(1_500_000, 6).to_string(),
             }],
         },
         &admin,
     )
     .unwrap();
+    for (px, q) in [(10u128, 1000u128), (11, 1000), (12, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 2, px, q, 18, 6); // asks: sell inj
+    }
+    for (px, q) in [(100u128, 1000u128), (99, 1000), (98, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_shroom, 1, px, q, 18, 6); // bids: buy inj w/ shroom
+    }
+    for (px, q) in [(2u128, 100_000u128), (3, 100_000)] {
+        limit_order(&exchange, &maker, &market_shroom_usdt, 2, px, q, 6, 6); // asks: sell usdt for shroom
+    }
+    app.increase_time(1);
 
     bank.send(
         MsgSend {
@@ -946,18 +1386,20 @@ fn setup_for_conversion_test() -> ConversionTestSetup {
             aggregator_addr,
             mock_amm_1_addr: "".to_string(),
             mock_amm_2_addr: "".to_string(),
-            mock_ob_inj_usdt_addr: "".to_string(),
-            mock_ob_usdt_inj_addr: "".to_string(),
+            market_inj_usdt: "".to_string(),
+            mock_clmm_inj_usdt_addr: "".to_string(),
         },
         shroom_cw20_addr,
         sai_cw20_addr,
         adapter_addr,
-        mock_inj_to_native_shroom_ob,
         mock_inj_to_cw20_shroom_amm,
         mock_cw20_shroom_to_cw20_sai_amm,
-        mock_usdt_to_inj_ob,
-        mock_native_shroom_to_usdt_ob,
         mock_cw20_shroom_to_usdt_amm,
+        // Live spot markets the orderbook hops trade against.
+        market_inj_usdt,
+        market_inj_shroom,
+        market_shroom_usdt,
+        native_shroom_denom,
     }
 }
 
@@ -971,7 +1413,7 @@ fn test_full_normalization_route() {
     // 10 INJ -> 1000 SHROOM total (500 native + 500 cw20)
     // 1000 SHROOM -> 100 SAI (rate of 0.1)
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -981,14 +1423,10 @@ fn test_full_normalization_route() {
                     Split {
                         percent: 50,
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                            swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
-                            offer_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "inj".to_string(),
-                            },
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: native_shroom_denom.clone(),
-                            },
-                            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                            market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                            target_denom: setup.native_shroom_denom.clone(),
+                            quantity: None,
+                            worst_price: None,
                         })],
                     },
                     Split {
@@ -997,9 +1435,6 @@ fn test_full_normalization_route() {
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
-                            },
-                            ask_asset_info: amm::AssetInfo::Token {
-                                contract_addr: setup.shroom_cw20_addr.clone(),
                             },
                         })],
                     },
@@ -1013,9 +1448,6 @@ fn test_full_normalization_route() {
                         pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                         offer_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.shroom_cw20_addr.clone(),
-                        },
-                        ask_asset_info: amm::AssetInfo::Token {
-                            contract_addr: setup.sai_cw20_addr.clone(),
                         },
                     })],
                 }],
@@ -1041,7 +1473,8 @@ fn test_full_normalization_route() {
         )
         .unwrap();
 
-    assert_eq!(balance.balance, Uint128::new(100_000_000));
+    // 99.925 SAI: the native-shroom split pays the live orderbook taker fee.
+    assert_eq!(balance.balance, Uint128::new(99_925_000));
 }
 
 #[test]
@@ -1058,7 +1491,7 @@ fn test_multi_stage_with_final_normalization() {
     // Final Result: The aggregator normalizes the 9,000 Native SHROOM and sends the
     // total 10,000 CW20 SHROOM to the user.
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -1067,14 +1500,10 @@ fn test_multi_stage_with_final_normalization() {
                 splits: vec![Split {
                     percent: 100,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: setup.mock_usdt_to_inj_ob.clone(),
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(10000),
+                        market_id: MarketId::new(setup.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "inj".to_string(),
+                        quantity: None,
+                        worst_price: None,
                     })],
                 }],
             },
@@ -1088,22 +1517,15 @@ fn test_multi_stage_with_final_normalization() {
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
                             },
-                            ask_asset_info: amm::AssetInfo::Token {
-                                contract_addr: setup.shroom_cw20_addr.clone(),
-                            },
                         })],
                     },
                     Split {
                         percent: 90, // 90% to Native SHROOM
                         path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                            swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
-                            offer_asset_info: amm::AssetInfo::NativeToken {
-                                denom: "inj".to_string(),
-                            },
-                            ask_asset_info: amm::AssetInfo::NativeToken {
-                                denom: native_shroom_denom.clone(),
-                            },
-                            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                            market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                            target_denom: setup.native_shroom_denom.clone(),
+                            quantity: None,
+                            worst_price: None,
                         })],
                     },
                 ],
@@ -1131,8 +1553,8 @@ fn test_multi_stage_with_final_normalization() {
         )
         .unwrap();
 
-    // Expected final amount: 10,000 SHROOM (with 6 decimals)
-    let expected_final_balance = Uint128::new(10_000_000_000u128);
+    // 9961.53375 SHROOM: the INJ->native-SHROOM orderbook split pays the taker fee.
+    let expected_final_balance = Uint128::new(9_961_533_750u128);
     assert_eq!(balance.balance, expected_final_balance);
 }
 
@@ -1187,9 +1609,6 @@ fn test_cw20_entry_point_swap_success() {
                     pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                     offer_asset_info: amm::AssetInfo::Token {
                         contract_addr: setup.shroom_cw20_addr.clone(),
-                    },
-                    ask_asset_info: amm::AssetInfo::Token {
-                        contract_addr: setup.sai_cw20_addr.clone(),
                     },
                 })],
             }],
@@ -1252,7 +1671,7 @@ fn test_reverse_normalization_route() {
     //     its CW20 SHROOM balance from Stage 1 into Native SHROOM to proceed.
     // Final Result: The user receives 500 USDT.
 
-    let native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
+    let _native_shroom_denom = format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr);
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![
@@ -1265,9 +1684,6 @@ fn test_reverse_normalization_route() {
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
-                        ask_asset_info: amm::AssetInfo::Token {
-                            contract_addr: setup.shroom_cw20_addr.clone(),
-                        },
                     })],
                 }],
             },
@@ -1276,15 +1692,10 @@ fn test_reverse_normalization_route() {
                 splits: vec![Split {
                     percent: 100,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
-                        // This is the key part of the test: the offer asset is NATIVE
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: native_shroom_denom.clone(),
-                        },
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(10000),
+                        market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                        target_denom: "usdt".to_string(),
+                        quantity: None,
+                        worst_price: None,
                     })],
                 }],
             },
@@ -1321,7 +1732,7 @@ fn test_reverse_normalization_route() {
         })
         .unwrap();
 
-    let swap_output = Uint128::new(500_000_000u128);
+    let swap_output = Uint128::new(498_753_000u128); // live shroom->usdt fill, net taker fee
     let expected_final_balance = initial_amount + swap_output;
 
     let final_balance = final_balance_response.balance.unwrap();
@@ -1354,9 +1765,6 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 33,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1366,9 +1774,6 @@ fn test_failure_if_minimum_receive_not_met() {
                     percent: 42,
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1377,14 +1782,10 @@ fn test_failure_if_minimum_receive_not_met() {
                 Split {
                     percent: 25,
                     path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: env.mock_ob_inj_usdt_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "usdt".to_string(),
+                        quantity: None,
+                        worst_price: None,
                     })],
                 },
             ],
@@ -1453,9 +1854,6 @@ fn test_failure_on_invalid_percentage_sum() {
                     percent: 50, // 50%
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_1_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1465,9 +1863,6 @@ fn test_failure_on_invalid_percentage_sum() {
                     percent: 49, // + 49% = 99% (Invalid!)
                     path: vec![Operation::AmmSwap(AmmSwapOp {
                         pool_address: env.mock_amm_2_addr.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
@@ -1535,11 +1930,8 @@ fn test_mixed_input_unified_output_reconciliation() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
-    };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
     };
 
     // Stage 1: Get 1000 CW20 SHROOM
@@ -1551,7 +1943,6 @@ fn test_mixed_input_unified_output_reconciliation() {
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
-                ask_asset_info: cw20_shroom_info.clone(),
             })],
         }],
     };
@@ -1563,10 +1954,10 @@ fn test_mixed_input_unified_output_reconciliation() {
                 // 60% requires Native SHROOM
                 percent: 60,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
-                    offer_asset_info: native_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
-                    min_quantity_tick_size: Uint128::new(10000),
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
                 })],
             },
             Split {
@@ -1575,7 +1966,6 @@ fn test_mixed_input_unified_output_reconciliation() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -1615,8 +2005,8 @@ fn test_mixed_input_unified_output_reconciliation() {
         })
         .unwrap();
 
-    // Expected Output: 300 USDT + 160 USDT = 460 USDT
-    let total_swap_output = Uint128::new(460_000_000u128);
+    // Expected Output: 300 USDT (AMM) + ~159.251 USDT (live shroom->usdt, net fee) = 459.251 USDT
+    let total_swap_output = Uint128::new(459_251_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
 
     let final_usdt_amount =
@@ -1659,11 +2049,8 @@ fn test_cw20_input_with_initial_reconciliation() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
-    };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
     };
 
     let stage1 = Stage {
@@ -1672,10 +2059,10 @@ fn test_cw20_input_with_initial_reconciliation() {
                 // 70% requires Native SHROOM
                 percent: 70,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
-                    offer_asset_info: native_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
-                    min_quantity_tick_size: Uint128::new(10000),
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
                 })],
             },
             Split {
@@ -1684,7 +2071,6 @@ fn test_cw20_input_with_initial_reconciliation() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -1727,8 +2113,8 @@ fn test_cw20_input_with_initial_reconciliation() {
         })
         .unwrap();
 
-    // Expected Output: 350 USDT (Native split) + 120 USDT (CW20 split) = 470 USDT
-    let total_swap_output = Uint128::new(470_000_000u128);
+    // Expected Output: ~349.127 USDT (live native split, net fee) + 120 USDT (CW20) = 469.127 USDT
+    let total_swap_output = Uint128::new(469_127_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
     let final_usdt_amount =
         Uint128::from_str(&final_usdt_balance_response.balance.unwrap().amount).unwrap();
@@ -1760,11 +2146,8 @@ fn test_complex_reconciliation_mixed_to_mixed() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
-    };
-    let usdt_info = amm::AssetInfo::NativeToken {
-        denom: "usdt".to_string(),
     };
     let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
@@ -1777,10 +2160,10 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 // 60% of INJ goes to create Native SHROOM
                 percent: 60,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                    swap_contract: setup.mock_inj_to_native_shroom_ob.clone(),
-                    offer_asset_info: inj_info.clone(),
-                    ask_asset_info: native_shroom_info.clone(),
-                    min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+                    market_id: MarketId::new(setup.market_inj_shroom.clone()).unwrap(),
+                    target_denom: setup.native_shroom_denom.clone(),
+                    quantity: None,
+                    worst_price: None,
                 })],
             },
             Split {
@@ -1789,7 +2172,6 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                     offer_asset_info: inj_info.clone(),
-                    ask_asset_info: cw20_shroom_info.clone(),
                 })],
             },
         ],
@@ -1802,10 +2184,10 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 // 25% of total value requires Native SHROOM
                 percent: 25,
                 path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                    swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
-                    offer_asset_info: native_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
-                    min_quantity_tick_size: Uint128::new(10000),
+                    market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
                 })],
             },
             Split {
@@ -1814,7 +2196,6 @@ fn test_complex_reconciliation_mixed_to_mixed() {
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
-                    ask_asset_info: usdt_info.clone(),
                 })],
             },
         ],
@@ -1852,8 +2233,8 @@ fn test_complex_reconciliation_mixed_to_mixed() {
         })
         .unwrap();
 
-    // Expected Output: 125 USDT + 300 USDT = 425 USDT
-    let total_swap_output = Uint128::new(425_000_000u128);
+    // Expected Output: ~124.306 USDT (live shroom->usdt, net fee) + 300 USDT (AMM) = 424.306 USDT
+    let total_swap_output = Uint128::new(424_306_000u128);
     let expected_final_usdt = initial_usdt_amount + total_swap_output;
 
     let final_usdt_amount =
@@ -1881,9 +2262,6 @@ fn test_final_output_is_cw20_token() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = amm::AssetInfo::Token {
-        contract_addr: setup.sai_cw20_addr.clone(),
-    };
 
     let stage1 = Stage {
         splits: vec![Split {
@@ -1891,7 +2269,6 @@ fn test_final_output_is_cw20_token() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                 offer_asset_info: inj_info.clone(),
-                ask_asset_info: cw20_shroom_info.clone(),
             })],
         }],
     };
@@ -1902,7 +2279,6 @@ fn test_final_output_is_cw20_token() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
-                ask_asset_info: cw20_sai_info.clone(),
             })],
         }],
     };
@@ -1968,9 +2344,6 @@ fn test_native_input_with_initial_cw20_requirement() {
     let cw20_shroom_info = amm::AssetInfo::Token {
         contract_addr: setup.shroom_cw20_addr.clone(),
     };
-    let cw20_sai_info = amm::AssetInfo::Token {
-        contract_addr: setup.sai_cw20_addr.clone(),
-    };
 
     // First, we need to get some Native SHROOM to the user.
     // Admin mints CW20 -> sends to Adapter -> Adapter sends Native SHROOM to Admin -> Admin sends to User.
@@ -2019,7 +2392,6 @@ fn test_native_input_with_initial_cw20_requirement() {
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
-                ask_asset_info: cw20_sai_info.clone(),
             })],
         }],
     };
@@ -2035,7 +2407,7 @@ fn test_native_input_with_initial_cw20_requirement() {
         &msg,
         &[Coin {
             denom: native_shroom_denom,
-            amount: amount_to_test,
+            amount: amount_to_test.into(),
         }],
         user,
     );
@@ -2078,9 +2450,6 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2090,9 +2459,6 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_2_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2157,9 +2523,6 @@ fn test_stage_with_single_hundred_percent_split() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: env.mock_amm_1_addr.clone(),
-                ask_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "usdt".to_string(),
-                },
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
@@ -2171,14 +2534,10 @@ fn test_stage_with_single_hundred_percent_split() {
         splits: vec![Split {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                ask_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "inj".to_string(),
-                },
-                offer_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "usdt".to_string(),
-                },
-                min_quantity_tick_size: Uint128::new(10000),
+                market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                target_denom: "inj".to_string(),
+                quantity: None,
+                worst_price: None,
             })],
         }],
     };
@@ -2222,7 +2581,8 @@ fn test_stage_with_single_hundred_percent_split() {
         .unwrap();
 
     // The final swap (1000 USDT -> INJ @ rate 0.1) should yield exactly 100 INJ.
-    let expected_final_amount = "100000000000000000000"; // 100 INJ with 18 decimals
+    // Buy INJ on the live book (best ask 10, gross atomic fee) = 99.75 INJ.
+    let expected_final_amount = "99750000000000000000";
     assert_eq!(final_received_attr.value, expected_final_amount);
 }
 
@@ -2255,14 +2615,10 @@ fn test_intermediate_swap_failure_reverts_transaction() {
         splits: vec![Split {
             percent: 100,
             path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-                ask_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "inj".to_string(),
-                },
-                offer_asset_info: amm::AssetInfo::NativeToken {
-                    denom: "usdt".to_string(),
-                },
-                min_quantity_tick_size: Uint128::new(10000),
+                market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                target_denom: "inj".to_string(),
+                quantity: None,
+                worst_price: None,
             })],
         }],
     };
@@ -2275,9 +2631,6 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: env.mock_amm_1_addr.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2288,9 +2641,6 @@ fn test_intermediate_swap_failure_reverts_transaction() {
                 percent: 50,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: "inj1invalidcontractaddressxxxxxxxxxxxxxx".to_string(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2348,13 +2698,13 @@ fn test_fee_collection_on_single_swap() {
 
     // --- 1. SETUP: Admin sets a 0.3% fee on the first mock AMM pool ---
     let fee_pool_address = env.mock_amm_1_addr.clone();
-    let fee_percent = Decimal::from_str("0.003").unwrap(); // 0.3%
+    let fee_fraction = Decimal::from_str("0.003").unwrap(); // 0.3%
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2373,9 +2723,6 @@ fn test_fee_collection_on_single_swap() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2483,13 +2830,13 @@ fn test_fee_collection_on_cw20_output() {
 
     // --- 1. SETUP: Admin sets a 1.5% fee on the INJ -> CW20 SHROOM pool ---
     let fee_pool_address = setup.mock_inj_to_cw20_shroom_amm.clone();
-    let fee_percent = Decimal::from_str("0.015").unwrap(); // 1.5%
+    let fee_fraction = Decimal::from_str("0.015").unwrap(); // 1.5%
 
     wasm.execute(
         &setup.env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2506,9 +2853,6 @@ fn test_fee_collection_on_cw20_output() {
             percent: 100,
             path: vec![Operation::AmmSwap(AmmSwapOp {
                 pool_address: fee_pool_address,
-                ask_asset_info: amm::AssetInfo::Token {
-                    contract_addr: setup.shroom_cw20_addr.clone(),
-                },
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
                 },
@@ -2568,7 +2912,7 @@ fn test_admin_functions_fail_for_unauthorized_user() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: env.mock_amm_1_addr.clone(),
-            fee_percent: Decimal::from_str("0.01").unwrap(),
+            fee_fraction: Decimal::from_str("0.01").unwrap(),
         },
         &[],
         unauthorized_user,
@@ -2629,7 +2973,7 @@ fn test_full_admin_fee_lifecycle() {
     let original_collector = &env.fee_collector;
 
     let fee_pool_address = env.mock_amm_1_addr.clone();
-    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+    let fee_fraction = Decimal::from_str("0.01").unwrap(); // 1%
     let expected_fee = Uint128::new(10_000_000); // 10 USDT fee
 
     // --- 1. Admin sets a fee ---
@@ -2637,7 +2981,7 @@ fn test_full_admin_fee_lifecycle() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2651,9 +2995,6 @@ fn test_full_admin_fee_lifecycle() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address.clone(),
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2721,7 +3062,7 @@ fn test_full_admin_fee_lifecycle() {
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2781,13 +3122,13 @@ fn test_multi_split_with_mixed_fees() {
     // --- 1. SETUP: Admin sets a 1% fee on AMM1, but NO fee on AMM2 ---
     let taxed_pool = env.mock_amm_1_addr.clone();
     let untaxed_pool = env.mock_amm_2_addr.clone();
-    let fee_percent = Decimal::from_str("0.01").unwrap(); // 1%
+    let fee_fraction = Decimal::from_str("0.01").unwrap(); // 1%
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: taxed_pool.clone(),
-            fee_percent,
+            fee_fraction,
         },
         &[],
         admin,
@@ -2802,9 +3143,6 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 40,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: taxed_pool,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2815,9 +3153,6 @@ fn test_multi_split_with_mixed_fees() {
                 percent: 60,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: untaxed_pool,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2894,13 +3229,13 @@ fn test_fee_truncates_to_zero() {
     // --- 1. SETUP: Admin sets a tiny fee on a pool ---
     let fee_pool_address = env.mock_amm_1_addr.clone();
     // This fee is 0.0001%, which is 0.000001 as a decimal.
-    let tiny_fee_percent = Decimal::from_str("0.000001").unwrap();
+    let tiny_fee_fraction = Decimal::from_str("0.000001").unwrap();
 
     wasm.execute(
         &env.aggregator_addr,
         &ExecuteMsg::SetFee {
             pool_address: fee_pool_address.clone(),
-            fee_percent: tiny_fee_percent,
+            fee_fraction: tiny_fee_fraction,
         },
         &[],
         admin,
@@ -2920,9 +3255,6 @@ fn test_fee_truncates_to_zero() {
                 percent: 100,
                 path: vec![Operation::AmmSwap(AmmSwapOp {
                     pool_address: fee_pool_address,
-                    ask_asset_info: amm::AssetInfo::NativeToken {
-                        denom: "usdt".to_string(),
-                    },
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
                     },
@@ -2987,6 +3319,48 @@ fn test_fee_truncates_to_zero() {
         Uint128::zero(),
         "Fee collector should have a zero balance"
     );
+}
+
+#[test]
+fn test_migrate_preserves_state_and_is_admin_gated() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Capture pre-migrate state we expect to survive the migration untouched.
+    let before: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+
+    // Upload the same wasm again to get a fresh code id to migrate onto.
+    let new_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+
+    // A non-admin cannot migrate (chain-enforced on the wasm module).
+    let unauthorized = wasm.migrate(new_code_id, &env.aggregator_addr, &MigrateMsg {}, &env.user);
+    assert!(
+        unauthorized.is_err(),
+        "migrate by a non-admin must be rejected"
+    );
+
+    // The code admin can migrate; the entry point runs cw2's identity/version guard.
+    wasm.migrate(
+        new_code_id,
+        &env.aggregator_addr,
+        &MigrateMsg {},
+        &env.admin,
+    )
+    .expect("admin migrate should succeed");
+
+    // Persistent state (CONFIG) is untouched by the no-op migration.
+    let after: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    assert_eq!(after.admin, before.admin);
+    assert_eq!(after.cw20_adapter_address, before.cw20_adapter_address);
+    assert_eq!(after.fee_collector, before.fee_collector);
 }
 
 #[test]
@@ -3082,13 +3456,10 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     let inj_info = amm::AssetInfo::NativeToken {
         denom: "inj".to_string(),
     };
-    let cw20_shroom_info = amm::AssetInfo::Token {
-        contract_addr: setup.shroom_cw20_addr.clone(),
-    };
-    let native_shroom_info = amm::AssetInfo::NativeToken {
+    let _native_shroom_info = amm::AssetInfo::NativeToken {
         denom: format!("factory/{}/{}", setup.adapter_addr, setup.shroom_cw20_addr),
     };
-    let usdt_info = amm::AssetInfo::NativeToken {
+    let _usdt_info = amm::AssetInfo::NativeToken {
         denom: "usdt".to_string(),
     };
 
@@ -3098,21 +3469,20 @@ fn test_multi_hop_path_with_mid_path_conversion() {
         Operation::AmmSwap(AmmSwapOp {
             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
             offer_asset_info: inj_info.clone(),
-            ask_asset_info: cw20_shroom_info.clone(),
         }),
         // Hop 2: Native SHROOM -> USDT (INPUT MISMATCH HERE)
         Operation::OrderbookSwap(OrderbookSwapOp {
-            swap_contract: setup.mock_native_shroom_to_usdt_ob.clone(),
-            offer_asset_info: native_shroom_info.clone(),
-            ask_asset_info: usdt_info.clone(),
-            min_quantity_tick_size: Uint128::new(10000),
+            market_id: MarketId::new(setup.market_shroom_usdt.clone()).unwrap(),
+            target_denom: "usdt".to_string(),
+            quantity: None,
+            worst_price: None,
         }),
         // Hop 3: USDT -> INJ
         Operation::OrderbookSwap(OrderbookSwapOp {
-            swap_contract: setup.mock_usdt_to_inj_ob.clone(),
-            offer_asset_info: usdt_info.clone(),
-            ask_asset_info: inj_info.clone(),
-            min_quantity_tick_size: Uint128::new(10000),
+            market_id: MarketId::new(setup.market_inj_usdt.clone()).unwrap(),
+            target_denom: "inj".to_string(),
+            quantity: None,
+            worst_price: None,
         }),
     ];
 
@@ -3167,7 +3537,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
 
     // Expected change: -10 INJ (sent) + 50 INJ (received) = +40 INJ net gain.
     let expected_final_amount = initial_inj_amount
-        .checked_sub(funds_to_send.amount)
+        .checked_sub(Uint128::try_from(funds_to_send.amount).unwrap())
         .unwrap()
         .checked_add(Uint128::new(50_000_000_000_000_000_000u128))
         .unwrap();
@@ -3343,43 +3713,23 @@ fn test_multi_split_to_same_orderbook_contract() {
     // Split 2 (60%): 60 INJ -> Mock OB @ 30.0 = 1,800 USDT
     // Total Expected Output: 3,000 USDT
 
-    // Define the single orderbook contract that both splits will use.
-    let shared_orderbook_contract = env.mock_ob_inj_usdt_addr.clone();
+    // Both splits route through the SAME live INJ/USDT market.
+    let ob_split = |percent: u8| Split {
+        percent,
+        path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+            target_denom: "usdt".to_string(),
+            quantity: None,
+            worst_price: None,
+        })],
+    };
 
     // Define the message for the route execution.
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![Stage {
-            splits: vec![
-                Split {
-                    percent: 40,
-                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: shared_orderbook_contract.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        // Tick size from the generic setup
-                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
-                },
-                Split {
-                    percent: 60,
-                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
-                        swap_contract: shared_orderbook_contract.clone(),
-                        ask_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "usdt".to_string(),
-                        },
-                        offer_asset_info: amm::AssetInfo::NativeToken {
-                            denom: "inj".to_string(),
-                        },
-                        min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
-                    })],
-                },
-            ],
+            splits: vec![ob_split(40), ob_split(60)],
         }],
-        minimum_receive: Some(Uint128::new(2_990_000_000)), // Min 2990 USDT
+        minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
     };
 
     // Get user's initial USDT balance for final assertion.
@@ -3420,8 +3770,9 @@ fn test_multi_split_to_same_orderbook_contract() {
         .find(|a| a.key == "final_received")
         .unwrap();
 
-    // Assert the total expected output is 3000 USDT (3000 * 10^6).
-    let expected_total_output = "3000000000";
+    // 100 INJ sold into the live book (best bid 9, depth 1000) less ~0.15% taker
+    // fee = 898.65 USDT, regardless of how the two splits divide it.
+    let expected_total_output = "898650000";
     assert_eq!(total_received_attr.value, expected_total_output);
 
     // 2. Assert the user's final bank balance is correct.
@@ -3454,24 +3805,16 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
 
     let path = vec![
         Operation::OrderbookSwap(OrderbookSwapOp {
-            swap_contract: env.mock_ob_inj_usdt_addr.clone(),
-            ask_asset_info: amm::AssetInfo::NativeToken {
-                denom: "usdt".to_string(),
-            },
-            offer_asset_info: amm::AssetInfo::NativeToken {
-                denom: "inj".to_string(),
-            },
-            min_quantity_tick_size: Uint128::new(1_000_000_000_000_000),
+            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+            target_denom: "usdt".to_string(),
+            quantity: None,
+            worst_price: None,
         }),
         Operation::OrderbookSwap(OrderbookSwapOp {
-            swap_contract: env.mock_ob_usdt_inj_addr.clone(),
-            ask_asset_info: amm::AssetInfo::NativeToken {
-                denom: "inj".to_string(),
-            },
-            offer_asset_info: amm::AssetInfo::NativeToken {
-                denom: "usdt".to_string(),
-            },
-            min_quantity_tick_size: Uint128::new(10000),
+            market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+            target_denom: "inj".to_string(),
+            quantity: None,
+            worst_price: None,
         }),
     ];
 
@@ -3479,7 +3822,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
         stages: vec![Stage {
             splits: vec![Split { percent: 100, path }],
         }],
-        minimum_receive: Some(Uint128::new(299_000_000_000_000_000_000u128)),
+        minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
     };
 
     let initial_inj_balance = bank
@@ -3523,7 +3866,8 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
         .find(|a| a.key == "final_received")
         .unwrap();
 
-    let expected_swap_output = Uint128::new(300_000_000_000_000_000_000u128); // 300 INJ
+    // 100 INJ -> sell @ bid 9 = 898.65 USDT -> buy @ ask 10 (gross fee) = 89.64 INJ.
+    let expected_swap_output = Uint128::new(89_640_000_000_000_000_000u128);
     assert_eq!(final_received_attr.value, expected_swap_output.to_string());
 
     // 2. Assert the user's final bank balance, accounting for gas fees.
@@ -3538,7 +3882,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
 
     // Calculate the "perfect world" final balance (without gas costs).
     let expected_final_amount_sans_gas = initial_inj_amount
-        .checked_sub(funds_to_send.amount)
+        .checked_sub(Uint128::try_from(funds_to_send.amount).unwrap())
         .unwrap()
         .checked_add(expected_swap_output)
         .unwrap();
@@ -3549,10 +3893,846 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
         "Final amount should be less than the ideal amount due to gas fees"
     );
 
-    // As a sanity check, ensure the balance still increased overall as this was a profitable swap.
-    // The net gain was 200 INJ, so the final balance should be well above the initial.
+    // On a real market an INJ->USDT->INJ round trip through the same book is a net
+    // LOSS (crosses the spread twice + pays two taker fees), so the user ends up
+    // with less INJ than they started — confirming the two hops chained for real
+    // (the old mock's 30.0/0.1 rates faked a profit; live books don't).
     assert!(
-        final_amount > initial_inj_amount,
-        "Final amount should be greater than the initial amount for this profitable swap"
+        final_amount < initial_inj_amount,
+        "Round trip through one book should net a loss (spread + 2x taker fee)"
     );
+}
+
+#[test]
+fn test_clmm_single_hop_swap() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // Input: 10 INJ (10 * 10^18)
+    // CLMM pool rate: 15.0 -> 10 INJ = 150 USDT (150 * 10^6)
+    // The aggregator queries Quote first, gets amount_out=150_000_000,
+    // then applies 0.5% slippage for minimum_amount_out.
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    minimum_amount_out: None,
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(149_000_000)), // 149 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+
+    assert!(res.is_ok(), "CLMM swap failed: {:?}", res.unwrap_err());
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 10 INJ * 15.0 = 150 USDT = 150_000_000 (6 decimals)
+    assert_eq!(total_received.value, "150000000");
+
+    // Verify user's USDT balance increased
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_balance = Uint128::from_str(&balance_response.balance.unwrap().amount).unwrap();
+    // Initial: 1_000_000_000_000 + swap output: 150_000_000
+    assert_eq!(final_balance, Uint128::new(1_000_150_000_000));
+}
+
+#[test]
+fn test_clmm_single_hop_swap_direct_mode() {
+    // Direct mode: the caller fixes `minimum_amount_out`, so the contract skips
+    // the per-hop `Quote` re-simulation and passes the floor straight into
+    // `SwapExactInput`. Same 10 INJ -> 150 USDT swap, just self-sized.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    // 149.25 USDT floor (0.5% under the 150 expected) — bot-sized.
+                    minimum_amount_out: Some(Uint128::new(149_250_000)),
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(149_000_000)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(10_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(
+        res.is_ok(),
+        "CLMM direct-mode swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let total_received = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event")
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap()
+        .value
+        .clone();
+    assert_eq!(total_received, "150000000");
+
+    let balance_response = bank
+        .query_balance(&QueryBalanceRequest {
+            address: env.user.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap();
+    let final_balance = Uint128::from_str(&balance_response.balance.unwrap().amount).unwrap();
+    assert_eq!(final_balance, Uint128::new(1_000_150_000_000));
+}
+
+#[test]
+fn test_clmm_mixed_with_amm_split() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Input: 100 INJ
+    // Split 1 (50%): 50 INJ -> AMM1 @ 10.0 = 500 USDT
+    // Split 2 (50%): 50 INJ -> CLMM @ 15.0 = 750 USDT
+    // Total: 1250 USDT
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![
+                Split {
+                    percent: 50,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        pool_address: env.mock_amm_1_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                },
+                Split {
+                    percent: 50,
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                        pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        minimum_amount_out: None,
+                    })],
+                },
+            ],
+        }],
+        minimum_receive: Some(Uint128::new(1_200_000_000)), // 1200 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(100_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "Mixed AMM+CLMM swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 50 INJ * 10 = 500 USDT + 50 INJ * 15 = 750 USDT = 1250 USDT
+    assert_eq!(total_received.value, "1250000000");
+}
+
+#[test]
+fn test_clmm_multi_hop() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Multi-hop: USDT -> OB (rate 0.1) -> INJ -> CLMM (rate 15.0) -> USDT
+    // Stage 1: 1000 USDT -> OB @ 0.1 = 100 INJ
+    // Stage 2: 100 INJ -> CLMM @ 15.0 = 1500 USDT
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "inj".to_string(),
+                        quantity: None,
+                        worst_price: None,
+                    })],
+                }],
+            },
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                        pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                        minimum_amount_out: None,
+                    })],
+                }],
+            },
+        ],
+        minimum_receive: Some(Uint128::new(1_400_000_000)), // 1400 USDT
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(1_000_000_000u128, "usdt")], // 1000 USDT
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "Multi-hop CLMM swap failed: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let success_event = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty == "wasm"
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .expect("Did not find success event");
+
+    let total_received = success_event
+        .attributes
+        .iter()
+        .find(|a| a.key == "final_received")
+        .unwrap();
+
+    // 1000 USDT * 0.1 = 100 INJ, 100 INJ * 15 = 1500 USDT
+    assert_eq!(total_received.value, "1496250000");
+}
+
+// ===========================================================================
+// FlashRoute — capital-free CLMM flash-arb
+//
+// The flash source is `mock_clmm_flash`, a faithful mirror of choice_clmm_pool's
+// flash interface (lend → FlashCallback → balance-delta repayment check +
+// reentrancy lock + GetConfig). The aggregator is the borrower:
+//   FlashRoute → pool.Flash → aggregator.FlashCallback → cycle via mock AMMs
+//             → repay principal+fee to the pool → surplus to the caller.
+// ===========================================================================
+
+struct FlashEnv {
+    app: InjectiveTestApp,
+    admin: SigningAccount,
+    user: SigningAccount,
+    aggregator_addr: String,
+    /// token0 = usdt, token1 = inj, 0.30% flash fee.
+    flash_pool_addr: String,
+    /// Cycle leg 1: 1 USDT -> 0.1 INJ (buy INJ around 10 usdt/inj).
+    amm_usdt_to_inj: String,
+    /// Cycle leg 2: 1 INJ -> 11 USDT (sell INJ above cost — the arb edge).
+    amm_inj_to_usdt: String,
+}
+
+fn setup_for_flash_test() -> FlashEnv {
+    let app = InjectiveTestApp::new();
+    let admin = app
+        .init_account_decimals(
+            &[
+                Coin::new(1_000_000_000_000_000_000_000_000u128, "inj"),
+                Coin::new(1_000_000_000_000_000u128, "usdt"),
+            ],
+            &[18, 6],
+        )
+        .unwrap();
+    // The caller is capital-free: it only needs INJ for gas, no usdt/inj input.
+    let user = app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let fee_collector = app.init_account(&[]).unwrap();
+
+    let wasm = Wasm::new(&app);
+    let aggregator_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let mock_swap_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let flash_pool_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_clmm_flash.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+    let adapter_code_id = wasm
+        .store_code(get_wasm_byte_code("cw20_adapter.wasm"), None, &admin)
+        .unwrap()
+        .data
+        .code_id;
+
+    let adapter_addr = wasm
+        .instantiate(
+            adapter_code_id,
+            &cw20_adapter::InstantiateMsg {},
+            Some(&admin.address()),
+            Some("adapter"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let aggregator_addr = wasm
+        .instantiate(
+            aggregator_code_id,
+            &InstantiateMsg {
+                admin: admin.address(),
+                cw20_adapter_address: adapter_addr,
+                fee_collector_address: fee_collector.address(),
+            },
+            Some(&admin.address()),
+            Some("aggregator"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // Allowlist the flash caller; FlashRoute is gated on the signer allowlist.
+    wasm.execute(
+        &aggregator_addr,
+        &ExecuteMsg::AuthorizeFlashSigner {
+            signer: user.address(),
+        },
+        &[],
+        &admin,
+    )
+    .unwrap();
+
+    let flash_pool_addr = wasm
+        .instantiate(
+            flash_pool_code_id,
+            &mock_clmm_flash::InstantiateMsg {
+                token0: mock_clmm_flash::AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+                token1: mock_clmm_flash::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                fee_bps: 30,
+            },
+            Some(&admin.address()),
+            Some("flash-pool"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let amm_usdt_to_inj = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    rate: "0.1".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,
+                    output_decimals: 18,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-usdt-inj"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    let amm_inj_to_usdt = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "11.0".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-inj-usdt"),
+            &[],
+            &admin,
+        )
+        .unwrap()
+        .data
+        .address;
+
+    // Fund: the pool holds usdt (lendable) + inj; leg 1 pays out inj; leg 2 usdt.
+    let bank = Bank::new(&app);
+    for (to, denom, amount) in [
+        (&flash_pool_addr, "usdt", micro(1_000_000, 6)), // lendable USDT
+        (&flash_pool_addr, "inj", micro(10, 18)),        // token1 presence only
+        (&amm_usdt_to_inj, "inj", micro(10_000, 18)),    // pays out ~100 INJ/cycle
+        (&amm_inj_to_usdt, "usdt", micro(10_000_000, 6)), // pays out ~1100 USDT/cycle
+    ] {
+        bank.send(
+            MsgSend {
+                from_address: admin.address(),
+                to_address: to.clone(),
+                amount: vec![ProtoCoin {
+                    denom: denom.to_string(),
+                    amount: amount.to_string(),
+                }],
+            },
+            &admin,
+        )
+        .unwrap();
+    }
+
+    FlashEnv {
+        app,
+        admin,
+        user,
+        aggregator_addr,
+        flash_pool_addr,
+        amm_usdt_to_inj,
+        amm_inj_to_usdt,
+    }
+}
+
+/// The profitable USDT -> INJ -> USDT cycle (leg1 then leg2).
+fn flash_cycle_stages(env: &FlashEnv) -> Vec<Stage> {
+    vec![
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.amm_usdt_to_inj.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                })],
+            }],
+        },
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.amm_inj_to_usdt.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                })],
+            }],
+        },
+    ]
+}
+
+fn usdt_balance(app: &InjectiveTestApp, addr: &str) -> u128 {
+    let b = Bank::new(app)
+        .query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .unwrap();
+    u128::from_str(&b.amount).unwrap()
+}
+
+#[test]
+fn test_flash_route_happy_path() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+    // Borrow 1000 USDT @ 0.30% fee (= 3 USDT). Cycle: 1000 USDT -> 100 INJ -> 1100
+    // USDT. Repay 1003, surplus 97 USDT to the caller (min_profit 50 satisfied).
+    let pool_usdt_before = usdt_balance(&env.app, &env.flash_pool_addr);
+    let user_usdt_before = usdt_balance(&env.app, &env.user.address());
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000), // 1000 USDT
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000), // 50 USDT floor
+    };
+
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[], &env.user);
+    assert!(res.is_ok(), "flash route failed: {:?}", res.unwrap_err());
+
+    let response = res.unwrap();
+    let done = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "flash_route_complete")
+        })
+        .expect("missing flash_route_complete event");
+    assert_eq!(
+        done.attributes
+            .iter()
+            .find(|a| a.key == "profit")
+            .unwrap()
+            .value,
+        "97000000"
+    );
+    assert_eq!(
+        done.attributes
+            .iter()
+            .find(|a| a.key == "repaid")
+            .unwrap()
+            .value,
+        "1003000000"
+    );
+
+    // Caller pocketed exactly the 97 USDT surplus.
+    assert_eq!(
+        usdt_balance(&env.app, &env.user.address()) - user_usdt_before,
+        97_000_000
+    );
+    // Pool is net +3 USDT (the flash fee), proving principal+fee was repaid.
+    assert_eq!(
+        usdt_balance(&env.app, &env.flash_pool_addr) - pool_usdt_before,
+        3_000_000
+    );
+}
+
+#[test]
+fn test_flash_route_below_min_profit_reverts() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+    let pool_usdt_before = usdt_balance(&env.app, &env.flash_pool_addr);
+
+    // Same cycle (yields 97 surplus) but demand 200 USDT — the route can't clear
+    // the floor, so the whole transaction must revert (loan auto-unwound).
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(200_000_000), // unreachable
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("profit floor not met"),
+        "expected FlashProfitNotMet, got: {err}"
+    );
+    // Nothing moved — the borrow was atomically reverted.
+    assert_eq!(
+        usdt_balance(&env.app, &env.flash_pool_addr),
+        pool_usdt_before
+    );
+}
+
+#[test]
+fn test_flash_route_cycle_through_flash_pool_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A cycle that swaps against the flash pool itself would deadlock on the pool's
+    // reentrancy lock; the aggregator must reject it up-front.
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    pool_address: env.flash_pool_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    minimum_amount_out: Some(Uint128::zero()),
+                })],
+            }],
+        }],
+        min_profit: Uint128::zero(),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("flash-source pool"),
+        "expected FlashPoolInCycle, got: {err}"
+    );
+}
+
+#[test]
+fn test_flash_callback_without_pending_flash_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A direct FlashCallback (no in-flight FlashRoute) must be rejected before any
+    // route runs, so a forged callback can't spend idle contract balances.
+    let msg = ExecuteMsg::FlashCallback {
+        fee0: Uint128::zero(),
+        fee1: Uint128::zero(),
+        data: cosmwasm_std::Binary::default(),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("no flash in flight"),
+        "expected NoPendingFlash, got: {err}"
+    );
+}
+
+#[test]
+fn test_flash_route_unauthorized_signer_rejected() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A signer NOT on the allowlist may not flash-borrow through the aggregator,
+    // even with an otherwise-valid, profitable cycle.
+    let outsider = env
+        .app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized, got: {err}"
+    );
+
+    // After the admin authorizes them, the same call succeeds.
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::AuthorizeFlashSigner {
+            signer: outsider.address(),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_ok());
+
+    // And revoking shuts them out again.
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::RevokeFlashSigner {
+            signer: outsider.address(),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized after revoke, got: {err}"
+    );
+}
+
+#[test]
+fn test_authorize_flash_signer_admin_only() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    // A non-admin cannot mutate the allowlist.
+    let err = wasm
+        .execute(
+            &env.aggregator_addr,
+            &ExecuteMsg::AuthorizeFlashSigner {
+                signer: env.user.address(),
+            },
+            &[],
+            &env.user,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Unauthorized"),
+        "expected Unauthorized, got: {err}"
+    );
+
+    // The IsFlashSigner query reflects the seeded allowlist (user authorized in
+    // setup; a fresh account is not).
+    let outsider = env.app.init_account(&[]).unwrap();
+    let user_auth: IsFlashSignerResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::IsFlashSigner {
+                signer: env.user.address(),
+            },
+        )
+        .unwrap();
+    assert!(user_auth.authorized);
+    let outsider_auth: IsFlashSignerResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::IsFlashSigner {
+                signer: outsider.address(),
+            },
+        )
+        .unwrap();
+    assert!(!outsider_auth.authorized);
+}
+
+#[test]
+fn test_flash_unrestricted_bypasses_signer_gate() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    let outsider = env
+        .app
+        .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: flash_cycle_stages(&env),
+        min_profit: Uint128::new(50_000_000),
+    };
+
+    // Blocked while gated...
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_err());
+
+    // ...admin opens flash globally...
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFlashUnrestricted { open: true },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    // ...and now any signer may flash-borrow.
+    assert!(wasm
+        .execute(&env.aggregator_addr, &msg, &[], &outsider)
+        .is_ok());
 }

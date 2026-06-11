@@ -1,8 +1,10 @@
+use crate::cw20::Cw20ReceiveMsg;
 #[allow(unused_imports)]
 use crate::state::Config;
 use cosmwasm_schema::{cw_serde, QueryResponses};
-use cosmwasm_std::{Addr, Coin, Decimal, Uint128};
-use cw20::Cw20ReceiveMsg;
+use cosmwasm_std::{Addr, Binary, Coin, Decimal, Uint128};
+use injective_cosmwasm::MarketId;
+use injective_math::FPDecimal;
 
 pub mod cw20_adapter {
     use super::*;
@@ -62,7 +64,20 @@ pub mod amm {
 
     #[cw_serde]
     pub enum QueryMsg {
-        Simulation { offer_asset: Asset },
+        Simulation {
+            offer_asset: Asset,
+        },
+        /// Pool pair info. Used by `SimulateRoute` to derive a hop's output asset
+        /// (the pair side that isn't the offer) without an explicit `ask_asset_info`
+        /// on the op. We only model `asset_infos`; serde drops the pair's other
+        /// fields (`contract_addr`, `liquidity_token`, decimals, ...) on decode.
+        Pair {},
+    }
+
+    /// Partial view of the pair's `PairInfo` — only the two asset infos.
+    #[cw_serde]
+    pub struct PairInfo {
+        pub asset_infos: [AssetInfo; 2],
     }
 
     #[cw_serde]
@@ -80,40 +95,6 @@ pub mod amm {
             belief_price: Option<Decimal>,
             max_spread: Option<Decimal>,
             to: Option<String>,
-        },
-    }
-}
-
-pub mod orderbook {
-    use super::*;
-    use injective_math::FPDecimal;
-
-    #[cw_serde]
-    pub struct FPCoin {
-        pub amount: FPDecimal,
-        pub denom: String,
-    }
-
-    #[cw_serde]
-    pub enum QueryMsg {
-        GetOutputQuantity {
-            from_quantity: FPDecimal,
-            source_denom: String,
-            target_denom: String,
-        },
-    }
-
-    #[cw_serde]
-    pub struct SwapEstimationResult {
-        pub expected_fees: Vec<FPCoin>,
-        pub result_quantity: FPDecimal,
-    }
-
-    #[cw_serde]
-    pub enum OrderbookExecuteMsg {
-        SwapMinOutput {
-            target_denom: String,
-            min_output_quantity: FPDecimal,
         },
     }
 }
@@ -136,25 +117,133 @@ pub mod reflection {
     }
 }
 
+pub mod clmm {
+    use super::*;
+
+    #[cw_serde]
+    pub enum ClmmPoolExecuteMsg {
+        SwapExactInput {
+            minimum_amount_out: Uint128,
+            recipient: Option<String>,
+            deadline: Option<u64>,
+        },
+    }
+
+    /// Flash-loan entry point on the CLMM pool. Wire-compatible with
+    /// `choice_clmm_common::pool::ExecuteMsg::Flash` (variant tag `flash`). The
+    /// pool lends `amount0`/`amount1` of token0/token1 to `recipient` and then
+    /// calls `recipient` back with `FlashCallbackMsg::FlashCallback`. `data` is
+    /// echoed into that callback unchanged.
+    #[cw_serde]
+    pub enum ClmmPoolFlashMsg {
+        Flash {
+            recipient: String,
+            amount0: Uint128,
+            amount1: Uint128,
+            data: Binary,
+        },
+    }
+
+    #[cw_serde]
+    pub enum Cw20HookMsg {
+        SwapExactInput {
+            minimum_amount_out: Uint128,
+            recipient: Option<String>,
+            deadline: Option<u64>,
+        },
+    }
+
+    #[cw_serde]
+    pub enum ClmmPoolQueryMsg {
+        Quote {
+            token_in: amm::AssetInfo,
+            amount_in: Uint128,
+        },
+        /// Pool config. Used by `SimulateRoute` to derive a hop's output asset
+        /// (the pool token that isn't the offer). The pool's `AssetInfo` is
+        /// wire-compatible with [`amm::AssetInfo`] (same `native_token`/`token`
+        /// snake_case tags); serde drops the unmodeled `tick_spacing`/`fee_config`/
+        /// `hook`/... fields on decode.
+        GetConfig {},
+    }
+
+    #[cw_serde]
+    pub struct QuoteResponse {
+        pub amount_out: Uint128,
+        pub amount_in_consumed: Uint128,
+        pub fee_amount: Uint128,
+    }
+
+    /// Partial view of the pool's `PoolConfig` — only the two token infos.
+    #[cw_serde]
+    pub struct ConfigResponse {
+        pub token0: amm::AssetInfo,
+        pub token1: amm::AssetInfo,
+    }
+}
+
+/// A single legacy-XYK AMM hop. `offer_asset_info` drives the dispatch (native
+/// funds vs `Cw20::Send` vs tax-exempt send) and per-stage allocation. The output
+/// (ask) asset is *not* carried: during execution it's read from the pair's swap
+/// event (`ask_asset` attribute), and during `SimulateRoute` it's derived from the
+/// pair's `Pair {}` query (the pair side that isn't the offer).
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
 }
 
+/// A single Injective spot-market hop, executed natively by the aggregator (it
+/// places the atomic spot order itself — there is no external swap contract).
+///
+/// `market_id` + `target_denom` are sufficient: the offer denom is the market's
+/// *other* side, `is_buy = (target_denom == market.base_denom)`, and the ticks
+/// come from the market — all derived on-chain.
+///
+/// - **Estimation mode** (`quantity`/`worst_price` omitted): the contract walks
+///   the book to size the order. Used by the Choice dApp (backs `SimulateRoute`).
+/// - **Direct mode** (both supplied): the caller fixes the base `quantity` and the
+///   `worst_price` bound, so no orderbook-walk queries run. Used by the arb bot;
+///   the route-level `minimum_receive` is the only net.
 #[cw_serde]
 pub struct OrderbookSwapOp {
-    pub swap_contract: String,
+    pub market_id: MarketId,
+    /// Native denom this hop must produce (the market's base for a buy, quote for a sell).
+    pub target_denom: String,
+    /// Direct mode: base quantity to trade. `None` => estimate from the book.
+    #[serde(default)]
+    pub quantity: Option<FPDecimal>,
+    /// Direct mode: worst acceptable price bound. `None` => estimate from the book.
+    #[serde(default)]
+    pub worst_price: Option<FPDecimal>,
+}
+
+/// A single CLMM hop. As with [`AmmSwapOp`], only `offer_asset_info` is carried:
+/// the output (ask) asset is read from the pool's swap event (`ask_asset`
+/// attribute) during execution, and from the pool's `GetConfig {}` query (the
+/// pool token that isn't the offer) during `SimulateRoute`.
+///
+/// - **Estimation mode** (`minimum_amount_out` omitted): the contract runs a
+///   per-hop `Quote` query and applies 0.5% slippage. Used by the Choice dApp.
+/// - **Direct mode** (`minimum_amount_out` supplied): the caller fixes the swap
+///   floor, so the per-hop `Quote` re-simulation is skipped entirely. Used by the
+///   arb bot; the route-level `minimum_receive` is the real net guard. An
+///   unfillable hop reverts the atomic route (it does not zero out gracefully).
+#[cw_serde]
+pub struct ClmmSwapOp {
+    pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
-    pub ask_asset_info: amm::AssetInfo,
-    pub min_quantity_tick_size: Uint128,
+    /// Direct mode: `SwapExactInput`'s `minimum_amount_out`, passed straight
+    /// through. `None` => estimate it from the pool (`Quote` + 0.5%).
+    #[serde(default)]
+    pub minimum_amount_out: Option<Uint128>,
 }
 
 #[cw_serde]
 pub enum Operation {
     AmmSwap(AmmSwapOp),
     OrderbookSwap(OrderbookSwapOp),
+    ClmmSwap(ClmmSwapOp),
 }
 
 #[cw_serde]
@@ -174,6 +263,10 @@ pub struct PlannedSwap {
     pub amount: Uint128,
     pub split_index: usize,
     pub op_index: usize,
+    /// The hop's offer (input) asset, resolved once when the stage is planned.
+    /// Carried so `execute_planned_swaps` doesn't re-derive it — for an orderbook
+    /// op that re-derivation is a spot-market chain query (`load_market`).
+    pub offer_info: amm::AssetInfo,
 }
 
 pub struct StagePlan {
@@ -196,6 +289,14 @@ pub struct InstantiateMsg {
     pub fee_collector_address: String,
 }
 
+/// No-op migrate payload. The route engine's state (`ACTIVE_ROUTES`,
+/// `SUBMSG_REPLY_STATES`, ...) is transient within a single atomic tx, and the
+/// persistent stores (`CONFIG`, `FEE_MAP`, `FLASH_SIGNERS`, `TAX_TOKEN_REGISTRY`)
+/// are structurally unchanged, so no data migration is required — the `migrate`
+/// entry point only guards the contract identity and bumps the stored version.
+#[cw_serde]
+pub struct MigrateMsg {}
+
 #[cw_serde]
 pub enum ExecuteMsg {
     ExecuteRoute {
@@ -209,7 +310,10 @@ pub enum ExecuteMsg {
     },
     SetFee {
         pool_address: String,
-        fee_percent: Decimal,
+        /// Aggregator fee as a decimal FRACTION of the hop's output (e.g.
+        /// "0.003" = 0.3%), NOT a percent. Renamed from the misleading
+        /// `fee_percent`. Must be < 1.
+        fee_fraction: Decimal,
     },
     RemoveFee {
         pool_address: String,
@@ -228,12 +332,47 @@ pub enum ExecuteMsg {
     DeregisterTaxToken {
         contract_addr: String,
     },
+    /// Adds `signer` to the `FlashRoute` allowlist. Admin-only.
+    AuthorizeFlashSigner {
+        signer: String,
+    },
+    /// Removes `signer` from the `FlashRoute` allowlist. Admin-only.
+    RevokeFlashSigner {
+        signer: String,
+    },
+    /// Escape hatch: when `open` is `true`, `FlashRoute` is permissionless (the
+    /// signer allowlist is bypassed). Admin-only.
+    SetFlashUnrestricted {
+        open: bool,
+    },
+    /// Capital-free CLMM flash-arb. Borrows `flash_amount` of `flash_asset` from
+    /// `flash_pool`, runs the `stages` cycle (must end in `flash_asset` and must
+    /// not route through `flash_pool`), repays principal + flash fee, and forwards
+    /// the surplus to the caller. The cycle reverts atomically unless the surplus
+    /// covers `min_profit`.
+    FlashRoute {
+        flash_pool: String,
+        flash_asset: amm::AssetInfo,
+        flash_amount: Uint128,
+        stages: Vec<Stage>,
+        min_profit: Uint128,
+    },
+    /// Borrower callback invoked by the CLMM pool mid-flash. Field layout matches
+    /// `choice_clmm_common::pool::FlashCallbackMsg::FlashCallback` so the pool's
+    /// serialized callback decodes straight into this variant. Only valid while a
+    /// `FlashRoute`-initiated flash is in flight (gated by `PENDING_FLASH`).
+    FlashCallback {
+        fee0: Uint128,
+        fee1: Uint128,
+        data: Binary,
+    },
 }
 
 #[cw_serde]
 pub struct FeeInfo {
     pub pool_address: String,
-    pub fee_percent: Decimal,
+    /// Decimal fraction of output (e.g. "0.003" = 0.3%), not a percent.
+    pub fee_fraction: Decimal,
 }
 
 #[cw_serde]
@@ -260,6 +399,27 @@ pub enum QueryMsg {
         start_after: Option<String>,
         limit: Option<u32>,
     },
+    /// Whether `signer` may call `FlashRoute` (true if explicitly allowlisted or
+    /// if flash is unrestricted).
+    #[returns(IsFlashSignerResponse)]
+    IsFlashSigner { signer: String },
+    /// All allowlisted flash signers, plus the unrestricted flag.
+    #[returns(FlashSignersResponse)]
+    FlashSigners {
+        start_after: Option<String>,
+        limit: Option<u32>,
+    },
+}
+
+#[cw_serde]
+pub struct IsFlashSignerResponse {
+    pub authorized: bool,
+}
+
+#[cw_serde]
+pub struct FlashSignersResponse {
+    pub signers: Vec<String>,
+    pub unrestricted: bool,
 }
 
 #[cw_serde]

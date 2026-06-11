@@ -56,12 +56,17 @@ The test suite uses `injective-test-tube`, which provides a high-fidelity testin
 **Important:** The test framework requires the Wasm binary to be compiled *before* the tests are run.
 
 ```bash
-# 1. Build the Wasm binary first
-./build-release.sh
+# 1. Build the Wasm artifacts first (rebuilds every workspace member, including a
+#    fresh dex_aggregator.wasm — a stale artifact tests old code).
+./build_release.sh
 
 # 2. Run the tests
 cargo test
 ```
+
+> If you add a workspace member or dependency, refresh `Cargo.lock` with a local
+> `cargo build` before `./build_release.sh` — the optimizer runs `--locked` and
+> aborts on a stale lock.
 
 ## Project Structure
 
@@ -89,34 +94,43 @@ AGGREGATION_CONTRACT/
 │   │       └── state.rs        # State definitions and storage management.
 │   │
 │   ├── mock_swap/          # A mock DEX contract used for integration testing. It simulates
-│   │                       # both AMM and Orderbook behavior with predictable rates.
+│   │                       # AMM, Orderbook, and CLMM behavior with predictable rates.
 │   │
-│   ├── cw20_adapter/       # A utility contract to handle conversions between native
-│   │                       # Injective tokenfactory denoms and their CW20 equivalents.
-│   │
-│   └── cw20_base/          # The standard CW20 fungible token contract (e.g., for SHROOM, SAI).
+│   └── mock_clmm_flash/    # A mock CLMM flash-loan pool for the FlashRoute integration
+│                           # tests. Faithfully mirrors choice_clmm_pool's flash interface
+│                           # (lend → FlashCallback → balance-delta repayment check +
+│                           # reentrancy lock + GetConfig) at the JSON wire level.
 │
-├── tests/                  # Workspace-level integration tests. This is where all the
-│   │                       # test files (like the ones we've been writing) reside. They use
-│   │                       # `injective-test-tube` to spin up a local chain environment.
+├── cw20_adapter/           # Pre-compiled WASM (not a workspace member): converts between
+│                           # native tokenfactory denoms and their CW20 equivalents.
 │
-├── .gitignore              # Specifies intentionally untracked files to ignore.
-├── build_release.sh        # A script to build optimized, production-ready .wasm files.
+├── cw20_base/              # Pre-compiled WASM (not a workspace member): the standard CW20
+│                           # token (e.g. for SHROOM, SAI), used by the integration tests.
+│
+├── docs/                   # Design docs (e.g. flash_route_plan.md).
+│
+├── scripts/                # Deploy/upload helpers: deploy_mainnet.sh, deploy_testnet.sh,
+│                           # upload_code_mainnet.sh (use `injectived`).
+│
+├── tests/                  # Workspace-level integration tests, driven by
+│                           # `injective-test-tube` (spins up a local chain environment).
+│
+├── artifacts/              # Optimized .wasm output from build_release.sh.
+├── build_release.sh        # Builds optimized, production-ready .wasm for every member.
 ├── Cargo.lock              # Records the exact versions of all dependencies.
-├── Cargo.toml              # The workspace's main manifest file, defining members and dependencies.
-├── deploy_testnet.sh       # A utility script for deploying contracts to a testnet.
+├── Cargo.toml              # The workspace manifest (members + shared dependencies).
+├── CLAUDE.md               # Contributor/agent guide for this contract.
 ├── LICENSE                 # Project's software license.
-├── readme.md               # This file.
-└── test_routes.txt         # A utility file for defining or documenting test routes.
+└── readme.md               # This file.
 ```
 
-## Core Functionality: `AggregateSwaps`
+## Core Functionality: `ExecuteRoute`
 
-The `AggregateSwaps` message is the primary entry point for executing complex trading routes. It is designed to be highly flexible, allowing users to define routes as a **Directed Acyclic Graph (DAG)** of swaps. This enables parallel, multi-hop paths that can utilize different intermediate assets, all within a single transaction.
+The `ExecuteRoute` message is the primary entry point for executing complex trading routes (CW20-initiated routes use the `Receive` hook's `Cw20HookMsg::ExecuteRoute`). It is designed to be highly flexible, allowing users to define routes as a **Directed Acyclic Graph (DAG)** of swaps. This enables parallel, multi-hop paths that can utilize different intermediate assets, all within a single transaction.
 
 ### Execution Flow
 
-When the contract receives an `AggregateSwaps` message, it performs the following steps:
+When the contract receives an `ExecuteRoute` message, it performs the following steps:
 
 1.  **Takes Custody:** The user sends their initial funds (either a native token or a CW20 token via a `Receive` message) along with the `AggregateSwaps` instructions. The aggregator contract takes custody of these initial funds.
 
@@ -141,10 +155,11 @@ When the contract receives an `AggregateSwaps` message, it performs the followin
 
 ### Message Structure
 
-The `AggregateSwaps` message is composed of several nested structs that define the route graph.
+The `ExecuteRoute` message is composed of several nested structs that define the route graph.
 
 ```rust
-pub struct ExecuteMsg::AggregateSwaps {
+// ExecuteMsg::ExecuteRoute { ... }
+pub struct ExecuteRoute {
     /// A vector of `Stage`s, executed sequentially. Each stage is a synchronization barrier.
     pub stages: Vec<Stage>,
 
@@ -168,24 +183,46 @@ pub struct Split {
 }
 
 pub enum Operation {
-    /// A swap on a constant-product (AMM) DEX.
+    /// A swap on a constant-product (legacy XYK / AMM) pair.
     AmmSwap(AmmSwapOp),
-    /// A swap on an orderbook-style DEX.
+    /// A native atomic spot-market order on Injective's orderbook (placed by the
+    /// aggregator itself — no external swap contract).
     OrderbookSwap(OrderbookSwapOp),
+    /// A swap on a concentrated-liquidity (CLMM) pool.
+    ClmmSwap(ClmmSwapOp),
 }
 
 // These structs define the specific details for each operation type.
+// AMM/CLMM ops carry only the `offer` side: the output (ask) asset is derived
+// from the pool's swap event (`ask_asset` attribute) during execution and from
+// the pool's `Pair {}` / `GetConfig {}` query during `SimulateRoute`.
 pub struct AmmSwapOp {
     pub pool_address: String,
-    pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
+    pub offer_asset_info: amm::AssetInfo,
 }
 
+// Orderbook hops are placed natively by the aggregator itself (it submits an
+// atomic spot-market order from its own subaccount — there is no external swap
+// contract). Native denoms only. `market_id` + `target_denom` are sufficient:
+// the offer denom is the market's other side, the direction is
+// `is_buy = (target_denom == market.base_denom)`, and the ticks come from the
+// market — all derived on-chain.
 pub struct OrderbookSwapOp {
-    pub swap_contract: String,
-    pub offer_asset_info: external::AssetInfo,
-    pub ask_asset_info: external::AssetInfo,
-    pub min_quantity_tick_size: Uint128,
+    pub market_id: MarketId,
+    /// The native denom this hop must produce (market base for a buy, quote for a sell).
+    pub target_denom: String,
+    /// Direct mode (arb bot): fixed base quantity. `None` => estimate from the book.
+    pub quantity: Option<FPDecimal>,
+    /// Direct mode (arb bot): worst acceptable price bound. `None` => estimate from the book.
+    pub worst_price: Option<FPDecimal>,
+}
+
+pub struct ClmmSwapOp {
+    pub pool_address: String,
+    pub offer_asset_info: amm::AssetInfo,
+    /// Direct mode (arb bot): the `SwapExactInput` floor, passed straight through.
+    /// `None` => estimate it from the pool (`Quote` + 0.5% slippage).
+    pub minimum_amount_out: Option<Uint128>,
 }
 ```
 
@@ -193,49 +230,43 @@ pub struct OrderbookSwapOp {
 
 Here is an example of a complex route that showcases the multi-hop `Path` functionality.
 
-**Route:** Start with `INJ`. Split the funds 50/50 into two parallel, multi-hop paths that use different intermediate assets (`USDT` and `AUSD`) but both end up with `SHROOM`.
+**Route:** Start with `INJ`. Split the funds into three parallel paths using AMM, Orderbook, and CLMM pools, all ending up with `USDT`.
 
 ```json
 {
-  "aggregate_swaps": {
+  "execute_route": {
     "stages": [
       {
         "splits": [
           {
-            "percent": 50,
+            "percent": 33,
             "path": [
               {
                 "amm_swap": {
                   "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
-                }
-              },
-              {
-                "orderbook_swap": {
-                  "swap_contract": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "peggy0x...usdt" } },
-                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } },
-                  "min_quantity_tick_size": 100000000
+                  "offer_asset_info": { "native_token": { "denom": "inj" } }
                 }
               }
             ]
           },
           {
-            "percent": 50,
+            "percent": 34,
             "path": [
               {
-                "amm_swap": {
-                  "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } },
-                  "ask_asset_info": { "native_token": { "denom": "peggy0x...ausd" } }
+                "orderbook_swap": {
+                  "market_id": "0x...",
+                  "target_denom": "peggy0x...usdt"
                 }
-              },
+              }
+            ]
+          },
+          {
+            "percent": 33,
+            "path": [
               {
-                "amm_swap": {
+                "clmm_swap": {
                   "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "peggy0x...ausd" } },
-                  "ask_asset_info": { "token": { "contract_addr": "inj1...shroom" } }
+                  "offer_asset_info": { "native_token": { "denom": "inj" } }
                 }
               }
             ]
@@ -244,6 +275,77 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
       }
     ],
     "minimum_receive": "123000000"
+  }
+}
+```
+
+## FlashRoute: Capital-Free CLMM Flash-Arb
+
+`FlashRoute` borrows a token from a Choice CLMM pool's `Flash {}`, runs a **cycle**
+(`X → … → X`) through *other* venues using the same routing engine as `ExecuteRoute`,
+repays `principal + flash_fee`, and forwards the surplus to the caller — all atomic,
+with no upfront capital. Because a flash loan must be repaid in the borrowed asset,
+the cycle ends in `flash_asset` (it is not an A→B user swap). Design details and the
+test plan live in [`docs/flash_route_plan.md`](docs/flash_route_plan.md).
+
+### How it works
+
+1. The caller sends `FlashRoute`. The aggregator validates the cycle (rejecting any
+   hop that routes through `flash_pool` — the pool's reentrancy lock would revert the
+   tx), maps `flash_asset` onto the pool's `token0`/`token1`, and fires the pool's
+   `Flash {}`.
+2. The pool lends the tokens to the aggregator and calls it back with `FlashCallback`.
+   The whole cycle then runs **depth-first inside that callback**.
+3. At the end of the cycle the aggregator repays `principal + fee` to the pool by
+   direct transfer (Bank `Send` / CW20 `Transfer` — never CW20 `Send`) and sends the
+   surplus to the caller. If the surplus can't cover `min_profit`, the whole
+   transaction reverts and the loan is unwound.
+
+Safety: `FlashCallback` is gated on an in-flight `FlashRoute` (`PENDING_FLASH`) and on
+`info.sender == flash_pool`, so a forged callback can't spend idle contract balances;
+the pool's own repayment check is a final backstop (it reverts the tx if unrepaid).
+
+### Message structure
+
+```rust
+// ExecuteMsg::FlashRoute { ... }
+pub struct FlashRoute {
+    /// CLMM pool to borrow from (its Flash {} is the loan source).
+    pub flash_pool: String,
+    /// Asset to borrow; must be the pool's token0 or token1.
+    pub flash_asset: amm::AssetInfo,
+    /// Amount to borrow (the cycle's working capital).
+    pub flash_amount: Uint128,
+    /// The X → … → X cycle. Must end in `flash_asset` and must NOT touch `flash_pool`.
+    pub stages: Vec<Stage>,
+    /// Surplus floor (in `flash_asset`); the tx reverts unless surplus ≥ this.
+    pub min_profit: Uint128,
+}
+
+// ExecuteMsg::FlashCallback { fee0, fee1, data } — the borrower callback. Invoked by
+// the pool mid-flash; wire-matches choice_clmm_common::pool::FlashCallbackMsg. Not
+// called directly by users.
+```
+
+### Example: borrow USDT, arb across two pools, keep the spread
+
+```json
+{
+  "flash_route": {
+    "flash_pool": "inj1...clmmpool",
+    "flash_asset": { "native_token": { "denom": "peggy0x...usdt" } },
+    "flash_amount": "1000000000",
+    "stages": [
+      { "splits": [ { "percent": 100, "path": [
+        { "amm_swap": { "pool_address": "inj1...poolA",
+                        "offer_asset_info": { "native_token": { "denom": "peggy0x...usdt" } } } }
+      ] } ] },
+      { "splits": [ { "percent": 100, "path": [
+        { "amm_swap": { "pool_address": "inj1...poolB",
+                        "offer_asset_info": { "native_token": { "denom": "inj" } } } }
+      ] } ] }
+    ],
+    "min_profit": "50000000"
   }
 }
 ```

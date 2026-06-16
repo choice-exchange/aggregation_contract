@@ -29,6 +29,14 @@ pub enum ContractError {
     #[error("Invalid funds for native token swap. Expected 1 coin, sent {sent}")]
     InvalidFunds { sent: usize },
 
+    #[error(
+        "Unsupported or malformed CW20 hook message — nothing was swapped and the transfer was reverted (parse error: {reason})"
+    )]
+    InvalidCw20Hook { reason: String },
+
+    #[error("minimum_receive must be greater than zero (a zero floor could let a route complete while returning nothing)")]
+    ZeroMinimumReceive {},
+
     // --- Execution & Economic Outcome Errors ---
     #[error(
         "Minimum receive amount not met. Minimum: {minimum_receive}, Received: {actual_receive}"

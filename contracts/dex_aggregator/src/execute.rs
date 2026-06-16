@@ -1,14 +1,85 @@
 use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo,
-    Response, StdError, StdResult, Uint128, WasmMsg,
+    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env,
+    MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
+use injective_math::FPDecimal;
 
 use crate::error::ContractError;
 use crate::msg::{amm, clmm, Operation, Stage};
 use crate::orderbook_exec;
-use crate::reply::proceed_to_next_step;
+use crate::reply::{get_operation_input, proceed_to_next_step};
+
+/// The dispatch message for a single hop plus, for orderbook hops, the base
+/// quantity the order was placed with (`ob_order_qty`) — carried so the reply can
+/// split the post-fill refund into protocol surplus vs. the user's unfilled
+/// remainder. `ob_order_qty` is `None` for AMM/CLMM hops.
+pub struct DispatchedSwap {
+    pub msg: CosmosMsg<InjectiveMsgWrapper>,
+    pub ob_order_qty: Option<FPDecimal>,
+}
+
+/// Contract balance of `info` held by `contract` (bank for natives, `Balance` query
+/// for CW20s). Chain-scale `Uint128`.
+pub fn query_asset_balance(
+    deps: Deps<InjectiveQueryWrapper>,
+    contract: &Addr,
+    info: &amm::AssetInfo,
+) -> Result<Uint128, ContractError> {
+    match info {
+        amm::AssetInfo::NativeToken { denom } => {
+            let bal = deps.querier.query_balance(contract, denom)?;
+            Ok(Uint128::try_from(bal.amount).map_err(StdError::from)?)
+        }
+        amm::AssetInfo::Token { contract_addr } => {
+            let res: BalanceResponse = deps.querier.query_wasm_smart(
+                contract_addr,
+                &Cw20QueryMsg::Balance {
+                    address: contract.to_string(),
+                },
+            )?;
+            Ok(res.balance)
+        }
+    }
+}
+
+/// Snapshot the contract's pre-route balance of every denom the route will touch —
+/// the offer denom plus every operation's input denom (offer + all intermediates;
+/// the final output is excluded and paid via the tracked amount). For the offer
+/// denom the route's own input is subtracted, so each baseline reflects only funds
+/// that pre-dated the route. `finalize_route` sweeps `current - baseline` of each so
+/// nothing the route doesn't deliver as output lingers in the contract.
+fn snapshot_entry_balances(
+    deps: Deps<InjectiveQueryWrapper>,
+    contract: &Addr,
+    stages: &[Stage],
+    offer: &amm::Asset,
+) -> Result<Vec<(amm::AssetInfo, Uint128)>, ContractError> {
+    let mut infos: Vec<amm::AssetInfo> = vec![offer.info.clone()];
+    for stage in stages {
+        for split in &stage.splits {
+            for op in &split.path {
+                let input = get_operation_input(deps, op)?;
+                if !infos.contains(&input) {
+                    infos.push(input);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(infos.len());
+    for info in infos {
+        let mut bal = query_asset_balance(deps, contract, &info)?;
+        // The offer is already in the contract at entry; exclude it from the
+        // baseline so the route's own input isn't mistaken for pre-existing funds.
+        if info == offer.info {
+            bal = bal.saturating_sub(offer.amount);
+        }
+        out.push((info, bal));
+    }
+    Ok(out)
+}
 use crate::state::{
     Awaiting, ExecutionState, FlashRepayment, PendingFlashCtx, RoutePlan, CONFIG, FEE_MAP,
     FLASH_SIGNERS, FLASH_UNRESTRICTED, PENDING_FLASH, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
@@ -113,9 +184,18 @@ pub fn execute_aggregate_swaps_internal(
         return Err(ContractError::InvalidPercentageSum {});
     }
 
+    // A positive floor is mandatory. A zero floor would let a route that produced
+    // nothing complete "successfully" while returning nothing, and it disables the
+    // user's only slippage guard on the output.
+    let minimum_receive = minimum_receive.unwrap_or_default();
+    if minimum_receive.is_zero() {
+        return Err(ContractError::ZeroMinimumReceive {});
+    }
+
     let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> { Ok(id + 1) })?;
 
-    let minimum_receive = minimum_receive.unwrap_or_default();
+    let entry_balances =
+        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &stages, &offer_asset)?;
 
     let plan = RoutePlan {
         sender: initiator.clone(),
@@ -134,6 +214,8 @@ pub fn execute_aggregate_swaps_internal(
         pending_swaps: vec![],
         pending_path_op: None,
         legs: vec![],
+        entry_balances,
+        pending_fees: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut initial_exec_state, reply_id)
@@ -285,18 +367,24 @@ pub fn execute_flash_callback(
         }),
     };
 
+    let offer_asset = amm::Asset {
+        info: ctx.flash_asset.clone(),
+        amount: ctx.principal,
+    };
+    let entry_balances =
+        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &plan.stages, &offer_asset)?;
+
     let mut exec_state = ExecutionState {
         plan,
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
         replies_expected: 0,
-        accumulated_assets: vec![amm::Asset {
-            info: ctx.flash_asset,
-            amount: ctx.principal,
-        }],
+        accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
         pending_path_op: None,
         legs: vec![],
+        entry_balances,
+        pending_fees: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut exec_state, reply_id)
@@ -312,8 +400,11 @@ pub fn create_swap_cosmos_msg(
     offer_asset_info: &amm::AssetInfo,
     amount: Uint128,
     env: &Env,
-) -> Result<Option<CosmosMsg<InjectiveMsgWrapper>>, ContractError> {
+) -> Result<Option<DispatchedSwap>, ContractError> {
     let recipient = env.contract.address.to_string();
+
+    // Set by the orderbook arm to the base quantity actually ordered.
+    let mut ob_order_qty: Option<FPDecimal> = None;
 
     let cosmos_msg = match operation {
         Operation::AmmSwap(amm_op) => {
@@ -404,7 +495,10 @@ pub fn create_swap_cosmos_msg(
                 ob_op.quantity,
                 ob_op.worst_price,
             )? {
-                Some(order_msg) => order_msg,
+                Some((order_msg, order_qty)) => {
+                    ob_order_qty = Some(order_qty);
+                    order_msg
+                }
                 None => return Err(ContractError::AmountTooSmall {}),
             }
         }
@@ -485,7 +579,10 @@ pub fn create_swap_cosmos_msg(
         }
     };
 
-    Ok(Some(cosmos_msg))
+    Ok(Some(DispatchedSwap {
+        msg: cosmos_msg,
+        ob_order_qty,
+    }))
 }
 
 /// Admin-only. Sets or updates the fee for a given pool address.

@@ -1,6 +1,7 @@
 use crate::msg::{amm, Operation, PlannedSwap, Stage};
 use cosmwasm_schema::cw_serde;
 use cosmwasm_std::{Addr, Decimal, StdError, Storage, Uint128};
+use injective_math::FPDecimal;
 use cw_storage_plus::{Item, Map};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,17 @@ pub struct ExecutionState {
     /// Executed venue trades, accumulated across the whole route for the terminal
     /// `aggregator_swap` event.
     pub legs: Vec<SwapLeg>,
+    /// Contract balance, per touched denom, snapshotted at route entry MINUS the
+    /// portion belonging to this route's own input (so it reflects only funds that
+    /// pre-dated the route). At `finalize_route` the positive delta `current -
+    /// baseline` of every touched denom (except the final output) is swept back —
+    /// guaranteeing no input / intermediate / refund lingers in the contract.
+    /// "Touched" = the offer denom plus every operation's input denom.
+    pub entry_balances: Vec<(amm::AssetInfo, Uint128)>,
+    /// Protocol revenue accrued mid-route that must be paid to the fee collector at
+    /// finalize (currently the orderbook buy-hop price-improvement surplus). Keyed by
+    /// denom; subtracted from a denom's swept residue so the rest returns to the user.
+    pub pending_fees: Vec<(amm::AssetInfo, Uint128)>,
 }
 
 #[cw_serde]
@@ -138,6 +150,11 @@ pub struct SubmsgReplyState {
     /// complete [`SwapLeg`] (offer side) without re-deriving it.
     pub in_denom: String,
     pub in_amount: Uint128,
+    /// Orderbook hops only: the base quantity the atomic order was placed with.
+    /// Needed at reply time to split the post-fill refund into protocol surplus
+    /// (price improvement on the filled quantity) vs. the user's unfilled remainder.
+    /// `None` for AMM/CLMM hops.
+    pub ob_order_qty: Option<FPDecimal>,
 }
 
 pub const ACTIVE_ROUTES: Map<u64, ExecutionState> = Map::new("execution_states");

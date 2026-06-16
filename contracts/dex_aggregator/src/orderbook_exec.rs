@@ -409,6 +409,10 @@ pub fn is_buy_for_target(market: &SpotMarket, target_denom: &str) -> bool {
 /// this hop; the order debits the contract's default subaccount, and the aggregator
 /// is its own fee recipient (self-relayer). Returns `Ok(None)` when the order
 /// quantity rounds to zero, so the caller can surface `AmountTooSmall`.
+///
+/// On success returns `(msg, order_qty)` where `order_qty` is the base quantity the
+/// order was placed with — the reply handler needs it to split the post-fill refund
+/// into protocol surplus vs. the user's unfilled remainder.
 pub fn build_swap_order_msg(
     deps: Deps<InjectiveQueryWrapper>,
     contract: &Addr,
@@ -417,7 +421,7 @@ pub fn build_swap_order_msg(
     input_amount: Uint128,
     quantity: Option<FPDecimal>,
     worst_price: Option<FPDecimal>,
-) -> StdResult<Option<CosmosMsg<InjectiveMsgWrapper>>> {
+) -> StdResult<Option<(CosmosMsg<InjectiveMsgWrapper>, FPDecimal)>> {
     // Paying quote => buying base; paying base => selling.
     let is_buy = offer_denom != market.base_denom;
 
@@ -458,7 +462,46 @@ pub fn build_swap_order_msg(
         None,
     );
 
-    Ok(Some(create_spot_market_order_msg(contract.clone(), order)))
+    Ok(Some((
+        create_spot_market_order_msg(contract.clone(), order),
+        order_qty,
+    )))
+}
+
+/// The decoded fill of an atomic spot market order, in chain units.
+pub struct OrderFill {
+    /// Base quantity filled.
+    pub quantity: FPDecimal,
+    /// Average fill price.
+    pub price: FPDecimal,
+    /// Trading fee taken (in quote).
+    pub fee: FPDecimal,
+}
+
+/// Decode the raw fill (base quantity, average price, trading fee) from an atomic
+/// spot market order reply. `None` => nothing filled (IOC no-fill / no results).
+pub fn decode_order_fill(response: &SubMsgResponse) -> StdResult<Option<OrderFill>> {
+    let first = match response.msg_responses.first() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let decoded = MsgCreateSpotMarketOrderResponse::decode(first.value.as_slice())
+        .map_err(|e| StdError::msg(format!("decode failed (type_url={}): {e}", first.type_url)))?;
+    let trade = match decoded.results {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    // protobuf serializes Dec values with an extra 10^18 factor; descale to chain units.
+    let scale = dec_scale_factor();
+    let price = FPDecimal::from_str(&trade.price).map_err(|_| StdError::msg("bad price"))? / scale;
+    let quantity =
+        FPDecimal::from_str(&trade.quantity).map_err(|_| StdError::msg("bad quantity"))? / scale;
+    let fee = FPDecimal::from_str(&trade.fee).map_err(|_| StdError::msg("bad fee"))? / scale;
+    Ok(Some(OrderFill {
+        quantity,
+        price,
+        fee,
+    }))
 }
 
 /// Decode the filled output (in `target_denom`, chain scale) from an atomic spot

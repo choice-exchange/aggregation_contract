@@ -6,8 +6,9 @@ use cosmwasm_std::{
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
 
 use crate::error::ContractError;
-use crate::execute::create_swap_cosmos_msg;
+use crate::execute::{create_swap_cosmos_msg, query_asset_balance};
 use crate::msg::{amm, cw20_adapter, Operation, PlannedSwap, Stage, StagePlan};
+use injective_math::FPDecimal;
 use crate::orderbook_exec;
 use crate::state::{
     apply_fee, Awaiting, Config, ExecutionState, PendingPathOp, SubmsgReplyState, SwapLeg,
@@ -128,13 +129,19 @@ fn handle_swap_reply(
     let split_index = submsg_state.split_index;
     let op_index = submsg_state.op_index;
 
-    let current_stage = exec_state
-        .plan
-        .stages
-        .get(exec_state.current_stage_index as usize)
-        .ok_or(ContractError::EmptyRoute {})?;
+    // Clone the replied split's path so the op references below don't hold an
+    // immutable borrow of `exec_state` (we mutate `exec_state.pending_fees` while
+    // capturing the orderbook surplus).
+    let path: Vec<Operation> = {
+        let current_stage = exec_state
+            .plan
+            .stages
+            .get(exec_state.current_stage_index as usize)
+            .ok_or(ContractError::EmptyRoute {})?;
+        current_stage.splits[split_index].path.clone()
+    };
 
-    let replied_op = &current_stage.splits[split_index].path[op_index];
+    let replied_op = &path[op_index];
 
     let result = match msg.result.into_result() {
         Ok(response) => response,
@@ -153,8 +160,44 @@ fn handle_swap_reply(
     let received_amount = match replied_op {
         Operation::OrderbookSwap(ob) => {
             let market = orderbook_exec::load_market(deps.as_ref(), &ob.market_id)?;
-            orderbook_exec::parse_order_output(&market, &ob.target_denom, &result)
+            let is_buy = orderbook_exec::is_buy_for_target(&market, &ob.target_denom);
+            match orderbook_exec::decode_order_fill(&result)
                 .map_err(|e| ContractError::OrderResponseDecode { err: e.to_string() })?
+            {
+                None => Uint128::zero(),
+                Some(fill) => {
+                    // Buy hops are sized at `worst_price` so margin == input; the
+                    // order fills at cheaper levels and the chain refunds the
+                    // difference. Capture that price-improvement surplus as protocol
+                    // revenue (it lingers in the offer denom; paid to the fee
+                    // collector at finalize). Any *unfilled* remainder is NOT a fee —
+                    // it's left in the contract for the user sweep in finalize_route.
+                    if is_buy {
+                        if let Some(order_qty) = submsg_state.ob_order_qty {
+                            let surplus = ob_buy_surplus(submsg_state.in_amount, order_qty, &fill);
+                            if !surplus.is_zero() {
+                                accumulate_fee(
+                                    exec_state,
+                                    &amm::AssetInfo::NativeToken {
+                                        denom: submsg_state.in_denom.clone(),
+                                    },
+                                    surplus,
+                                );
+                            }
+                        }
+                    }
+                    let out = if is_buy {
+                        fill.quantity
+                    } else {
+                        fill.quantity * fill.price - fill.fee
+                    };
+                    if out.is_negative() || out.is_zero() {
+                        Uint128::zero()
+                    } else {
+                        Uint128::from(out)
+                    }
+                }
+            }
         }
         _ => parse_amount_from_swap_reply(&result.events, &env)?,
     };
@@ -180,7 +223,7 @@ fn handle_swap_reply(
         fee_amount: Uint128::zero(),
     });
 
-    let replied_path = &current_stage.splits[split_index].path;
+    let replied_path = &path;
 
     if let Some(next_op) = replied_path.get(op_index + 1) {
         // This is a multi-hop path, proceed to the next operation.
@@ -213,14 +256,17 @@ fn handle_swap_reply(
         // Create the message for the next step. `None` => the next hop provably
         // yields nothing (e.g. a CLMM quote of zero), so this path ends here as a
         // zero-value path rather than reverting.
-        let next_msg = match create_swap_cosmos_msg(
+        let dispatched = match create_swap_cosmos_msg(
             &mut deps,
             next_op,
             &offer_asset_for_next_op.info,
             offer_asset_for_next_op.amount,
             &env,
         )? {
-            Some(msg) => msg,
+            Some(d) => d,
+            // `None` => the next hop yields nothing; the intermediate already in hand
+            // (this op's input denom is snapshotted) is returned to the user by the
+            // residue sweep in finalize_route.
             None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
         };
 
@@ -238,10 +284,11 @@ fn handle_swap_reply(
                 op_index: op_index + 1,
                 in_denom: asset_key(&offer_asset_for_next_op.info),
                 in_amount: offer_asset_for_next_op.amount,
+                ob_order_qty: dispatched.ob_order_qty,
             },
         )?;
 
-        let sub_msg = SubMsg::reply_on_success(next_msg, next_submsg_id);
+        let sub_msg = SubMsg::reply_on_success(dispatched.msg, next_submsg_id);
 
         ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;
 
@@ -347,13 +394,102 @@ fn create_send_msg(
 /// whole `total_amount` goes to the route's sender (gated by `minimum_receive`).
 /// For a flash-arb cycle it repays `principal + fee` to the flash pool by direct
 /// transfer and forwards the surplus to the initiator (gated by `min_profit`).
+/// Price-improvement surplus (in quote) on the *filled* portion of an orderbook
+/// BUY: the margin reserved for the filled quantity (at `worst_price`) minus what
+/// the fill actually consumed. Always `>= 0` and capped at the total refund, so it
+/// can never claim more than the chain returned, and the unfilled remainder is left
+/// out (it returns to the user via the residue sweep). Sells have no such surplus —
+/// their price improvement comes out as extra output, which already flows onward.
+fn ob_buy_surplus(reserved_in: Uint128, order_qty: FPDecimal, fill: &orderbook_exec::OrderFill) -> Uint128 {
+    if order_qty.is_zero() || fill.quantity.is_zero() {
+        return Uint128::zero();
+    }
+    let reserved = FPDecimal::from(reserved_in);
+    // What the fill actually consumed of the reserved quote.
+    let consumed = fill.quantity * fill.price + fill.fee;
+    let leftover = reserved - consumed; // total refund the chain returned
+    if leftover.is_negative() || leftover.is_zero() {
+        return Uint128::zero();
+    }
+    // Margin still reserved for the unfilled base => belongs to the user, not fees.
+    let filled = if fill.quantity > order_qty {
+        order_qty
+    } else {
+        fill.quantity
+    };
+    let unfilled_margin = reserved * ((order_qty - filled) / order_qty);
+    let surplus = leftover - unfilled_margin;
+    if surplus.is_negative() {
+        return Uint128::zero();
+    }
+    // Never claim more than the chain actually refunded.
+    let surplus = if surplus > leftover { leftover } else { surplus };
+    Uint128::from(surplus)
+}
+
+/// Accumulate protocol revenue owed in `info`, to be paid to the fee collector at
+/// finalize and netted out of that denom's residue sweep.
+fn accumulate_fee(exec_state: &mut ExecutionState, info: &amm::AssetInfo, amount: Uint128) {
+    if let Some(entry) = exec_state.pending_fees.iter_mut().find(|(i, _)| i == info) {
+        entry.1 += amount;
+    } else {
+        exec_state.pending_fees.push((info.clone(), amount));
+    }
+}
+
+/// Sweep every touched denom (except the final output) out of the contract so a
+/// successful route never leaves user funds behind: each denom's residue
+/// (`current - entry_baseline`) is split into the protocol surplus accrued in it
+/// (`pending_fees`, capped at the residue) -> fee collector, and the remainder
+/// (unfilled orderbook remainders, dropped intermediates, un-spent split inputs,
+/// no-fills) -> the route's sender. The final output denom is excluded; it is paid
+/// from the tracked `total_amount`.
+fn build_residue_sweep(
+    deps: &mut DepsMut<InjectiveQueryWrapper>,
+    env: &Env,
+    exec_state: &ExecutionState,
+    final_asset: &amm::AssetInfo,
+) -> Result<Vec<CosmosMsg<InjectiveMsgWrapper>>, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    let mut msgs: Vec<CosmosMsg<InjectiveMsgWrapper>> = Vec::new();
+    for (info, baseline) in &exec_state.entry_balances {
+        if info == final_asset {
+            continue;
+        }
+        let current = query_asset_balance(deps.as_ref(), &env.contract.address, info)?;
+        let residue = current.saturating_sub(*baseline);
+        if residue.is_zero() {
+            continue;
+        }
+        let fee = exec_state
+            .pending_fees
+            .iter()
+            .find(|(i, _)| i == info)
+            .map(|(_, a)| *a)
+            .unwrap_or_default()
+            .min(residue);
+        let to_user = residue - fee;
+        if !fee.is_zero() {
+            msgs.push(create_send_msg(deps, &config.fee_collector, info, fee)?);
+        }
+        if !to_user.is_zero() {
+            msgs.push(create_send_msg(deps, &exec_state.plan.sender, info, to_user)?);
+        }
+    }
+    Ok(msgs)
+}
+
 fn finalize_route(
     deps: &mut DepsMut<InjectiveQueryWrapper>,
+    env: &Env,
     reply_id: u64,
     exec_state: &ExecutionState,
     total_amount: Uint128,
     asset_info: &amm::AssetInfo,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    // Return everything the route touched but does not deliver as output.
+    let sweep_msgs = build_residue_sweep(deps, env, exec_state, asset_info)?;
+
     if let Some(flash) = &exec_state.plan.flash_repayment {
         let required = flash
             .repay_amount
@@ -388,6 +524,7 @@ fn finalize_route(
         }
         ACTIVE_ROUTES.remove(deps.storage, reply_id);
         Ok(response
+            .add_messages(sweep_msgs)
             .add_attribute("action", "flash_route_complete")
             .add_attribute("repaid", flash.repay_amount.to_string())
             .add_attribute("profit", surplus.to_string()))
@@ -409,6 +546,7 @@ fn finalize_route(
         }
         ACTIVE_ROUTES.remove(deps.storage, reply_id);
         Ok(response
+            .add_messages(sweep_msgs)
             .add_event(build_swap_event(exec_state, asset_info, total_amount))
             .add_attribute("action", "aggregate_swap_complete")
             .add_attribute("final_received", total_amount.to_string()))
@@ -520,7 +658,7 @@ fn handle_final_stage(
 
     if conversion_submsgs.is_empty() {
         // SCENARIO A: All assets were already the target type. We are done.
-        finalize_route(deps, reply_id, exec_state, ready_amount, &target_asset_info)
+        finalize_route(deps, &env, reply_id, exec_state, ready_amount, &target_asset_info)
     } else {
         // SCENARIO B: Conversions are needed. Set up the exec_state for the final reply.
         exec_state.awaiting = Awaiting::FinalConversions;
@@ -574,6 +712,7 @@ fn handle_final_conversion_reply(
 
     finalize_route(
         &mut deps,
+        &env,
         reply_id,
         exec_state,
         total_final_amount,
@@ -942,7 +1081,7 @@ fn plan_next_stage(
     })
 }
 
-fn get_operation_input(
+pub(crate) fn get_operation_input(
     deps: Deps<InjectiveQueryWrapper>,
     op: &Operation,
 ) -> Result<amm::AssetInfo, ContractError> {
@@ -980,14 +1119,17 @@ fn execute_planned_swaps(
         let offer_asset_info = swap.offer_info.clone();
         // `None` => this hop provably yields nothing; skip the split entirely
         // (don't burn a reply id or persist submsg state for a message we never send).
-        let msg = match create_swap_cosmos_msg(
+        let dispatched = match create_swap_cosmos_msg(
             deps,
             &swap.operation,
             &offer_asset_info,
             swap.amount,
             &env,
         )? {
-            Some(msg) => msg,
+            Some(d) => d,
+            // `None` => the hop provably yields nothing and is not dispatched. The
+            // allocated input stays in the contract (offer denom is snapshotted) and
+            // is returned to the user by the residue sweep in finalize_route.
             None => continue,
         };
 
@@ -1003,10 +1145,11 @@ fn execute_planned_swaps(
                 op_index: swap.op_index,
                 in_denom: asset_key(&offer_asset_info),
                 in_amount: swap.amount,
+                ob_order_qty: dispatched.ob_order_qty,
             },
         )?;
 
-        submessages.push(SubMsg::reply_on_success(msg, submsg_id));
+        submessages.push(SubMsg::reply_on_success(dispatched.msg, submsg_id));
     }
 
     REPLY_ID_COUNTER.save(deps.storage, &reply_id_counter)?;
@@ -1080,14 +1223,14 @@ fn handle_path_conversion_reply(
 
     let converted_asset_info = get_operation_input(deps.as_ref(), &pending_op_details.operation)?;
     // `None` => the resumed hop provably yields nothing; end the path gracefully.
-    let swap_msg = match create_swap_cosmos_msg(
+    let dispatched = match create_swap_cosmos_msg(
         &mut deps,
         &pending_op_details.operation,
         &converted_asset_info,
         converted_amount,
         &env,
     )? {
-        Some(msg) => msg,
+        Some(d) => d,
         None => return complete_zero_value_path(&mut deps, env, exec_state, master_reply_id),
     };
 
@@ -1105,10 +1248,11 @@ fn handle_path_conversion_reply(
             op_index,
             in_denom: asset_key(&converted_asset_info),
             in_amount: converted_amount,
+            ob_order_qty: dispatched.ob_order_qty,
         },
     )?;
 
-    let sub_msg = SubMsg::reply_on_success(swap_msg, submsg_id);
+    let sub_msg = SubMsg::reply_on_success(dispatched.msg, submsg_id);
 
     exec_state.awaiting = Awaiting::Swaps;
     ACTIVE_ROUTES.save(deps.storage, master_reply_id, exec_state)?;

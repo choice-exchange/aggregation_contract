@@ -1,6 +1,6 @@
 use crate::cw20::Cw20ReceiveMsg;
 use cosmwasm_std::{
-    entry_point, Binary, Deps, DepsMut, Env, Event, MessageInfo, Reply, Response, StdError,
+    entry_point, Binary, Deps, DepsMut, Env, MessageInfo, Reply, Response, StdError,
     StdResult, Uint128,
 };
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
@@ -76,39 +76,41 @@ pub fn execute(
             amount,
             msg,
         }) => {
-            if let Ok(hook_msg) = cosmwasm_std::from_json::<Cw20HookMsg>(&msg) {
-                // This is a user-initiated swap starting with a CW20 token.
-                match hook_msg {
-                    Cw20HookMsg::ExecuteRoute {
+            // A CW20 only reaches this entry point via `Cw20::Send`, which always
+            // carries a hook `msg`; the sole legitimate hook is `ExecuteRoute`. Any
+            // other / malformed payload (e.g. a route built for a different
+            // aggregator version — a `clmm_swap` op against a CLMM-less build, or the
+            // pre-merge `orderbook_swap` shape against the merged build) MUST revert
+            // so the cw20 `send` transfer rolls back and the sender keeps their
+            // tokens. Returning `Ok` here previously emitted a fake
+            // "internal_conversion_complete" success and silently stranded the funds
+            // in the contract (SHROOM incident, tx 3CA5FC2B...).
+            let hook_msg: Cw20HookMsg = cosmwasm_std::from_json(&msg)
+                .map_err(|e| ContractError::InvalidCw20Hook {
+                    reason: e.to_string(),
+                })?;
+            match hook_msg {
+                Cw20HookMsg::ExecuteRoute {
+                    stages,
+                    minimum_receive,
+                } => {
+                    // This is a user-initiated swap starting with a CW20 token.
+                    let offer_asset = amm::Asset {
+                        info: amm::AssetInfo::Token {
+                            contract_addr: info.sender.to_string(),
+                        },
+                        amount,
+                    };
+                    let initiator = deps.api.addr_validate(&sender)?;
+                    execute::execute_aggregate_swaps_internal(
+                        deps,
+                        env,
                         stages,
                         minimum_receive,
-                    } => {
-                        let offer_asset = amm::Asset {
-                            info: amm::AssetInfo::Token {
-                                contract_addr: info.sender.to_string(),
-                            },
-                            amount,
-                        };
-                        let initiator = deps.api.addr_validate(&sender)?;
-                        execute::execute_aggregate_swaps_internal(
-                            deps,
-                            env,
-                            stages,
-                            minimum_receive,
-                            offer_asset,
-                            initiator,
-                        )
-                    }
-                }
-            } else {
-                Ok(Response::new()
-                    .add_event(
-                        Event::new("wasm")
-                            .add_attribute("action", "internal_conversion_complete")
-                            .add_attribute("recipient", env.contract.address.to_string())
-                            .add_attribute("amount", amount.to_string()),
+                        offer_asset,
+                        initiator,
                     )
-                    .add_attribute("info", "cw20_received_for_normalization"))
+                }
             }
         }
         ExecuteMsg::UpdateAdmin { new_admin } => {

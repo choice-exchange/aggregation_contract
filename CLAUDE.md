@@ -2,7 +2,13 @@
 
 ## Project Overview
 
-CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swaps through multiple AMM pools, orderbook contracts, and CLMM (Concentrated Liquidity) pools in parallel, multi-hop paths with automatic CW20/native token conversion. Also supports **FlashRoute** — capital-free CLMM flash-arb (borrow from a CLMM pool's `Flash {}`, run a cycle through other venues, repay principal+fee, keep the surplus; see `docs/flash_route_plan.md`). Cargo workspace with three members: `dex_aggregator` (main contract), `mock_swap` (test helper), and `mock_clmm_flash` (test flash-pool helper). Deployed on Injective mainnet (Code ID 1892, address `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26`).
+CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swaps through multiple AMM pools, orderbook contracts, and CLMM (Concentrated Liquidity) pools in parallel, multi-hop paths with automatic CW20/native token conversion. Also supports **FlashRoute** — capital-free CLMM flash-arb (borrow from a CLMM pool's `Flash {}`, run a cycle through other venues, repay principal+fee, keep the surplus; see `docs/flash_route_plan.md`). Cargo workspace with three members: `dex_aggregator` (main contract), `mock_swap` (test helper), and `mock_clmm_flash` (test flash-pool helper).
+
+Mainnet deployments:
+
+- **v2 (merged orderbook) — current/live:** `inj1520rsss9aykhkfmuf89nh5hp2jww770z4u3eu0` (Code ID 2042). Native orderbook execution; wasm-admin is the Choice Admin Timelock `inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
+- **v1 (pre-merge) — legacy:** `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26` (Code ID 1892, AMM/orderbook only, no CLMM). wasm-admin = `inj1yrg4pg8…`.
+- **v2.0.1 (fund-safety hardening) — built, pending migration of BOTH instances** (see Fund-safety invariant below).
 
 ## Build, Test, and Deploy Commands
 
@@ -55,13 +61,13 @@ cd contracts/dex_aggregator && cargo run --example schema
 
 ### Execution Flow
 
-1. User calls `ExecuteRoute` (native funds) or sends CW20 via `Receive` hook
-2. `execute_aggregate_swaps_internal` validates input, creates `ExecutionState`, calls `proceed_to_next_step`
+1. User calls `ExecuteRoute` (native funds) or sends CW20 via `Receive` hook. `minimum_receive` is **mandatory and must be > 0** (`ZeroMinimumReceive`); a CW20 `Receive` whose hook fails to deserialize **reverts** (`InvalidCw20Hook`) — it never keeps the tokens.
+2. `execute_aggregate_swaps_internal` validates input, **snapshots the contract's pre-route balance of every touched denom** (offer + every op input) into `ExecutionState.entry_balances`, creates `ExecutionState`, calls `proceed_to_next_step`
 3. Each stage: calculates per-split amounts, dispatches CW20/native conversions if needed (`Awaiting::Conversions`)
 4. Executes parallel swap submessages, each tracked by unique reply IDs in `SUBMSG_REPLY_STATES`
-5. `handle_swap_reply` processes each reply; for multi-hop paths, chains to next operation
+5. `handle_swap_reply` processes each reply; for multi-hop paths, chains to next operation. Orderbook BUY hops capture their price-improvement surplus (sized at `worst_price`, filled cheaper) into `ExecutionState.pending_fees`
 6. Mid-path conversions handled via `Awaiting::PathConversion`
-7. After final stage: normalizes output assets (`Awaiting::FinalConversions`), checks `minimum_receive`, sends to user
+7. After final stage: normalizes output assets (`Awaiting::FinalConversions`), checks `minimum_receive`, sends the tracked output to the user, then **`build_residue_sweep` drains every touched denom** (current − entry baseline): the `pending_fees` portion → fee collector, the remainder (unfilled orderbook remainders, dropped intermediates, un-spent split inputs, no-fills) → the user. **Invariant: a successful route leaves nothing in the contract.**
 
 ### Supporting Contracts
 
@@ -112,5 +118,6 @@ cd contracts/dex_aggregator && cargo run --example schema
 - CLMM swaps support both native and CW20 tokens; no rounding needed. Pre-execution `Quote` query computes `minimum_amount_out` with 0.5% slippage
 - `FPDecimal` (from `injective-math`) for orderbook quantities; `Uint128`/`Decimal` (from `cosmwasm-std`) for everything else (including CLMM)
 - Fees deducted at path completion (end of a split's operation chain), not per-operation
+- **Fund-safety invariant (v2.0.1):** the engine tracks amounts *virtually*, so any value the chain hands back (orderbook refunds) or that a dropped/skipped/no-fill leg leaves behind would otherwise linger. `finalize_route` closes this with a balance-delta sweep over `entry_balances`: **orderbook buy price-improvement surplus → fee collector** (the only "orderbook fee", recorded in `pending_fees`); **all other residue → the user** (unfilled remainders, dropped intermediates, un-spent split inputs, no-fills). The final-output denom is excluded (paid from the tracked amount). Net result: a successful route holds nothing afterward. `minimum_receive == 0` is rejected so a route that produces nothing can never "succeed" returning nothing. Regression tests: `test_orderbook_surplus_to_fee_collector_and_contract_drains`, `test_amm_route_leaves_no_residue`, `test_zero_minimum_receive_is_rejected` in `tests/integration.rs`.
 - **FlashRoute** (`docs/flash_route_plan.md`): a flash-arb cycle must repay in the *borrowed* asset, so it ends in `flash_asset` (gated by `min_profit`), not an A→B user swap. The whole cycle runs depth-first inside the pool's `FlashCallback`, so repayment settles before the pool's repay check — the pool reverts the tx if unrepaid. Repay uses the same Bank `Send` / CW20 `Transfer` (never CW20 `Send`) the pool requires. `FlashCallback` is gated on `PENDING_FLASH` + `info.sender == flash_pool`; the cycle may not route through `flash_pool` (reentrancy lock).
 - CI (`.github/workflows/test.yml`) runs `cargo build --verbose && cargo test --verbose` on push/PR to main

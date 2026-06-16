@@ -2469,7 +2469,9 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
-        minimum_receive: None, // We don't care about the output amount, only that it doesn't fail.
+        // A positive floor is mandatory. The 1-wei route produces 0 output, so it
+        // must fail *gracefully* (MinimumReceiveNotMet) — not panic — and roll back.
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     let initial_usdt_balance = bank
@@ -2485,14 +2487,12 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
     // Execute the transaction with 1 wei of INJ.
     let res = wasm.execute(&env.aggregator_addr, &msg, &[Coin::new(1u128, "inj")], user);
     assert!(
-        res.is_ok(),
-        "Execution with a zero-amount split failed: {:?}",
-        res.unwrap_err()
+        res.is_err(),
+        "A route that produces zero output must fail gracefully, not succeed"
     );
 
     // --- ASSERT FINAL BALANCE ---
-    // Due to the mock pool's decimal conversion (18 for INJ, 6 for USDT), swapping
-    // just 1 wei of INJ will result in 0 USDT. Therefore, the user's balance should not change.
+    // The route produced 0 USDT and reverted, so the user's balance is unchanged.
     let final_usdt_balance_response = bank
         .query_balance(&QueryBalanceRequest {
             address: user.address(),
@@ -2651,7 +2651,8 @@ fn test_intermediate_swap_failure_reverts_transaction() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
-        minimum_receive: None, // Not relevant, as the transaction should fail.
+        // Positive floor required; the tx fails later at the invalid intermediate hop.
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     // Execute the transaction
@@ -3001,7 +3002,7 @@ fn test_full_admin_fee_lifecycle() {
                 })],
             }],
         }],
-        minimum_receive: None,
+        minimum_receive: Some(Uint128::new(1)),
     };
     wasm.execute(
         &env.aggregator_addr,
@@ -3261,7 +3262,7 @@ fn test_fee_truncates_to_zero() {
                 })],
             }],
         }],
-        minimum_receive: None,
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     // Execute the transaction
@@ -4735,4 +4736,178 @@ fn test_flash_unrestricted_bypasses_signer_gate() {
     assert!(wasm
         .execute(&env.aggregator_addr, &msg, &[], &outsider)
         .is_ok());
+}
+
+// ===========================================================================
+// Fund-safety invariant tests (v2.0.1 hardening)
+//
+// Core guarantee: a SUCCESSFUL route never leaves user funds stranded in the
+// contract. Orderbook buy-hop price-improvement surplus -> fee collector;
+// every other residue (unfilled, dropped, un-spent, refunded) -> the user;
+// and `minimum_receive` must be > 0.
+// ===========================================================================
+
+#[test]
+fn test_zero_minimum_receive_is_rejected() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let route = vec![Stage {
+        splits: vec![Split {
+            percent: 100,
+            path: vec![Operation::AmmSwap(AmmSwapOp {
+                pool_address: env.mock_amm_1_addr.clone(),
+                offer_asset_info: amm::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            })],
+        }],
+    }];
+
+    // None (defaults to zero) is rejected.
+    let res_none = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: route.clone(),
+            minimum_receive: None,
+        },
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(res_none.is_err(), "minimum_receive=None must be rejected");
+    assert!(
+        res_none.unwrap_err().to_string().contains("minimum_receive"),
+        "error should name minimum_receive"
+    );
+
+    // Explicit zero is rejected too.
+    let res_zero = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: route,
+            minimum_receive: Some(Uint128::zero()),
+        },
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(res_zero.is_err(), "minimum_receive=0 must be rejected");
+}
+
+#[test]
+fn test_orderbook_surplus_to_fee_collector_and_contract_drains() {
+    // A multi-level orderbook BUY (sized at the worst consumed price) leaves a
+    // price-improvement refund in the contract. The hardening routes that surplus
+    // to the fee collector and sweeps the contract to zero — the user still gets
+    // the full INJ output, and NO funds linger in the aggregator.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let bal = |addr: &str, denom: &str| -> u128 {
+        bank.query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: denom.to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount.parse::<u128>().unwrap())
+        .unwrap_or(0)
+    };
+
+    let collector_usdt_before = bal(&env.fee_collector.address(), "usdt");
+    let user_inj_before = bal(&env.user.address(), "inj");
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(14_000_000_000u128, "usdt")], // crosses ask levels 10 & 11
+        &env.user,
+    );
+    assert!(res.is_ok(), "orderbook buy should succeed: {:?}", res.unwrap_err());
+
+    // 1. Contract is drained — no USDT (input/surplus) and no INJ (output) left.
+    assert_eq!(
+        bal(&env.aggregator_addr, "usdt"),
+        0,
+        "aggregator must retain no USDT after a successful route"
+    );
+    assert_eq!(
+        bal(&env.aggregator_addr, "inj"),
+        0,
+        "aggregator must retain no INJ after a successful route"
+    );
+
+    // 2. The price-improvement surplus was captured as protocol revenue.
+    let collector_gain = bal(&env.fee_collector.address(), "usdt") - collector_usdt_before;
+    assert!(
+        collector_gain > 0,
+        "fee collector should receive the orderbook price-improvement surplus"
+    );
+
+    // 3. The user actually received INJ output.
+    assert!(
+        bal(&env.user.address(), "inj") > user_inj_before,
+        "user should receive INJ output"
+    );
+}
+
+#[test]
+fn test_amm_route_leaves_no_residue() {
+    // A plain AMM swap must drain the contract completely: no offer (INJ) and no
+    // output (USDT) lingering after finalize.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let bal = |addr: &str, denom: &str| -> u128 {
+        bank.query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: denom.to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount.parse::<u128>().unwrap())
+        .unwrap_or(0)
+    };
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    pool_address: env.mock_amm_1_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")], // 1 INJ
+        &env.user,
+    );
+    assert!(res.is_ok(), "amm swap should succeed: {:?}", res.unwrap_err());
+
+    assert_eq!(bal(&env.aggregator_addr, "inj"), 0, "no INJ should linger");
+    assert_eq!(bal(&env.aggregator_addr, "usdt"), 0, "no USDT should linger");
 }

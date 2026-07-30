@@ -26,6 +26,13 @@ pub enum ContractError {
     #[error("Percentages in a stage must sum to 100")]
     InvalidPercentageSum {},
 
+    #[error("A stage received two different {kind} assets ({first} and {second}); the stage allocator treats each side as one fungible pile")]
+    MixedAssetsInStage {
+        kind: String,
+        first: String,
+        second: String,
+    },
+
     #[error("Invalid funds for native token swap. Expected 1 coin, sent {sent}")]
     InvalidFunds { sent: usize },
 
@@ -76,7 +83,27 @@ pub enum ContractError {
     #[error("Failed to parse swap reply: wasm event did not contain an 'ask_asset' attribute")]
     NoAskAssetInReply {},
 
+    #[error(
+        "Route would spend more {asset} than it brought in (wanted {wanted}, route balance {available}) — a hop reported an output it did not deliver"
+    )]
+    OutputNotBacked {
+        asset: String,
+        wanted: Uint128,
+        available: Uint128,
+    },
+
+    #[error(
+        "Asset {asset} was never snapshotted at route entry, so the engine cannot bound what this route may spend of it"
+    )]
+    UnsnapshottedAsset { asset: String },
+
+    #[error("Could not determine the output asset of the hop on {venue}: {reason}")]
+    UnresolvableAskAsset { venue: String, reason: String },
+
     // --- Orderbook (native spot-order) Errors ---
+    /// Retained for wire/API compatibility. No longer returned: a hop that cannot
+    /// place an order (sub-tick, sub-`min_notional`) is now a graceful zero-value
+    /// path, matching the CLMM zero-quote path and `SimulateRoute`'s no-fill quote.
     #[error("Orderbook order quantity rounds to zero (input below one tick)")]
     AmountTooSmall {},
 

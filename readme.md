@@ -1,10 +1,29 @@
 # Choice Aggregation Contract
 
-## Mainnet Deployment
+## Mainnet Deployments
 
-Code Id: 1892
+The same bytecode runs under two instantiations with **different threat models** — the
+frontend instance is permissionless and its route fields are attacker-controlled, while the
+arb instance is effectively single-caller and cares about `SimulateRoute` matching execution.
+Evaluate any change against both.
 
-Address: `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26`
+| Instance | Address | Code Id |
+|---|---|---|
+| Choice frontend | `inj1520rsss9aykhkfmuf89nh5hp2jww770z4u3eu0` | 2060 (v2.0.1) |
+| Arb bot | `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx` | 2060 (v2.0.1) |
+| v1 (legacy, pre-merge) | `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26` | 1892 |
+
+`ExecuteRoute` is permissionless on **both** instances; only `FlashRoute` is gated (by
+`FLASH_SIGNERS`, currently empty on both, so flash is off).
+
+wasm-admin on both current instances is the Choice Admin Timelock
+`inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay). Note that this gates **migration
+only** — `config.admin` is a separate, non-timelocked key and owns `EmergencyWithdraw`,
+`UpdateCw20Adapter`, `UpdateFeeCollector`, `UpdateAdmin` and the flash-signer setters.
+
+**v2.2.0 is built but not uploaded or migrated** — see
+[docs/v2_2_0_changes.md](docs/v2_2_0_changes.md). It supersedes the never-shipped v2.1.0
+([docs/v2_1_0_changes.md](docs/v2_1_0_changes.md)).
 
 ## Getting Started
 
@@ -148,10 +167,19 @@ When the contract receives an `ExecuteRoute` message, it performs the following 
     *   If there is another stage, it uses the now-normalized assets as input and repeats step 3.
     *   If it was the final stage, it proceeds to the final payout.
 
-6.  **Final Payout and Safety Check:** After the final stage (and any final normalizations) are complete, the contract performs its most critical safety check.
-    *   It verifies that the total amount of the final asset it holds is greater than or equal to the user's specified `minimum_receive`.
-    *   If the check passes, it sends the full balance of the final asset to the user.
-    *   If the check fails, the entire transaction is reverted, and the user gets their initial funds back.
+6.  **Final Payout and Safety Checks:** After the final stage (and any final normalizations) are complete:
+    *   The tracked output is bounded by what the route actually brought in — the contract's
+        current balance of the final asset less the baseline it snapshotted before the route
+        started. A venue that reports an output it did not deliver cannot be paid out of anything
+        else the contract happens to hold.
+    *   It verifies the result is greater than or equal to the user's specified `minimum_receive`.
+    *   If the checks pass, it sends the output to the user, then sweeps every other denom the
+        route touched — unfilled orderbook remainders, dropped intermediates, un-spent split
+        inputs — back to them, minus any accrued protocol fee.
+    *   If a check fails, the entire transaction is reverted and the user keeps their funds.
+
+    **`minimum_receive` is mandatory and must be > 0.** A zero floor would let a route that
+    produced nothing complete "successfully" while returning nothing.
 
 ### Message Structure
 
@@ -193,12 +221,20 @@ pub enum Operation {
 }
 
 // These structs define the specific details for each operation type.
-// AMM/CLMM ops carry only the `offer` side: the output (ask) asset is derived
-// from the pool's swap event (`ask_asset` attribute) during execution and from
-// the pool's `Pair {}` / `GetConfig {}` query during `SimulateRoute`.
+//
+// `ask_asset_info` — the asset the hop produces — is OPTIONAL but worth supplying:
+// omitted, the contract derives it from the pool's `Pair {}` / `GetConfig {}`, one
+// extra query per hop. It is resolved before the hop runs (never read back from the
+// swap event) because the engine snapshots that denom's balance to bound what the
+// route may later spend and pay out.
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: Option<amm::AssetInfo>,
+    /// Passed to the pair's `Swap`. `None` => 49% (effectively unbounded), clamped
+    /// to 49%. Never sent to the pair as `None`: Astroport substitutes its own 0.5%
+    /// and asserts on it, invisibly to `SimulateRoute`.
+    pub max_spread: Option<Decimal>,
 }
 
 // Orderbook hops are placed natively by the aggregator itself (it submits an
@@ -212,19 +248,33 @@ pub struct OrderbookSwapOp {
     /// The native denom this hop must produce (market base for a buy, quote for a sell).
     pub target_denom: String,
     /// Direct mode (arb bot): fixed base quantity. `None` => estimate from the book.
+    /// Floored to `min_quantity_tick_size` and bounded by what the hop actually
+    /// holds, so an off-grid or unaffordable value fills smaller instead of
+    /// reverting the whole route.
     pub quantity: Option<FPDecimal>,
-    /// Direct mode (arb bot): worst acceptable price bound. `None` => estimate from the book.
+    /// Direct mode (arb bot): worst acceptable price bound. `None` => estimate from
+    /// the book. Snapped to `min_price_tick_size` in the safe direction (down for a
+    /// buy, up for a sell), so the fill is never worse than asked for.
     pub worst_price: Option<FPDecimal>,
 }
 
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
+    pub ask_asset_info: Option<amm::AssetInfo>,
     /// Direct mode (arb bot): the `SwapExactInput` floor, passed straight through.
-    /// `None` => estimate it from the pool (`Quote` + 0.5% slippage).
+    /// `None` => estimate it from the pool (`Quote` less `slippage_bps`).
     pub minimum_amount_out: Option<Uint128>,
+    /// Estimation-mode slippage tolerance in bps. `None` => 50 (0.5%), clamped to
+    /// 10000. Ignored in direct mode.
+    pub slippage_bps: Option<u16>,
 }
 ```
+
+A hop that cannot trade — an orderbook order below one quantity tick or below the market's
+`min_notional`, or a CLMM quote of zero — is a **graceful zero-value path**: that split
+contributes nothing, its allocation is returned, and the rest of the route proceeds. It does not
+revert the route, and `SimulateRoute` quotes it the same way.
 
 ### Example Usage
 
@@ -244,7 +294,8 @@ Here is an example of a complex route that showcases the multi-hop `Path` functi
               {
                 "amm_swap": {
                   "pool_address": "inj1...",
-                  "offer_asset_info": { "native_token": { "denom": "inj" } }
+                  "offer_asset_info": { "native_token": { "denom": "inj" } },
+                  "ask_asset_info": { "native_token": { "denom": "peggy0x...usdt" } }
                 }
               }
             ]
@@ -292,8 +343,8 @@ test plan live in [`docs/flash_route_plan.md`](docs/flash_route_plan.md).
 
 1. The caller sends `FlashRoute`. The aggregator validates the cycle (rejecting any
    hop that routes through `flash_pool` — the pool's reentrancy lock would revert the
-   tx), maps `flash_asset` onto the pool's `token0`/`token1`, and fires the pool's
-   `Flash {}`.
+   tx; checked for every venue carrying a contract address, not just CLMM), maps
+   `flash_asset` onto the pool's `token0`/`token1`, and fires the pool's `Flash {}`.
 2. The pool lends the tokens to the aggregator and calls it back with `FlashCallback`.
    The whole cycle then runs **depth-first inside that callback**.
 3. At the end of the cycle the aggregator repays `principal + fee` to the pool by
@@ -303,7 +354,13 @@ test plan live in [`docs/flash_route_plan.md`](docs/flash_route_plan.md).
 
 Safety: `FlashCallback` is gated on an in-flight `FlashRoute` (`PENDING_FLASH`) and on
 `info.sender == flash_pool`, so a forged callback can't spend idle contract balances;
-the pool's own repayment check is a final backstop (it reverts the tx if unrepaid).
+the pool's own repayment check is a final backstop (it reverts the tx if unrepaid). As with
+`ExecuteRoute`, every amount the cycle moves is bounded by what the loan actually delivered.
+
+On a flash cycle the orderbook buy-hop price-improvement surplus is **not** carved off — it is
+credited into the amount `min_profit` measures and paid to the caller. A flash caller is an
+allowlisted signer running their own cycle, so that surplus is their arb profit. The per-pool
+`FEE_MAP` carve still applies.
 
 ### Message structure
 

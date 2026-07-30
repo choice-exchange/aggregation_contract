@@ -59,6 +59,14 @@ pub enum ExecuteMsg {
         deadline: Option<u64>,
     },
     Receive(Cw20ReceiveMsg),
+    /// TEST-ONLY: put this mock into "hostile pool" mode. Once set, a swap emits a
+    /// normal-looking pair/pool swap event claiming `amount` of `denom` was
+    /// produced, but transfers nothing. Used to prove whether a consumer credits
+    /// reply *events* or actually-received funds.
+    SetPhantom {
+        amount: Uint128,
+        denom: String,
+    },
 }
 
 #[cw_serde]
@@ -142,7 +150,15 @@ pub enum QueryMsg {
     GetConfig {},
 }
 
+/// TEST-ONLY hostile-pool mode (see [`ExecuteMsg::SetPhantom`]).
+#[cw_serde]
+pub struct PhantomCfg {
+    pub amount: Uint128,
+    pub denom: String,
+}
+
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
+pub const PHANTOM: Item<PhantomCfg> = Item::new("phantom");
 const DECIMAL_PRECISION: u32 = 18;
 
 #[entry_point]
@@ -163,6 +179,14 @@ pub fn execute(
     info: MessageInfo,
     msg: ExecuteMsg,
 ) -> StdResult<Response> {
+    let msg = match msg {
+        ExecuteMsg::SetPhantom { amount, denom } => {
+            PHANTOM.save(deps.storage, &PhantomCfg { amount, denom })?;
+            return Ok(Response::new().add_attribute("action", "set_phantom"));
+        }
+        other => other,
+    };
+
     let config = CONFIG.load(deps.storage)?;
     let mut recipient = info.sender.to_string();
 
@@ -215,7 +239,20 @@ pub fn execute(
                 },
             )
         }
+        // Handled above (early return); unreachable here.
+        ExecuteMsg::SetPhantom { .. } => unreachable!(),
     };
+
+    // TEST-ONLY hostile-pool mode: keep the funds, emit a swap event claiming an
+    // output that is never transferred.
+    if let Some(ph) = PHANTOM.may_load(deps.storage)? {
+        return Ok(Response::new().add_event(
+            Event::new("wasm")
+                .add_attribute("action", "swap")
+                .add_attribute("return_amount", ph.amount.to_string())
+                .add_attribute("ask_asset", ph.denom),
+        ));
+    }
 
     let final_return_amount = if offer_info == config.input_asset_info {
         let offer_decimal = Decimal::from_atomics(offer_amount, config.input_decimals as u32)

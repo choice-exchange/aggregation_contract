@@ -6,9 +6,37 @@ CosmWasm DEX aggregator smart contract for the Injective blockchain. Routes swap
 
 Mainnet deployments:
 
-- **v2 (merged orderbook) — current/live:** `inj1520rsss9aykhkfmuf89nh5hp2jww770z4u3eu0` (Code ID 2042). Native orderbook execution; wasm-admin is the Choice Admin Timelock `inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
-- **v1 (pre-merge) — legacy:** `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26` (Code ID 1892, AMM/orderbook only, no CLMM). wasm-admin = `inj1yrg4pg8…`.
-- **v2.0.1 (fund-safety hardening) — built, pending migration of BOTH instances** (see Fund-safety invariant below).
+The same bytecode runs under **two instantiations with different threat models** — audit and
+test every change against both:
+
+- **Choice frontend — `inj1520rsss9aykhkfmuf89nh5hp2jww770z4u3eu0`.** Permissionless; many
+  unrelated users. Routes are suggested by the Choice router but *submitted by the user*, so
+  every field of `stages` is attacker-controlled (and `pool_address` has **no allowlist**).
+- **Arb bot — `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx`.** Effectively single-caller;
+  `FlashRoute` additionally gated by `FLASH_SIGNERS`. Latency- and gas-sensitive; the concern
+  is economic correctness — does `SimulateRoute` agree with what execution does.
+
+Both currently run **Code ID 2060 (v2.0.1)**; the v2.0.1 migration is DONE. wasm-admin on both
+is the Choice Admin Timelock `inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
+
+- **v2.2.0 — built, NOT uploaded, NOT migrated.** Audit fixes: routes bounded to their own
+  funds, fee ordering, direct-mode tick snapping, gate parity. See
+  [docs/v2_2_0_changes.md](docs/v2_2_0_changes.md) — read it before touching
+  `snapshot_entry_balances`, `finalize_route`, or `build_swap_order_msg`. Supersedes the
+  unshipped v2.1.0 ([docs/v2_1_0_changes.md](docs/v2_1_0_changes.md), still accurate as
+  background).
+- **v1 (pre-merge) — legacy:** `inj1a4qvqym6ajewepa7v8y2rtxuz9f92kyq2zsg26` (Code ID 1892,
+  AMM/orderbook only, no CLMM). wasm-admin = `inj1yrg4pg8…`.
+
+Live state worth knowing (verified on chain 2026-07-30): `FEE_MAP` is **empty** on both
+instances (`all_fees` → `[]`), and flash is **switched off** — `flash_signers` is empty and
+`unrestricted` is false on both, so `FlashRoute` is deny-all for everyone including the admin.
+
+⚠️ **The timelock is only the *wasm* admin.** `config.admin` on the Choice instance is the hot
+EOA `inj1yrg4pg8hcu0sw5rjlrcqfmw2ewf2uztlmdysak` (key `choicedev`), so `EmergencyWithdraw`,
+`UpdateCw20Adapter`, `UpdateFeeCollector`, `UpdateAdmin` and the flash-signer setters are one
+key away from a 48h-delay-free change — and `UpdateCw20Adapter` repoints every conversion, so
+it reaches users' in-flight funds. Migration is the only action the timelock actually gates.
 
 ## Build, Test, and Deploy Commands
 
@@ -18,8 +46,12 @@ cargo build
 
 # Production WASM build (uses cosmwasm/workspace-optimizer:0.17.0 Docker image)
 # Outputs dex_aggregator.wasm, mock_swap.wasm, mock_clmm_flash.wasm to ./artifacts/
-# (runs --locked; if you added a member/dep, refresh Cargo.lock with a local
-#  `cargo build` first, or the optimizer aborts on a stale lock)
+# (runs --locked; refresh Cargo.lock with a local `cargo build` FIRST or the
+#  optimizer aborts on a stale lock. Triggered by adding a member/dep AND by
+#  bumping a crate version — the lock records the version too. Failure looks like
+#  "the lock file needs to be updated but --locked was passed" + a panic at
+#  pkg_build.rs, exit 101. ⚠️ It leaves the PREVIOUS artifacts in place, so a
+#  following `cargo test` passes against stale wasm — always check the exit code.)
 ./build_release.sh
 
 # Run tests (MUST run ./build_release.sh first — see note below)
@@ -102,7 +134,8 @@ cd contracts/dex_aggregator && cargo run --example schema
 - `SubmsgReplyState` maps `submsg_id` → `master_reply_id`, `split_index`, `op_index`
 - `ExecutionState` stored in `ACTIVE_ROUTES` keyed by `master_reply_id`
 - All submessages use `SubMsg::reply_on_success`
-- Reply amounts parsed from wasm event attributes: `return_amount` (AMM), `swap_final_amount` (orderbook), `amount_out` (CLMM), `post_tax_amount` (tax tokens)
+- Reply *amounts* come from wasm event attributes: `return_amount` (AMM), `amount_out` (CLMM), `post_tax_amount` (tax tokens); orderbook hops decode the typed spot-order response instead
+- Reply *assets* are **not** read from the reply. A hop's output `AssetInfo` is resolved before it runs — from the op's `ask_asset_info`, else the pool's `Pair {}`/`GetConfig {}`. Trusting the venue's `ask_asset` let an arbitrary pool name any asset it liked (v2.2.0 §1)
 
 ## Testing
 
@@ -114,10 +147,19 @@ cd contracts/dex_aggregator && cargo run --example schema
 ## Important Notes
 
 - `reply.rs` is the most complex module — state machine changes require careful review of all `Awaiting` state transitions
-- Orderbook swaps only support native token inputs/outputs; amounts rounded to `min_quantity_tick_size`
-- CLMM swaps support both native and CW20 tokens; no rounding needed. Pre-execution `Quote` query computes `minimum_amount_out` with 0.5% slippage
+- **The gate must see what reverts (v2.1.0).** `SimulateRoute` is the arb bot's pre-broadcast gate. Anything that changes what the executor actually submits MUST be visible to the query path, or the gate clears routes that are guaranteed to fail. The two paths deliberately share `estimate_single_swap_execution`, `sell_base_quantity`, `meets_min_notional` and `apply_fee` — adding an execution-side adjustment outside that shared code re-opens the hole. Four separate bugs were this one mistake.
+- Orderbook swaps only support native token inputs/outputs. **Both** the estimator and the order builder floor quantity via `sell_base_quantity`, and both check `meets_min_notional`. **Direct mode skips the estimators entirely**, so `direct_order_params` is the only place that snaps its quantity/price to the market ticks and bounds it by what the hop holds — and `SimulateRoute` sizes through the same helper. A hop that cannot place an order is a graceful zero-value path, never a route-wide revert.
+- **Never read a hop's output asset from its reply.** It is resolved before the hop runs — `ask_asset_info` if supplied, else the pool's `Pair {}`/`GetConfig {}`. The venue is not an authority on what it produced; `pool_address` has no allowlist.
+- CLMM swaps support both native and CW20 tokens; no rounding needed. In estimation mode a pre-execution `Quote` computes `minimum_amount_out` less `ClmmSwapOp::slippage_bps` (default 50 = 0.5%).
+- **Never send `max_spread: None` to an AMM pair.** Choice's `assert_max_spread` no-ops on `None`, but Astroport substitutes its own 0.5% and asserts — invisibly to `SimulateRoute`. `AmmSwapOp::max_spread` defaults to and is clamped at 49%.
+- **Splits within a stage are quoted against the same pre-stage state** — every message is built before any executes, and `simulate_route` is a single snapshot. Two splits on one venue over-quote. Supported (and tested), so not rejected; merge them or use separate stages.
+- ⚠️ **`ob_buy_surplus` OVERESTIMATES** the orderbook buy refund by a few atomic units. Every consumer must clamp against real balance, the way `build_residue_sweep` does with `.min(residue)`. Crediting it raw makes `finalize_route` promise more than it holds and reverts the whole route.
+- **The protocol's orderbook carve is price improvement ONLY** — `(order_price − fill.price) × filled`. Everything else a buy leaves over is the user's: the quantity-tick flooring loss, the `(1 + fee)` sizing headroom, the relayer rebate, the margin against unfilled base. Measuring the user's share as "the unfilled fraction" instead made it exactly zero on every complete fill (v2.2.0 §4).
 - `FPDecimal` (from `injective-math`) for orderbook quantities; `Uint128`/`Decimal` (from `cosmwasm-std`) for everything else (including CLMM)
-- Fees deducted at path completion (end of a split's operation chain), not per-operation
-- **Fund-safety invariant (v2.0.1):** the engine tracks amounts *virtually*, so any value the chain hands back (orderbook refunds) or that a dropped/skipped/no-fill leg leaves behind would otherwise linger. `finalize_route` closes this with a balance-delta sweep over `entry_balances`: **orderbook buy price-improvement surplus → fee collector** (the only "orderbook fee", recorded in `pending_fees`); **all other residue → the user** (unfilled remainders, dropped intermediates, un-spent split inputs, no-fills). The final-output denom is excluded (paid from the tracked amount). Net result: a successful route holds nothing afterward. `minimum_receive == 0` is rejected so a route that produces nothing can never "succeed" returning nothing. Regression tests: `test_orderbook_surplus_to_fee_collector_and_contract_drains`, `test_amm_route_leaves_no_residue`, `test_zero_minimum_receive_is_rejected` in `tests/integration.rs`.
+- Fees are *charged* at path completion (end of a split's operation chain) but *paid* at finalize, via `pending_pool_fees`. Sending them from the reply that charged them raced the residue sweep — see v2.2.0 §3
+- **Fund-safety invariants.** The engine tracks amounts *virtually*: a hop's output is a number the venue reported, and `pool_address` is caller-supplied with no allowlist. Two invariants hold it together, and BOTH are load-bearing.
+  1. **A route may only move what it brought in (v2.2.0).** `snapshot_entry_balances` baselines the offer denom plus every op's input *and output*; `route_spendable = current − baseline` bounds every swap input, mid-path carry, adapter conversion, and the final payout (`OutputNotBacked`). A no-op on honest routes — the contract necessarily holds at least the tracked output — but on a hop that reported an output it never delivered the credit collapses to zero and the route dies at its own `minimum_receive`. Fails closed (`UnsnapshottedAsset`). Both the dispatch clamp and the payout clamp are needed: clamping only the payout still lets a fabricated intermediate be *spent* through a real pool.
+  2. **A successful route leaves nothing behind (v2.0.1).** `build_residue_sweep` drains every touched denom: accrued fees → fee collector (`pending_pool_fees` = the per-pool `FEE_MAP` carve, always owed; `pending_fees` = orderbook buy price improvement, suppressed on flash cycles where it is the caller's own arb profit and credited into what `min_profit` measures), everything else → the user. The final-output denom is netted against the tracked payout, not skipped — skipping it stranded the buy surplus on every CLOSED cycle.
+  `minimum_receive == 0` is rejected so a route that produces nothing can never "succeed" returning nothing. Regression tests: `test_hostile_pool_cannot_drain_contract_balance`, `test_ob_buy_unspent_input_returns_to_user`, `test_fee_on_non_final_stage_is_paid_once_to_collector`, `test_orderbook_surplus_to_fee_collector_and_contract_drains`, `test_amm_route_leaves_no_residue`, `test_zero_minimum_receive_is_rejected`.
 - **FlashRoute** (`docs/flash_route_plan.md`): a flash-arb cycle must repay in the *borrowed* asset, so it ends in `flash_asset` (gated by `min_profit`), not an A→B user swap. The whole cycle runs depth-first inside the pool's `FlashCallback`, so repayment settles before the pool's repay check — the pool reverts the tx if unrepaid. Repay uses the same Bank `Send` / CW20 `Transfer` (never CW20 `Send`) the pool requires. `FlashCallback` is gated on `PENDING_FLASH` + `info.sender == flash_pool`; the cycle may not route through `flash_pool` (reentrancy lock).
 - CI (`.github/workflows/test.yml`) runs `cargo build --verbose && cargo test --verbose` on push/PR to main

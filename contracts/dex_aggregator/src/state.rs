@@ -51,6 +51,13 @@ pub fn apply_fee(
 pub struct PendingPathOp {
     pub operation: Operation,
     pub amount: Uint128,
+    /// Where this op sits in the current stage. Recorded when the conversion is
+    /// dispatched rather than recovered by searching the plan afterwards: an
+    /// identical `Operation` can legitimately appear in more than one split (see
+    /// `test_multi_split_to_same_orderbook_contract`), and a search returns the
+    /// FIRST match — which silently attributed the resumed hop to the wrong split.
+    pub split_index: usize,
+    pub op_index: usize,
 }
 
 /// Repayment obligation attached to a flash-arb route. Present only on routes
@@ -136,9 +143,21 @@ pub struct ExecutionState {
     /// "Touched" = the offer denom plus every operation's input denom.
     pub entry_balances: Vec<(amm::AssetInfo, Uint128)>,
     /// Protocol revenue accrued mid-route that must be paid to the fee collector at
-    /// finalize (currently the orderbook buy-hop price-improvement surplus). Keyed by
+    /// finalize (the orderbook buy-hop price-improvement surplus). Keyed by
     /// denom; subtracted from a denom's swept residue so the rest returns to the user.
+    /// SUPPRESSED on flash routes — the surplus is the caller's own arb profit.
     pub pending_fees: Vec<(amm::AssetInfo, Uint128)>,
+    /// Per-pool `FEE_MAP` carve accrued at each split path's terminal hop. Paid to
+    /// the fee collector at finalize, exactly like `pending_fees` but NEVER
+    /// suppressed on flash routes.
+    ///
+    /// ⚠️ Deferred rather than sent from the reply that charged it. That message was
+    /// appended AFTER `proceed_to_next_step`, and submessages recurse depth-first —
+    /// so `finalize_route`'s residue sweep ran first, saw the still-unsent fee as
+    /// residue and paid it to the USER, and the queued fee transfer then found an
+    /// empty balance and reverted the whole route. Any `SetFee` on a pool used
+    /// anywhere but a route's last stage was enough to trigger it.
+    pub pending_pool_fees: Vec<(amm::AssetInfo, Uint128)>,
 }
 
 #[cw_serde]
@@ -155,6 +174,13 @@ pub struct SubmsgReplyState {
     /// (price improvement on the filled quantity) vs. the user's unfilled remainder.
     /// `None` for AMM/CLMM hops.
     pub ob_order_qty: Option<FPDecimal>,
+    /// Orderbook hops only: the price bound the order was placed at (`worst_price`,
+    /// after tick snapping). The protocol's price-improvement surplus is measured
+    /// against THIS, not against the whole reserved input.
+    pub ob_order_price: Option<FPDecimal>,
+    /// Orderbook hops only: whether the order was a BUY, cached at dispatch so the
+    /// reply does not re-query the market just to recover its direction.
+    pub ob_is_buy: Option<bool>,
 }
 
 pub const ACTIVE_ROUTES: Map<u64, ExecutionState> = Map::new("execution_states");

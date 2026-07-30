@@ -183,14 +183,34 @@ pub mod clmm {
 }
 
 /// A single legacy-XYK AMM hop. `offer_asset_info` drives the dispatch (native
-/// funds vs `Cw20::Send` vs tax-exempt send) and per-stage allocation. The output
-/// (ask) asset is *not* carried: during execution it's read from the pair's swap
-/// event (`ask_asset` attribute), and during `SimulateRoute` it's derived from the
-/// pair's `Pair {}` query (the pair side that isn't the offer).
+/// funds vs `Cw20::Send` vs tax-exempt send) and per-stage allocation.
 #[cw_serde]
 pub struct AmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
+    /// The asset this hop produces. Resolved BEFORE the hop runs, because the
+    /// engine snapshots its balance to bound what the route may spend and pay out
+    /// (see `snapshot_entry_balances`). `None` => derived from the pair's
+    /// `Pair {}` query (the side that isn't the offer), costing one extra query
+    /// per hop; supply it to skip that.
+    ///
+    /// It is deliberately NOT read back from the swap event any more. Trusting the
+    /// reply's `ask_asset` let a caller-authored "pool" name any asset it liked and
+    /// have the aggregator pay it out of balances the route never brought in.
+    #[serde(default)]
+    pub ask_asset_info: Option<amm::AssetInfo>,
+    /// `max_spread` passed to the pair's `Swap`. **Never sent as `None`**: Choice's
+    /// `assert_max_spread` no-ops when both it and `belief_price` are `None`, but
+    /// Astroport substitutes its OWN 0.5% default and asserts on it — and
+    /// `SimulateRoute`'s `Simulation` query never applies that assert, so the
+    /// pre-fire gate cannot see the revert coming.
+    ///
+    /// `None` here => 49%, i.e. effectively unbounded, leaving the route's
+    /// mandatory `minimum_receive` / `min_profit` as the real slippage guard. 49
+    /// rather than the 50 Astroport permits, so a pair bounding with `>=` instead
+    /// of `>` cannot reject every swap. Clamped to 50% for the same reason.
+    #[serde(default)]
+    pub max_spread: Option<Decimal>,
 }
 
 /// A single Injective spot-market hop, executed natively by the aggregator (it
@@ -218,10 +238,7 @@ pub struct OrderbookSwapOp {
     pub worst_price: Option<FPDecimal>,
 }
 
-/// A single CLMM hop. As with [`AmmSwapOp`], only `offer_asset_info` is carried:
-/// the output (ask) asset is read from the pool's swap event (`ask_asset`
-/// attribute) during execution, and from the pool's `GetConfig {}` query (the
-/// pool token that isn't the offer) during `SimulateRoute`.
+/// A single CLMM hop.
 ///
 /// - **Estimation mode** (`minimum_amount_out` omitted): the contract runs a
 ///   per-hop `Quote` query and applies 0.5% slippage. Used by the Choice dApp.
@@ -233,10 +250,24 @@ pub struct OrderbookSwapOp {
 pub struct ClmmSwapOp {
     pub pool_address: String,
     pub offer_asset_info: amm::AssetInfo,
+    /// The asset this hop produces — see [`AmmSwapOp::ask_asset_info`]. `None` =>
+    /// derived from the pool's `GetConfig {}` (the token that isn't the offer).
+    #[serde(default)]
+    pub ask_asset_info: Option<amm::AssetInfo>,
     /// Direct mode: `SwapExactInput`'s `minimum_amount_out`, passed straight
-    /// through. `None` => estimate it from the pool (`Quote` + 0.5%).
+    /// through. `None` => estimate it from the pool (`Quote` less `slippage_bps`).
     #[serde(default)]
     pub minimum_amount_out: Option<Uint128>,
+    /// Estimation-mode slippage tolerance in basis points. `None` => 50 (0.5%),
+    /// the value that used to be hardcoded. Ignored when `minimum_amount_out` is
+    /// supplied. Clamped to 10000; at 10000 the floor is effectively disabled and
+    /// the route's own `minimum_receive` / `min_profit` is the only guard.
+    ///
+    /// Worth raising when a stage splits across the SAME pool: every split's quote
+    /// is taken before any of them execute, so later splits are priced against
+    /// pre-trade state and this cushion is what absorbs the difference.
+    #[serde(default)]
+    pub slippage_bps: Option<u16>,
 }
 
 #[cw_serde]
@@ -252,6 +283,21 @@ pub struct Split {
     pub percent: u8,
 }
 
+/// One parallel step of a route. Every split in a stage is dispatched together and
+/// its outputs are pooled before the next stage runs.
+///
+/// ⚠️ **Splits within a stage are quoted against the SAME pre-stage state.** All of
+/// a stage's messages are built in `execute_planned_swaps` before any of them
+/// execute, so if two splits hit the same venue the second one is priced as though
+/// the first had not traded — and `simulate_route` has the identical blind spot,
+/// being a single-snapshot query. The result is an over-quote that the pre-fire
+/// gate cannot see.
+///
+/// It is not rejected, because same-venue splits are a supported shape (see
+/// `test_multi_split_to_same_orderbook_contract`). But routers should merge two
+/// splits that share a pool into one, and where a shared pool is unavoidable on a
+/// CLMM hop, widen `ClmmSwapOp::slippage_bps` to cover the self-impact. Sequencing
+/// the affected hops into separate stages removes the problem entirely.
 #[cw_serde]
 pub struct Stage {
     pub splits: Vec<Split>,
@@ -320,6 +366,12 @@ pub enum ExecuteMsg {
     },
     UpdateFeeCollector {
         new_fee_collector: String,
+    },
+    /// Admin-only. Repoints the CW20<->native adapter used by every conversion
+    /// (`create_conversion_msg`). Without this the address is fixed at instantiate
+    /// and a redeployed adapter could only be picked up by a contract migration.
+    UpdateCw20Adapter {
+        new_cw20_adapter: String,
     },
     EmergencyWithdraw {
         asset_info: amm::AssetInfo,

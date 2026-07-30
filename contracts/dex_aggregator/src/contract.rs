@@ -124,6 +124,9 @@ pub fn execute(
         ExecuteMsg::UpdateFeeCollector { new_fee_collector } => {
             update_fee_collector(deps, info, new_fee_collector)
         }
+        ExecuteMsg::UpdateCw20Adapter { new_cw20_adapter } => {
+            crate::execute::update_cw20_adapter(deps, info, new_cw20_adapter)
+        }
         ExecuteMsg::EmergencyWithdraw { asset_info } => {
             crate::execute::emergency_withdraw(deps, env, info, asset_info)
         }

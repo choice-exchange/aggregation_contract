@@ -76,8 +76,10 @@ atomic tx — only one flash is ever in flight.
   + `PENDING_FLASH: Item<PendingFlashCtx>`.
 
 ### `src/execute.rs`
-- `execute_flash_route(...)`: validate stages/percents; **guard** that no `ClmmSwap`
-  op routes through `flash_pool` (reentrancy lock would revert the tx); query the
+- `execute_flash_route(...)`: validate stages/percents (every stage, via
+  `validate_stages`); **guard** that no op routes through `flash_pool` — checked for
+  every venue carrying a contract address, AMM as well as CLMM, since the route is
+  caller-supplied (reentrancy lock would revert the tx); query the
   pool's `GetConfig {}` to map `flash_asset → token0/token1` and set
   `amount0`/`amount1`; save `PENDING_FLASH`; emit the `Flash` message.
 - `execute_flash_callback(...)`: load+remove `PENDING_FLASH` (absence ⇒

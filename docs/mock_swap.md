@@ -2,13 +2,19 @@
 
 ## Purpose
 
-The `mock_swap` contract is a test-only helper that simulates both AMM and orderbook DEX pools with a configurable exchange rate. It implements the same execute and query interfaces that the `dex_aggregator` contract calls, so integration tests can deploy mock pools with known rates and verify the aggregator's routing logic end-to-end.
+The `mock_swap` contract is a test-only helper that simulates AMM, orderbook and CLMM DEX pools with a configurable exchange rate. It implements the same execute and query interfaces that the `dex_aggregator` contract calls, so integration tests can deploy mock pools with known rates and verify the aggregator's routing logic end-to-end.
+
+It also has a deliberately **hostile** mode (`SetPhantom`, below) for proving that the aggregator does not trust what a pool says about itself.
 
 **This contract is never deployed to mainnet/testnet.** It exists solely for `injective-test-tube` integration tests.
 
+> Note: orderbook hops are no longer routed through a contract — the aggregator submits atomic
+> spot orders itself, against a real market launched by the test harness. `ProtocolType::Orderbook`
+> and `SwapMinOutput` remain for the legacy pre-merge shapes and are not on the live path.
+
 ## Source
 
-Single file: `contracts/mock_swap/src/lib.rs` (~273 lines)
+Single file: `contracts/mock_swap/src/lib.rs`
 
 Compiled artifact: `artifacts/mock_swap.wasm` (produced by `./build_release.sh`)
 
@@ -113,6 +119,31 @@ pub struct MockSwapHookSwapField {
 ```
 
 If decoding succeeds and `to` is set, output goes to that address. Otherwise output goes to `sender`. The input asset is identified as `AssetInfo::Token { contract_addr: info.sender }` (the CW20 contract that called Receive).
+
+### `SetPhantom` — hostile-pool mode (test-only)
+
+```rust
+SetPhantom { amount: Uint128, denom: String }
+```
+
+Puts the mock into "hostile pool" mode. Once set, **every** subsequent swap keeps the funds it
+was sent and returns a response containing only
+
+```
+wasm: action=swap  return_amount=<amount>  ask_asset=<denom>
+```
+
+— a normal-looking pair/pool swap event claiming an output that is never transferred. There is
+no way to switch it back off; instantiate a fresh mock for the honest case.
+
+This exists to answer one question: **does the consumer credit reply events, or funds actually
+received?** It is how `test_hostile_pool_cannot_drain_contract_balance` proves the aggregator's
+route-funds invariant — an attacker-authored pool used to be able to drain the aggregator's
+whole balance of any denom for 1 wei of gas by emitting exactly the above. See
+[v2_2_0_changes.md](v2_2_0_changes.md) §1–2.
+
+Use it whenever you add a new disbursement path to the aggregator: point a route at a phantom
+pool, and assert the contract's balance is untouched.
 
 ---
 
@@ -240,8 +271,10 @@ Mock contracts must be pre-funded with their output asset. For native outputs, t
 
 - **Rate verification:** Deploy pool with rate X, swap amount Y, verify output is Y * X (adjusted for decimals)
 - **Multi-hop chains:** Deploy pool A→B and pool B→C, build a 2-operation path, verify end-to-end output
-- **Protocol mixing:** Deploy AMM and orderbook mocks in the same route to test mixed protocol handling
+- **Protocol mixing:** Deploy AMM and CLMM mocks in the same route to test mixed protocol handling (orderbook legs use a real seeded market — see `launch_spot_market` in the test harness)
 - **CW20 swaps:** Deploy a mock that accepts CW20 input and outputs native (or vice versa), test with `Cw20ExecuteMsg::Send`
+- **Fund safety:** `SetPhantom` a mock, route through it, and assert nothing left the aggregator. A new payout path that isn't clamped will fail this
+- **Pair/config queries:** the mock answers `Pair {}` and `GetConfig {}` with `(input_asset_info, output_asset_info)`, which is how the aggregator resolves an op's output asset when `ask_asset_info` is omitted
 
 ---
 

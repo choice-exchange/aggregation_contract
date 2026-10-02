@@ -90,6 +90,59 @@ pub fn round_up_to_min_tick(num: FPDecimal, min_tick: FPDecimal) -> FPDecimal {
     FPDecimal::from(num.num - remainder.num + min_tick.num)
 }
 
+/// The base quantity an orderbook **SELL** hop actually trades: the input floored
+/// to the market's quantity tick.
+///
+/// ⚠️ Call this from BOTH the estimator and the order builder. They diverged once
+/// — the builder floored the sell input while `estimate_execution_sell_from_source`
+/// priced the raw, unfloored amount — so `SimulateRoute` over-reported by exactly
+/// the flooring loss (a measured 2.03% on a 1.939378 ATOM leg at a 0.1 ATOM tick)
+/// and the mandatory pre-fire gate passed routes the chain then reverted at the
+/// min-receive floor. Buys were never affected: `estimate_execution_buy_from_source`
+/// rounds the derived base quantity itself.
+pub fn sell_base_quantity(input: FPDecimal, min_quantity_tick_size: FPDecimal) -> FPDecimal {
+    round_to_min_tick(input, min_quantity_tick_size)
+}
+
+/// Whether an order of `quantity` at `price` clears the market's `min_notional`.
+///
+/// The chain rejects a spot order whose notional (price × quantity) falls below
+/// this floor, and NEITHER the tick rounding nor the zero-quantity guard catches
+/// it: a leg can be an exact multiple of `min_quantity_tick_size` and still be
+/// worth less than the floor (every INJ/ATOM major sits at 1e6 = $1.00). Checked
+/// in `build_swap_order_msg`, so **direct mode** — which supplies its own
+/// quantity/price and skips the estimators entirely — is covered too, and in both
+/// estimators so `SimulateRoute` reports the same nothing the fill would produce.
+///
+/// Units: prices and quantities are chain-scale throughout this module, so
+/// `price * quantity` is chain-scale quote — the same scale as `min_notional`.
+pub fn meets_min_notional(market: &SpotMarket, price: FPDecimal, quantity: FPDecimal) -> bool {
+    if market.min_notional.is_zero() {
+        return true;
+    }
+    price * quantity >= market.min_notional
+}
+
+/// A hop that will not place an order: zero output, zero fee. Returned by the
+/// estimators instead of an error so the quote and the executor agree the path is
+/// worth nothing, and the caller finishes it as a graceful zero-value path.
+fn no_fill_estimate(market: &SpotMarket, is_buy_order: bool) -> StepExecutionEstimate {
+    StepExecutionEstimate {
+        worst_price: FPDecimal::ZERO,
+        result_quantity: FPDecimal::ZERO,
+        result_denom: if is_buy_order {
+            market.base_denom.clone()
+        } else {
+            market.quote_denom.clone()
+        },
+        is_buy_order,
+        fee_estimate: Some(FPCoin {
+            denom: market.quote_denom.clone(),
+            amount: FPDecimal::ZERO,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Orderbook walk / pricing (ported from queries.rs, from-source only)
 // ---------------------------------------------------------------------------
@@ -189,6 +242,144 @@ fn get_effective_fee_discount_rate(market: &SpotMarket, is_self_relayer: bool) -
 // Single-market estimators (from-source only)
 // ---------------------------------------------------------------------------
 
+/// `(gross, net)` atomic taker-fee fractions for `market`.
+///
+/// The chain reserves the GROSS atomic taker fee as order margin; the relayer-fee-
+/// share discount is only rebated *after* the trade (to the fee recipient, i.e.
+/// this contract). So BUY sizing must use the gross fraction — sizing with the
+/// discounted net fee over-commits the held quote and the order is rejected
+/// ("insufficient funds"). SELL output uses the net fee (what the self-relaying
+/// contract actually nets). Shared by the estimators and the direct-mode sizer so
+/// the two cannot drift.
+pub fn fee_fractions(
+    deps: &Deps<InjectiveQueryWrapper>,
+    market: &SpotMarket,
+) -> StdResult<(FPDecimal, FPDecimal)> {
+    let querier = InjectiveQuerier::new(&deps.querier);
+    let fee_multiplier = querier
+        .query_market_atomic_execution_fee_multiplier(&market.market_id)?
+        .multiplier;
+    let gross = market.taker_fee_rate * fee_multiplier;
+    // Merged aggregator is always its own fee recipient.
+    let net = gross * (FPDecimal::ONE - get_effective_fee_discount_rate(market, true));
+    Ok((gross, net))
+}
+
+/// Size a **direct-mode** orderbook hop: the caller fixed `quantity` and
+/// `worst_price`, so no orderbook walk runs. Returns `Ok(None)` when the hop
+/// cannot place an order at all (rounds to zero, or below `min_notional`), which
+/// the caller finishes as a graceful zero-value path.
+///
+/// Three adjustments the raw caller values do NOT get for free, each of which the
+/// chain would otherwise turn into a revert of the WHOLE route:
+///
+/// 1. **Price snapped to `min_price_tick_size`**, in the direction that can never
+///    give a worse fill than asked: a BUY's bound is a ceiling (round down), a
+///    SELL's is a floor (round up).
+/// 2. **Quantity floored to `min_quantity_tick_size`** — never more than asked,
+///    and never off-grid.
+/// 3. **Quantity bounded by what this hop actually holds.** A mid-route leg's true
+///    input is only known on chain, so a caller-fixed quantity is routinely too
+///    large by the time it runs; without this the order dies for insufficient
+///    funds and takes the route with it.
+///
+/// Shared verbatim with `SimulateRoute` (see [`direct_mode_estimate`]) so the
+/// pre-fire gate quotes the order that will actually be submitted.
+pub fn direct_order_params(
+    deps: &Deps<InjectiveQueryWrapper>,
+    market: &SpotMarket,
+    offer_denom: &str,
+    input_amount: Uint128,
+    quantity: FPDecimal,
+    worst_price: FPDecimal,
+) -> StdResult<Option<(FPDecimal, FPDecimal)>> {
+    // Paying quote => buying base; paying base => selling.
+    let is_buy = offer_denom != market.base_denom;
+
+    let price = if is_buy {
+        round_to_min_tick(worst_price, market.min_price_tick_size)
+    } else {
+        round_up_to_min_tick(worst_price, market.min_price_tick_size)
+    };
+    if price.is_negative() || price.is_zero() {
+        return Ok(None);
+    }
+
+    let mut qty = round_to_min_tick(quantity, market.min_quantity_tick_size);
+
+    let affordable = if is_buy {
+        let (gross_fee, _) = fee_fractions(deps, market)?;
+        let per_unit = price * (FPDecimal::ONE + gross_fee);
+        if per_unit.is_zero() {
+            FPDecimal::ZERO
+        } else {
+            FPDecimal::from(input_amount) / per_unit
+        }
+    } else {
+        FPDecimal::from(input_amount)
+    };
+    let affordable = round_to_min_tick(affordable, market.min_quantity_tick_size);
+    if qty > affordable {
+        qty = affordable;
+    }
+
+    if qty.is_negative() || qty.is_zero() {
+        return Ok(None);
+    }
+    if !meets_min_notional(market, price, qty) {
+        return Ok(None);
+    }
+    Ok(Some((price, qty)))
+}
+
+/// `SimulateRoute`'s view of a direct-mode hop. Sizes the order through
+/// [`direct_order_params`] — the same code the executor submits with — instead of
+/// re-deriving it from the book, which quoted an order that was never placed.
+pub fn direct_mode_estimate(
+    deps: &Deps<InjectiveQueryWrapper>,
+    market: &SpotMarket,
+    offer_denom: &str,
+    input_amount: Uint128,
+    quantity: FPDecimal,
+    worst_price: FPDecimal,
+) -> StdResult<StepExecutionEstimate> {
+    let is_buy = offer_denom != market.base_denom;
+    let (price, qty) =
+        match direct_order_params(deps, market, offer_denom, input_amount, quantity, worst_price)? {
+            Some(v) => v,
+            None => return Ok(no_fill_estimate(market, is_buy)),
+        };
+
+    if is_buy {
+        return Ok(StepExecutionEstimate {
+            worst_price: price,
+            result_quantity: qty,
+            result_denom: market.base_denom.clone(),
+            is_buy_order: true,
+            fee_estimate: Some(FPCoin {
+                denom: market.quote_denom.clone(),
+                amount: FPDecimal::ZERO,
+            }),
+        });
+    }
+
+    // Sell: price the fill at the caller's floor — conservative, since any fill at
+    // or above it only improves the output.
+    let (_, net_fee) = fee_fractions(deps, market)?;
+    let gross = qty * price;
+    let fee = gross * net_fee;
+    Ok(StepExecutionEstimate {
+        worst_price: price,
+        result_quantity: gross - fee,
+        result_denom: market.quote_denom.clone(),
+        is_buy_order: false,
+        fee_estimate: Some(FPCoin {
+            denom: market.quote_denom.clone(),
+            amount: fee,
+        }),
+    })
+}
+
 /// Estimate / size a single-market orderbook hop where the caller supplies the
 /// **input** quantity (`input`, in either the market's base or quote denom).
 ///
@@ -210,22 +401,7 @@ pub fn estimate_single_swap_execution(
         return Err(StdError::msg("Invalid swap denom - neither base nor quote"));
     }
 
-    // Merged aggregator is always its own fee recipient.
-    let is_self_relayer = true;
-
-    let fee_multiplier = querier
-        .query_market_atomic_execution_fee_multiplier(&market.market_id)?
-        .multiplier;
-
-    // The chain reserves the GROSS atomic taker fee as order margin; the relayer-
-    // fee-share discount is only rebated *after* the trade (to the fee recipient,
-    // i.e. this contract). So size BUY orders with the gross fee — sizing with the
-    // discounted net fee over-commits the held quote and the order is rejected
-    // ("insufficient funds"). SELL output uses the net fee (what the self-relaying
-    // contract actually nets, discount included).
-    let gross_fee_fraction = market.taker_fee_rate * fee_multiplier;
-    let net_fee_fraction = gross_fee_fraction
-        * (FPDecimal::ONE - get_effective_fee_discount_rate(market, is_self_relayer));
+    let (gross_fee_fraction, net_fee_fraction) = fee_fractions(deps, market)?;
 
     // from-source: paying quote => buying base; paying base => selling.
     let is_buy = input.denom != market.base_denom;
@@ -286,6 +462,13 @@ fn estimate_execution_buy_from_source(
     // only when levels are far apart.
     let expected_base_quantity = available_swap_quote_funds / worst_price;
     let result_quantity = round_to_min_tick(expected_base_quantity, market.min_quantity_tick_size);
+
+    // Below the market's notional floor the chain rejects the order outright, so
+    // quote it as a no-fill instead of an output the route can never realise.
+    if !meets_min_notional(market, worst_price, result_quantity) {
+        return Ok(no_fill_estimate(market, true));
+    }
+
     let fee_estimate = input_quote_quantity - available_swap_quote_funds;
 
     // The funds check only matters for real execution: the atomic order debits the
@@ -328,6 +511,21 @@ fn estimate_execution_sell_from_source(
     input_base_quantity: FPDecimal,
     fee_fraction: FPDecimal,
 ) -> StdResult<StepExecutionEstimate> {
+    // Price the quantity the order will ACTUALLY be placed with, not the raw
+    // input: `build_swap_order_msg` floors the sell input to the tick, so walking
+    // the book with the unfloored amount over-reports the hop's output by the
+    // flooring loss. See `sell_base_quantity`.
+    let input_base_quantity = sell_base_quantity(input_base_quantity, market.min_quantity_tick_size);
+
+    // Sub-tick input places no order at all (`build_swap_order_msg` returns
+    // `Ok(None)` => `AmountTooSmall`). Report a zero-value hop rather than walking
+    // the book, which would otherwise round the partial level back UP to one tick
+    // and quote liquidity that is never traded. Execution is unaffected: it derives
+    // its own quantity and bails on zero before reading `worst_price`.
+    if input_base_quantity.is_zero() {
+        return Ok(no_fill_estimate(market, false));
+    }
+
     let orders = querier.query_spot_market_orderbook(
         &market.market_id,
         OrderSide::Buy,
@@ -346,6 +544,12 @@ fn estimate_execution_sell_from_source(
     let average_price =
         get_average_price_from_orders(&top_orders, market.min_price_tick_size, false)?;
     let worst_price = get_worst_price_from_orders(&top_orders)?;
+
+    // The order is placed at `worst_price`; below the market's notional floor the
+    // chain rejects it, so quote a no-fill rather than a clean estimate.
+    if !meets_min_notional(market, worst_price, input_base_quantity) {
+        return Ok(no_fill_estimate(market, false));
+    }
 
     let expected_exchange_quantity = input_base_quantity * average_price;
     let fee_estimate = expected_exchange_quantity * fee_fraction;
@@ -409,6 +613,10 @@ pub fn is_buy_for_target(market: &SpotMarket, target_denom: &str) -> bool {
 /// this hop; the order debits the contract's default subaccount, and the aggregator
 /// is its own fee recipient (self-relayer). Returns `Ok(None)` when the order
 /// quantity rounds to zero, so the caller can surface `AmountTooSmall`.
+///
+/// On success returns `(msg, order_qty, order_price)` — the base quantity and the
+/// price bound the order was actually placed with. The reply handler needs both to
+/// separate the protocol's price-improvement surplus from the user's unspent input.
 pub fn build_swap_order_msg(
     deps: Deps<InjectiveQueryWrapper>,
     contract: &Addr,
@@ -417,12 +625,19 @@ pub fn build_swap_order_msg(
     input_amount: Uint128,
     quantity: Option<FPDecimal>,
     worst_price: Option<FPDecimal>,
-) -> StdResult<Option<CosmosMsg<InjectiveMsgWrapper>>> {
+) -> StdResult<Option<(CosmosMsg<InjectiveMsgWrapper>, FPDecimal, FPDecimal)>> {
     // Paying quote => buying base; paying base => selling.
     let is_buy = offer_denom != market.base_denom;
 
     let (price, order_qty) = match (quantity, worst_price) {
-        (Some(q), Some(p)) => (p, q),
+        // Direct mode: tick-snapped, affordability-bounded, min_notional-checked by
+        // `direct_order_params` — the same helper `SimulateRoute` sizes with.
+        (Some(q), Some(p)) => {
+            match direct_order_params(&deps, market, offer_denom, input_amount, q, p)? {
+                Some(v) => v,
+                None => return Ok(None),
+            }
+        }
         _ => {
             let input = FPCoin {
                 amount: FPDecimal::from(input_amount),
@@ -433,14 +648,22 @@ pub fn build_swap_order_msg(
                 // estimator already rounds the base quantity to tick
                 est.result_quantity
             } else {
-                // sells trade the base input directly; round it down to the tick
-                round_to_min_tick(FPDecimal::from(input_amount), market.min_quantity_tick_size)
+                // sells trade the base input directly, floored to the tick. Shared
+                // with the estimator so the quote can never over-report the fill.
+                sell_base_quantity(FPDecimal::from(input_amount), market.min_quantity_tick_size)
             };
             (est.worst_price, qty)
         }
     };
 
     if order_qty.is_negative() || order_qty.is_zero() {
+        return Ok(None);
+    }
+
+    // Belt-and-braces for the estimation path (direct mode already checked it in
+    // `direct_order_params`). A sub-notional order is rejected by the chain, so bail
+    // here rather than spending gas on a certain revert.
+    if !meets_min_notional(market, price, order_qty) {
         return Ok(None);
     }
 
@@ -458,7 +681,47 @@ pub fn build_swap_order_msg(
         None,
     );
 
-    Ok(Some(create_spot_market_order_msg(contract.clone(), order)))
+    Ok(Some((
+        create_spot_market_order_msg(contract.clone(), order),
+        order_qty,
+        price,
+    )))
+}
+
+/// The decoded fill of an atomic spot market order, in chain units.
+pub struct OrderFill {
+    /// Base quantity filled.
+    pub quantity: FPDecimal,
+    /// Average fill price.
+    pub price: FPDecimal,
+    /// Trading fee taken (in quote).
+    pub fee: FPDecimal,
+}
+
+/// Decode the raw fill (base quantity, average price, trading fee) from an atomic
+/// spot market order reply. `None` => nothing filled (IOC no-fill / no results).
+pub fn decode_order_fill(response: &SubMsgResponse) -> StdResult<Option<OrderFill>> {
+    let first = match response.msg_responses.first() {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let decoded = MsgCreateSpotMarketOrderResponse::decode(first.value.as_slice())
+        .map_err(|e| StdError::msg(format!("decode failed (type_url={}): {e}", first.type_url)))?;
+    let trade = match decoded.results {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    // protobuf serializes Dec values with an extra 10^18 factor; descale to chain units.
+    let scale = dec_scale_factor();
+    let price = FPDecimal::from_str(&trade.price).map_err(|_| StdError::msg("bad price"))? / scale;
+    let quantity =
+        FPDecimal::from_str(&trade.quantity).map_err(|_| StdError::msg("bad quantity"))? / scale;
+    let fee = FPDecimal::from_str(&trade.fee).map_err(|_| StdError::msg("bad fee"))? / scale;
+    Ok(Some(OrderFill {
+        quantity,
+        price,
+        fee,
+    }))
 }
 
 /// Decode the filled output (in `target_denom`, chain scale) from an atomic spot
@@ -644,6 +907,90 @@ mod tests {
             ),
             FPDecimal::must_from_str("0.000001")
         );
+    }
+
+    #[test]
+    fn test_sell_base_quantity_floors_to_tick() {
+        // Regression: route 729's middle leg (sell ATOM for USDC on a 0.1 ATOM
+        // tick). The estimator used to price the raw 1.939378 while the order
+        // builder placed 1.9 — a 2.03% over-report that passed the pre-fire gate
+        // and reverted on chain at the min-receive floor.
+        let tick = FPDecimal::must_from_str("0.1");
+        assert_eq!(
+            sell_base_quantity(FPDecimal::must_from_str("1.939378"), tick),
+            FPDecimal::must_from_str("1.9")
+        );
+        // Exact multiples are untouched.
+        assert_eq!(
+            sell_base_quantity(FPDecimal::must_from_str("1.9"), tick),
+            FPDecimal::must_from_str("1.9")
+        );
+        // Sub-tick floors to zero => no order is placed, so the hop is worth zero.
+        assert_eq!(
+            sell_base_quantity(FPDecimal::must_from_str("0.09"), tick),
+            FPDecimal::ZERO
+        );
+        // Decimal-correct for 6-dec bases too (ATOM/NINJA class, 0.01 tick).
+        assert_eq!(
+            sell_base_quantity(
+                FPDecimal::must_from_str("12.3456"),
+                FPDecimal::must_from_str("0.01")
+            ),
+            FPDecimal::must_from_str("12.34")
+        );
+    }
+
+    fn market_with_min_notional(min_notional: u128) -> SpotMarket {
+        SpotMarket {
+            ticker: "TEST/USDT".to_string(),
+            base_denom: "base".to_string(),
+            quote_denom: "quote".to_string(),
+            maker_fee_rate: FPDecimal::ZERO,
+            taker_fee_rate: FPDecimal::ZERO,
+            relayer_fee_share_rate: FPDecimal::ZERO,
+            market_id: MarketId::unchecked(
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+            ),
+            status: Default::default(),
+            min_price_tick_size: FPDecimal::must_from_str("0.000001"),
+            min_quantity_tick_size: FPDecimal::must_from_str("0.01"),
+            min_notional: FPDecimal::from(min_notional),
+        }
+    }
+
+    #[test]
+    fn test_meets_min_notional() {
+        // Every INJ/ATOM major on mainnet carries min_notional = 1e6 ($1 at 6dp).
+        let market = market_with_min_notional(1_000_000);
+        let price = FPDecimal::from(500_000u128);
+
+        // Comfortably above the floor.
+        assert!(meets_min_notional(
+            &market,
+            price,
+            FPDecimal::from(3u128)
+        ));
+        // Exactly at the floor is accepted (the chain's check is >=).
+        assert!(meets_min_notional(
+            &market,
+            price,
+            FPDecimal::from(2u128)
+        ));
+        // Below it. A clean multiple of the quantity tick, and non-zero, so neither
+        // the tick rounding nor the zero guard would have caught this.
+        assert!(!meets_min_notional(
+            &market,
+            price,
+            FPDecimal::from(1u128)
+        ));
+
+        // A market with no floor never rejects.
+        let unbounded = market_with_min_notional(0);
+        assert!(meets_min_notional(
+            &unbounded,
+            price,
+            FPDecimal::must_from_str("0.01")
+        ));
     }
 
     #[test]

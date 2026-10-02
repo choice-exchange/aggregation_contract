@@ -16,10 +16,15 @@ test every change against both:
   `FlashRoute` additionally gated by `FLASH_SIGNERS`. Latency- and gas-sensitive; the concern
   is economic correctness — does `SimulateRoute` agree with what execution does.
 
-Both currently run **Code ID 2060 (v2.0.1)**; the v2.0.1 migration is DONE. wasm-admin on both
-is the Choice Admin Timelock `inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
+Both now run **Code ID 2067 (v2.2.0)**. wasm-admin on both is the Choice Admin Timelock
+`inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
 
-- **v2.2.0 — built, NOT uploaded, NOT migrated.** Audit fixes: routes bounded to their own
+- **v2.2.0 — LIVE on both instances.** The Choice instance was migrated 2026-09-06 at
+  height 181774266 (timelock `apply{}`, tx `E63BD461…C1D2E`); the arb-bot instance was
+  instantiated on 2067 directly. Verified live by two multi-hop AMM+CLMM user swaps that
+  left the contract balance byte-for-byte unchanged (the residue invariant). The legacy
+  v1-arb aggregator `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx` is deliberately left on
+  **2060** as a rollback anchor. Audit fixes: routes bounded to their own
   funds, fee ordering, direct-mode tick snapping, gate parity. See
   [docs/v2_2_0_changes.md](docs/v2_2_0_changes.md) — read it before touching
   `snapshot_entry_balances`, `finalize_route`, or `build_swap_order_msg`. Supersedes the

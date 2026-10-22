@@ -15,6 +15,19 @@ pub fn query_config(deps: Deps) -> StdResult<Binary> {
     to_json_binary(&config)
 }
 
+/// Canonical identity of an asset under the CW20 adapter: a CW20 and the bank denom
+/// the adapter wraps it into (`factory/<adapter>/<cw20>`) are the same asset, which
+/// is the assumption the executor's stage allocator is built on.
+fn canonical_key(info: &amm::AssetInfo, adapter: &Addr) -> String {
+    match info {
+        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+        amm::AssetInfo::NativeToken { denom } => denom
+            .strip_prefix(&format!("factory/{adapter}/"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| denom.clone()),
+    }
+}
+
 pub fn simulate_route(
     deps: Deps<InjectiveQueryWrapper>,
     env: Env,
@@ -27,6 +40,13 @@ pub fn simulate_route(
         });
     }
 
+    // The gate must reject every shape execution rejects, or it clears routes that
+    // are guaranteed to revert. Percentage sums were previously checked on the
+    // executor's first stage only, and never here at all.
+    crate::execute::validate_stages(&stages).map_err(|e| StdError::msg(e.to_string()))?;
+
+    let adapter = crate::state::CONFIG.load(deps.storage)?.cw20_adapter_address;
+
     let mut current_assets: Vec<amm::Asset> = vec![amm::Asset {
         info: amm::AssetInfo::NativeToken {
             denom: amount_in.denom,
@@ -38,51 +58,61 @@ pub fn simulate_route(
     for stage in stages {
         let mut next_stage_outputs: Vec<amm::Asset> = vec![];
 
-        // Group the current assets by their type to get the total for each pile.
-        let mut grouped_inputs: Vec<(amm::AssetInfo, Uint128)> = vec![];
-        for asset in current_assets {
-            if let Some((_, amount)) = grouped_inputs
-                .iter_mut()
-                .find(|(info, _)| *info == asset.info)
-            {
-                *amount += asset.amount;
-            } else {
-                grouped_inputs.push((asset.info, asset.amount));
+        // Mirror `plan_next_stage` exactly: one native pile plus one CW20 pile,
+        // summed into a single logical amount under adapter identity, and rejected
+        // outright if two genuinely different natives (or CW20s) arrive together.
+        //
+        // ⚠️ This used to allocate each split from the pile matching that split's OWN
+        // input asset. That both quoted multi-denom stages the executor now refuses
+        // with `MixedAssetsInStage`, and quoted ~zero for any split whose input the
+        // executor would have produced by an adapter conversion.
+        let mut native_have = Uint128::zero();
+        let mut cw20_have = Uint128::zero();
+        let mut seen_native: Option<String> = None;
+        let mut seen_cw20: Option<String> = None;
+        for asset in &current_assets {
+            match &asset.info {
+                amm::AssetInfo::NativeToken { denom } => {
+                    match &seen_native {
+                        Some(seen) if seen != denom => {
+                            return Err(StdError::msg(format!(
+                                "stage received two different native assets ({seen} and {denom})"
+                            )))
+                        }
+                        _ => seen_native = Some(denom.clone()),
+                    }
+                    native_have += asset.amount;
+                }
+                amm::AssetInfo::Token { contract_addr } => {
+                    match &seen_cw20 {
+                        Some(seen) if seen != contract_addr => {
+                            return Err(StdError::msg(format!(
+                                "stage received two different CW20 assets ({seen} and {contract_addr})"
+                            )))
+                        }
+                        _ => seen_cw20 = Some(contract_addr.clone()),
+                    }
+                    cw20_have += asset.amount;
+                }
             }
         }
+        let total_logical_amount = native_have + cw20_have;
 
-        let mut amounts_allocated: Vec<(amm::AssetInfo, Uint128)> = vec![];
+        let mut allocated = Uint128::zero();
 
         for (i, split) in stage.splits.iter().enumerate() {
             let path_input_info = get_path_start_info(deps, &split.path)?;
 
-            let total_amount_for_type = grouped_inputs
-                .iter()
-                .find(|(info, _)| *info == path_input_info)
-                .map(|(_, amount)| *amount)
-                .unwrap_or_else(Uint128::zero);
-
+            // Identical to the executor: every split draws from the combined pile,
+            // and the last one absorbs the rounding remainder.
             let amount_for_split = if i < stage.splits.len() - 1 {
-                total_amount_for_type.multiply_ratio(split.percent as u128, 100u128)
+                total_logical_amount.multiply_ratio(split.percent as u128, 100u128)
             } else {
-                let already_allocated = amounts_allocated
-                    .iter()
-                    .find(|(info, _)| *info == path_input_info)
-                    .map(|(_, amount)| *amount)
-                    .unwrap_or_else(Uint128::zero);
-                total_amount_for_type
-                    .checked_sub(already_allocated)
+                total_logical_amount
+                    .checked_sub(allocated)
                     .map_err(StdError::from)?
             };
-
-            if let Some((_, allocated)) = amounts_allocated
-                .iter_mut()
-                .find(|(info, _)| *info == path_input_info)
-            {
-                *allocated += amount_for_split;
-            } else {
-                amounts_allocated.push((path_input_info.clone(), amount_for_split));
-            }
+            allocated += amount_for_split;
 
             let mut current_path_asset = amm::Asset {
                 info: path_input_info,
@@ -122,7 +152,25 @@ pub fn simulate_route(
         current_assets = next_stage_outputs;
     }
 
-    let total_output: Uint128 = current_assets.iter().map(|a| a.amount).sum();
+    // `handle_final_stage` normalizes every accumulated asset onto the first one via
+    // the adapter (1:1), so the outputs may only be summed when they are the same
+    // asset under adapter identity. Summing unconditionally reported 100 USDT plus
+    // 5 INJ as "105" — a number with no meaning, for a route the executor would have
+    // reverted on when the adapter refused the conversion.
+    let mut total_output = Uint128::zero();
+    let target_key = current_assets
+        .first()
+        .map(|a| canonical_key(&a.info, &adapter));
+    for asset in &current_assets {
+        let key = canonical_key(&asset.info, &adapter);
+        if Some(&key) != target_key.as_ref() {
+            return Err(StdError::msg(format!(
+                "route ends in two different assets ({} and {key}); they cannot be summed",
+                target_key.unwrap_or_default()
+            )));
+        }
+        total_output += asset.amount;
+    }
 
     let response = SimulateRouteResponse {
         output_amount: total_output,
@@ -187,16 +235,29 @@ fn simulate_single_operation(
                 )));
             }
 
-            let est = orderbook_exec::estimate_single_swap_execution(
-                &deps,
-                &env.contract.address,
-                &market,
-                FPCoin {
-                    amount: offer_asset.amount.into(),
-                    denom: source_denom,
-                },
-                true,
-            )?;
+            // Direct mode fixes the order outright, so quoting it by walking the
+            // book describes a DIFFERENT order than the one that will be submitted.
+            // Size it through the same helper the executor builds the order with.
+            let est = match (op.quantity, op.worst_price) {
+                (Some(q), Some(p)) => orderbook_exec::direct_mode_estimate(
+                    &deps,
+                    &market,
+                    &source_denom,
+                    offer_asset.amount,
+                    q,
+                    p,
+                )?,
+                _ => orderbook_exec::estimate_single_swap_execution(
+                    &deps,
+                    &env.contract.address,
+                    &market,
+                    FPCoin {
+                        amount: offer_asset.amount.into(),
+                        denom: source_denom,
+                    },
+                    true,
+                )?,
+            };
 
             Ok(amm::Asset {
                 info: amm::AssetInfo::NativeToken {
@@ -373,12 +434,25 @@ mod tests {
     fn inj_mock_deps(
     ) -> OwnedDeps<MockStorage, MockApi, MockQuerier<InjectiveQueryWrapper>, InjectiveQueryWrapper>
     {
-        OwnedDeps {
+        let mut deps = OwnedDeps {
             storage: MockStorage::default(),
             api: MockApi::default(),
             querier: MockQuerier::new(&[]),
             custom_query_type: PhantomData,
-        }
+        };
+        // `simulate_route` reads the adapter address to decide whether two assets are
+        // the same asset under adapter identity.
+        crate::state::CONFIG
+            .save(
+                &mut deps.storage,
+                &Config {
+                    admin: Addr::unchecked("inj1admin"),
+                    cw20_adapter_address: Addr::unchecked("inj1adapter"),
+                    fee_collector: Addr::unchecked("inj1collector"),
+                },
+            )
+            .unwrap();
+        deps
     }
 
     /// Build an `amm::PairInfo` binary for the given two assets.
@@ -431,7 +505,7 @@ mod tests {
         let stages = vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: POOL_A_ADDR.to_string(),
                     offer_asset_info: AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -509,13 +583,13 @@ mod tests {
             splits: vec![Split {
                 percent: 100,
                 path: vec![
-                    Operation::AmmSwap(AmmSwapOp {
+                    Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: POOL_A_ADDR.to_string(),
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "inj".to_string(),
                         },
                     }),
-                    Operation::AmmSwap(AmmSwapOp {
+                    Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: POOL_B_ADDR.to_string(),
                         offer_asset_info: AssetInfo::NativeToken {
                             denom: "usdt".to_string(),
@@ -541,24 +615,27 @@ mod tests {
         // A pool address is one fixed pair, so each logical pair needs its own
         // address (the op no longer declares its output asset — it's derived from
         // the pool's `Pair {}`).
-        const POOL_INJ_USDT: &str = "inj1pool0000000000000000000000000injusdt0";
-        const POOL_INJ_AUSD: &str = "inj1pool0000000000000000000000000injausd0";
+        //
+        // NOTE: this used to split stage 2 across a USDT pool and an AUSD pool with
+        // percents of 100 and 100. Both the executor (`MixedAssetsInStage`) and now
+        // the simulator reject that shape — a stage's splits share ONE pile of
+        // assets and their percents must sum to 100 — so the route is now a fan-out
+        // into a common denom followed by a single fan-in, which is what a router
+        // should emit anyway.
+        const POOL_INJ_USDT_A: &str = "inj1pool000000000000000000000000injusdta";
+        const POOL_INJ_USDT_B: &str = "inj1pool000000000000000000000000injusdtb";
         const POOL_USDT_SHROOM: &str = "inj1pool000000000000000000000000usdtshrm";
-        const POOL_AUSD_SHROOM: &str = "inj1pool000000000000000000000000ausdshrm";
 
         let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
 
-        // Mock responses for all 4 swaps
         querier.update_wasm(move |q: &WasmQuery| match q {
             WasmQuery::Smart {
                 contract_addr, msg, ..
             } => {
                 let decoded: amm::QueryMsg = from_json(msg).unwrap();
                 let pair = match contract_addr.as_str() {
-                    POOL_INJ_USDT => (native("inj"), native("usdt")),
-                    POOL_INJ_AUSD => (native("inj"), native("ausd")),
+                    POOL_INJ_USDT_A | POOL_INJ_USDT_B => (native("inj"), native("usdt")),
                     POOL_USDT_SHROOM => (native("usdt"), native("shroom")),
-                    POOL_AUSD_SHROOM => (native("ausd"), native("shroom")),
                     other => panic!("Unexpected query to {}", other),
                 };
                 let offer_asset = match decoded {
@@ -569,12 +646,11 @@ mod tests {
                 };
 
                 let response_amount = match (contract_addr.as_str(), offer_asset.amount.u128()) {
-                    // Stage 1
-                    (POOL_INJ_USDT, 500) => 10000, // 50% of 1000 INJ -> 10000 USDT
-                    (POOL_INJ_AUSD, 500) => 20000, // 50% of 1000 INJ -> 20000 AUSD
-                    // Stage 2 (Totals: 10k USDT, 20k AUSD)
-                    (POOL_USDT_SHROOM, 10000) => 5000, // 10000 USDT -> 5000 SHROOM
-                    (POOL_AUSD_SHROOM, 20000) => 8000, // 20000 AUSD -> 8000 SHROOM
+                    // Stage 1: 1000 INJ split 50/50 -> 10000 + 20000 USDT
+                    (POOL_INJ_USDT_A, 500) => 10000,
+                    (POOL_INJ_USDT_B, 500) => 20000,
+                    // Stage 2: the pooled 30000 USDT -> 15000 SHROOM
+                    (POOL_USDT_SHROOM, 30000) => 15000,
                     _ => panic!(
                         "Unexpected query: {} with amount {}",
                         contract_addr, offer_asset.amount
@@ -592,52 +668,34 @@ mod tests {
         let mut deps = inj_mock_deps();
         deps.querier = querier;
 
+        let inj_split = |pool: &str| Split {
+            percent: 50,
+            path: vec![Operation::AmmSwap(AmmSwapOp {
+                ask_asset_info: None,
+                max_spread: None,
+                pool_address: pool.to_string(),
+                offer_asset_info: AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            })],
+        };
+
         let stages = vec![
-            // Stage 1: INJ -> USDT / AUSD
             Stage {
-                splits: vec![
-                    Split {
-                        percent: 50,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_INJ_USDT.to_string(),
-                            offer_asset_info: AssetInfo::NativeToken {
-                                denom: "inj".to_string(),
-                            },
-                        })],
-                    },
-                    Split {
-                        percent: 50,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_INJ_AUSD.to_string(),
-                            offer_asset_info: AssetInfo::NativeToken {
-                                denom: "inj".to_string(),
-                            },
-                        })],
-                    },
-                ],
+                splits: vec![inj_split(POOL_INJ_USDT_A), inj_split(POOL_INJ_USDT_B)],
             },
-            // Stage 2: USDT / AUSD -> SHROOM
             Stage {
-                splits: vec![
-                    Split {
-                        percent: 100,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_USDT_SHROOM.to_string(),
-                            offer_asset_info: AssetInfo::NativeToken {
-                                denom: "usdt".to_string(),
-                            },
-                        })],
-                    },
-                    Split {
-                        percent: 100,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
-                            pool_address: POOL_AUSD_SHROOM.to_string(),
-                            offer_asset_info: AssetInfo::NativeToken {
-                                denom: "ausd".to_string(),
-                            },
-                        })],
-                    },
-                ],
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        ask_asset_info: None,
+                        max_spread: None,
+                        pool_address: POOL_USDT_SHROOM.to_string(),
+                        offer_asset_info: AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                    })],
+                }],
             },
         ];
 
@@ -649,8 +707,128 @@ mod tests {
         )
         .unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
-        // Final output is the sum of the shroom from both paths
-        assert_eq!(result.output_amount, Uint128::new(5000 + 8000));
+        assert_eq!(result.output_amount, Uint128::new(15000));
+    }
+
+    /// The gate must refuse a stage whose splits do not sum to 100 — the executor
+    /// hands the last split whatever is left over, so any other sum silently means
+    /// something different there than it reads as here.
+    #[test]
+    fn test_simulate_rejects_bad_percentage_sum_on_later_stage() {
+        let deps = inj_mock_deps();
+        let split = |pool: &str, pct: u8| Split {
+            percent: pct,
+            path: vec![Operation::AmmSwap(AmmSwapOp {
+                ask_asset_info: None,
+                max_spread: None,
+                pool_address: pool.to_string(),
+                offer_asset_info: AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            })],
+        };
+        let stages = vec![
+            Stage {
+                splits: vec![split(POOL_A_ADDR, 100)],
+            },
+            // 100 + 100 = 200
+            Stage {
+                splits: vec![split(POOL_A_ADDR, 100), split(POOL_B_ADDR, 100)],
+            },
+        ];
+        let err = simulate_route(
+            deps.as_ref(),
+            mock_env(),
+            stages,
+            Coin::new(1000u128, "inj"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Percentages in a stage must sum to 100"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Two different natives arriving in one stage is `MixedAssetsInStage` in the
+    /// executor; the gate must not quote it as though the splits were independently
+    /// funded.
+    #[test]
+    fn test_simulate_rejects_two_different_natives_in_one_stage() {
+        const POOL_INJ_USDT: &str = "inj1pool0000000000000000000000000injusdt0";
+        const POOL_INJ_AUSD: &str = "inj1pool0000000000000000000000000injausd0";
+
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart {
+                contract_addr, msg, ..
+            } => {
+                let pair = match contract_addr.as_str() {
+                    POOL_INJ_USDT => (native("inj"), native("usdt")),
+                    POOL_INJ_AUSD => (native("inj"), native("ausd")),
+                    other => panic!("Unexpected query to {}", other),
+                };
+                match from_json::<amm::QueryMsg>(msg).unwrap() {
+                    amm::QueryMsg::Pair {} => {
+                        SystemResult::Ok(ContractResult::Ok(pair_binary(pair.0, pair.1)))
+                    }
+                    amm::QueryMsg::Simulation { .. } => {
+                        SystemResult::Ok(ContractResult::Ok(
+                            to_json_binary(&amm::SimulationResponse {
+                                return_amount: Uint128::new(500),
+                                ..Default::default()
+                            })
+                            .unwrap(),
+                        ))
+                    }
+                }
+            }
+            _ => panic!("Unsupported query type"),
+        });
+        let mut deps = inj_mock_deps();
+        deps.querier = querier;
+
+        let split = |pool: &str| Split {
+            percent: 50,
+            path: vec![Operation::AmmSwap(AmmSwapOp {
+                ask_asset_info: None,
+                max_spread: None,
+                pool_address: pool.to_string(),
+                offer_asset_info: AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            })],
+        };
+        // Stage 1 fans INJ out into USDT and AUSD; stage 2 would then receive two
+        // different natives in one pile.
+        let stages = vec![
+            Stage {
+                splits: vec![split(POOL_INJ_USDT), split(POOL_INJ_AUSD)],
+            },
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                        ask_asset_info: None,
+                        max_spread: None,
+                        pool_address: POOL_INJ_USDT.to_string(),
+                        offer_asset_info: AssetInfo::NativeToken {
+                            denom: "usdt".to_string(),
+                        },
+                    })],
+                }],
+            },
+        ];
+        let err = simulate_route(
+            deps.as_ref(),
+            mock_env(),
+            stages,
+            Coin::new(1000u128, "inj"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("two different native assets"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

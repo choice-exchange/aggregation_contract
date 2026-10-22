@@ -32,7 +32,10 @@ use injective_test_tube::{
     },
     Account, Bank, Exchange, Gov, InjectiveTestApp, Module, SigningAccount, Wasm,
 };
-use mock_swap::{AssetInfo, InstantiateMsg as MockInstantiateMsg, ProtocolType, SwapConfig};
+use mock_swap::{
+    AssetInfo, ExecuteMsg as MockExecuteMsg, InstantiateMsg as MockInstantiateMsg, ProtocolType,
+    SwapConfig,
+};
 use prost::Message as _;
 
 // ---------------------------------------------------------------------------
@@ -601,7 +604,7 @@ fn test_aggregate_swap_success() {
             splits: vec![
                 Split {
                     percent: 33,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_1_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -610,7 +613,7 @@ fn test_aggregate_swap_success() {
                 },
                 Split {
                     percent: 42,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_2_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -698,7 +701,7 @@ fn test_aggregator_swap_event_emitted() {
             splits: vec![
                 Split {
                     percent: 33,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_1_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -707,7 +710,7 @@ fn test_aggregator_swap_event_emitted() {
                 },
                 Split {
                     percent: 42,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_2_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -917,7 +920,7 @@ fn test_multi_stage_aggregate_swap_success() {
                 splits: vec![
                     Split {
                         percent: 49,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                        path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                             pool_address: env.mock_amm_1_addr.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
@@ -926,7 +929,7 @@ fn test_multi_stage_aggregate_swap_success() {
                     },
                     Split {
                         percent: 51,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                        path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                             pool_address: env.mock_amm_2_addr.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
@@ -985,15 +988,20 @@ fn test_multi_stage_aggregate_swap_success() {
         })
         .unwrap();
 
-    // The user's final balance should be their initial balance minus the input amount, plus the swap output.
-    // Initial: 1_000_000_000_000 (from setup)
-    // Input:   1_000_000_000_000
-    // Output:  1_510_000_000_000
-    // Expected Final: 1_000_000_000_000 - 1_000_000_000_000 + 1_510_000_000_000 = 1_510_000_000_000
-    let initial_user_balance = 1_000_000_000_000u128; // Assuming this is the initial balance from setup()
+    // The user gets the tracked output PLUS the part of their 1000 USDT the buy hop
+    // never spent: sizing reserves `input / (1 + gross atomic fee)` and then floors
+    // the derived base quantity to the 0.001 INJ tick, so ~1.0037 USDT is committed
+    // as margin but never consumed. The buy fills entirely at the best ask (10),
+    // i.e. at exactly the price the order was placed at, so there is NO price
+    // improvement and the protocol takes nothing — see
+    // `test_ob_buy_unspent_input_returns_to_user`. That remainder used to be booked
+    // as protocol revenue and paid to the fee collector.
+    let unspent_buy_input = 1_003_750u128;
+    let initial_user_balance = 1_000_000_000_000u128; // from setup()
     let expected_final_balance = Uint128::new(initial_user_balance)
         - Uint128::try_from(initial_funds.amount).unwrap()
-        + Uint128::from_str(expected_final_amount).unwrap();
+        + Uint128::from_str(expected_final_amount).unwrap()
+        + Uint128::new(unspent_buy_input);
 
     // Extract the amount from the query response
     let final_balance = balance_response.balance.unwrap();
@@ -1002,6 +1010,20 @@ fn test_multi_stage_aggregate_swap_success() {
     // Assert the final balance is correct
     assert_eq!(final_amount, expected_final_balance);
     assert_eq!(final_balance.denom, "usdt");
+
+    // ...and none of it was diverted to the fee collector.
+    assert_eq!(
+        bank.query_balance(&QueryBalanceRequest {
+            address: env.fee_collector.address(),
+            denom: "usdt".to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount)
+        .unwrap_or_default(),
+        "0",
+        "a fill at the order's own price yields no price improvement to carve"
+    );
 }
 
 pub struct ConversionTestSetup {
@@ -1431,7 +1453,7 @@ fn test_full_normalization_route() {
                     },
                     Split {
                         percent: 50,
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                        path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
@@ -1444,7 +1466,7 @@ fn test_full_normalization_route() {
             Stage {
                 splits: vec![Split {
                     percent: 100,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                         offer_asset_info: amm::AssetInfo::Token {
                             contract_addr: setup.shroom_cw20_addr.clone(),
@@ -1512,7 +1534,7 @@ fn test_multi_stage_with_final_normalization() {
                 splits: vec![
                     Split {
                         percent: 10, // 10% to CW20 SHROOM
-                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                        path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                             offer_asset_info: amm::AssetInfo::NativeToken {
                                 denom: "inj".to_string(),
@@ -1605,7 +1627,7 @@ fn test_cw20_entry_point_swap_success() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                     offer_asset_info: amm::AssetInfo::Token {
                         contract_addr: setup.shroom_cw20_addr.clone(),
@@ -1679,7 +1701,7 @@ fn test_reverse_normalization_route() {
             Stage {
                 splits: vec![Split {
                     percent: 100,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -1763,7 +1785,7 @@ fn test_failure_if_minimum_receive_not_met() {
             splits: vec![
                 Split {
                     percent: 33,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_1_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -1772,7 +1794,7 @@ fn test_failure_if_minimum_receive_not_met() {
                 },
                 Split {
                     percent: 42,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_2_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -1852,7 +1874,7 @@ fn test_failure_on_invalid_percentage_sum() {
             splits: vec![
                 Split {
                     percent: 50, // 50%
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_1_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -1861,7 +1883,7 @@ fn test_failure_on_invalid_percentage_sum() {
                 },
                 Split {
                     percent: 49, // + 49% = 99% (Invalid!)
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_2_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -1938,7 +1960,7 @@ fn test_mixed_input_unified_output_reconciliation() {
     let stage1 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
@@ -1963,7 +1985,7 @@ fn test_mixed_input_unified_output_reconciliation() {
             Split {
                 // 40% requires CW20 SHROOM
                 percent: 40,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
                 })],
@@ -2068,7 +2090,7 @@ fn test_cw20_input_with_initial_reconciliation() {
             Split {
                 // 30% requires CW20 SHROOM
                 percent: 30,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
                 })],
@@ -2169,7 +2191,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
             Split {
                 // 40% of INJ goes to create CW20 SHROOM
                 percent: 40,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                     offer_asset_info: inj_info.clone(),
                 })],
@@ -2193,7 +2215,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
             Split {
                 // 75% of total value requires CW20 SHROOM
                 percent: 75,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
                     offer_asset_info: cw20_shroom_info.clone(),
                 })],
@@ -2266,7 +2288,7 @@ fn test_final_output_is_cw20_token() {
     let stage1 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
                 offer_asset_info: inj_info.clone(),
             })],
@@ -2276,7 +2298,7 @@ fn test_final_output_is_cw20_token() {
     let stage2 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
             })],
@@ -2389,7 +2411,7 @@ fn test_native_input_with_initial_cw20_requirement() {
     let stage1 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: setup.mock_cw20_shroom_to_cw20_sai_amm.clone(),
                 offer_asset_info: cw20_shroom_info.clone(),
             })],
@@ -2448,7 +2470,7 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
         splits: vec![
             Split {
                 percent: 50,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: env.mock_amm_1_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -2457,7 +2479,7 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
             },
             Split {
                 percent: 50,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: env.mock_amm_2_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -2469,7 +2491,9 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
-        minimum_receive: None, // We don't care about the output amount, only that it doesn't fail.
+        // A positive floor is mandatory. The 1-wei route produces 0 output, so it
+        // must fail *gracefully* (MinimumReceiveNotMet) — not panic — and roll back.
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     let initial_usdt_balance = bank
@@ -2485,14 +2509,12 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
     // Execute the transaction with 1 wei of INJ.
     let res = wasm.execute(&env.aggregator_addr, &msg, &[Coin::new(1u128, "inj")], user);
     assert!(
-        res.is_ok(),
-        "Execution with a zero-amount split failed: {:?}",
-        res.unwrap_err()
+        res.is_err(),
+        "A route that produces zero output must fail gracefully, not succeed"
     );
 
     // --- ASSERT FINAL BALANCE ---
-    // Due to the mock pool's decimal conversion (18 for INJ, 6 for USDT), swapping
-    // just 1 wei of INJ will result in 0 USDT. Therefore, the user's balance should not change.
+    // The route produced 0 USDT and reverted, so the user's balance is unchanged.
     let final_usdt_balance_response = bank
         .query_balance(&QueryBalanceRequest {
             address: user.address(),
@@ -2521,7 +2543,7 @@ fn test_stage_with_single_hundred_percent_split() {
     let stage1 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: env.mock_amm_1_addr.clone(),
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
@@ -2629,7 +2651,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
             Split {
                 // This split is valid.
                 percent: 50,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: env.mock_amm_1_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -2639,7 +2661,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
             Split {
                 // THIS SPLIT IS INTENTIONALLY INVALID.
                 percent: 50,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: "inj1invalidcontractaddressxxxxxxxxxxxxxx".to_string(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -2651,7 +2673,8 @@ fn test_intermediate_swap_failure_reverts_transaction() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
-        minimum_receive: None, // Not relevant, as the transaction should fail.
+        // Positive floor required; the tx fails later at the invalid intermediate hop.
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     // Execute the transaction
@@ -2721,7 +2744,7 @@ fn test_fee_collection_on_single_swap() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: fee_pool_address.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -2851,7 +2874,7 @@ fn test_fee_collection_on_cw20_output() {
     let stage1 = Stage {
         splits: vec![Split {
             percent: 100,
-            path: vec![Operation::AmmSwap(AmmSwapOp {
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                 pool_address: fee_pool_address,
                 offer_asset_info: amm::AssetInfo::NativeToken {
                     denom: "inj".to_string(),
@@ -2993,7 +3016,7 @@ fn test_full_admin_fee_lifecycle() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: fee_pool_address.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -3001,7 +3024,7 @@ fn test_full_admin_fee_lifecycle() {
                 })],
             }],
         }],
-        minimum_receive: None,
+        minimum_receive: Some(Uint128::new(1)),
     };
     wasm.execute(
         &env.aggregator_addr,
@@ -3141,7 +3164,7 @@ fn test_multi_split_with_mixed_fees() {
             Split {
                 // This split goes to the TAXED pool
                 percent: 40,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: taxed_pool,
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -3151,7 +3174,7 @@ fn test_multi_split_with_mixed_fees() {
             Split {
                 // This split goes to the UNTAXED pool
                 percent: 60,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: untaxed_pool,
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -3253,7 +3276,7 @@ fn test_fee_truncates_to_zero() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: fee_pool_address,
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -3261,7 +3284,7 @@ fn test_fee_truncates_to_zero() {
                 })],
             }],
         }],
-        minimum_receive: None,
+        minimum_receive: Some(Uint128::new(1)),
     };
 
     // Execute the transaction
@@ -3466,7 +3489,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
     // The 3-hop path with a required conversion between hop 1 and 2
     let path = vec![
         // Hop 1: INJ -> CW20 SHROOM
-        Operation::AmmSwap(AmmSwapOp {
+        Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
             pool_address: setup.mock_inj_to_cw20_shroom_amm.clone(),
             offer_asset_info: inj_info.clone(),
         }),
@@ -3918,7 +3941,7 @@ fn test_clmm_single_hop_swap() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None, slippage_bps: None,
                     pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -3985,7 +4008,7 @@ fn test_clmm_single_hop_swap_direct_mode() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None, slippage_bps: None,
                     pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -4054,7 +4077,7 @@ fn test_clmm_mixed_with_amm_split() {
             splits: vec![
                 Split {
                     percent: 50,
-                    path: vec![Operation::AmmSwap(AmmSwapOp {
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                         pool_address: env.mock_amm_1_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -4063,7 +4086,7 @@ fn test_clmm_mixed_with_amm_split() {
                 },
                 Split {
                     percent: 50,
-                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None, slippage_bps: None,
                         pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -4136,7 +4159,7 @@ fn test_clmm_multi_hop() {
             Stage {
                 splits: vec![Split {
                     percent: 100,
-                    path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                    path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None, slippage_bps: None,
                         pool_address: env.mock_clmm_inj_usdt_addr.clone(),
                         offer_asset_info: amm::AssetInfo::NativeToken {
                             denom: "inj".to_string(),
@@ -4205,6 +4228,10 @@ struct FlashEnv {
     amm_usdt_to_inj: String,
     /// Cycle leg 2: 1 INJ -> 11 USDT (sell INJ above cost — the arb edge).
     amm_inj_to_usdt: String,
+    /// Real INJ/USDT spot market, so a flash cycle can open on an orderbook BUY
+    /// (the only hop that produces a price-improvement refund).
+    market_inj_usdt: String,
+    fee_collector_addr: String,
 }
 
 fn setup_for_flash_test() -> FlashEnv {
@@ -4223,6 +4250,9 @@ fn setup_for_flash_test() -> FlashEnv {
         .init_account(&[Coin::new(1_000_000_000_000_000_000_000u128, "inj")])
         .unwrap();
     let fee_collector = app.init_account(&[]).unwrap();
+
+    // Spot-market launch prerequisite (mirrors `setup()`).
+    register_min_notionals(&app, &admin, &["inj", "usdt"]);
 
     let wasm = Wasm::new(&app);
     let aggregator_code_id = wasm
@@ -4381,6 +4411,25 @@ fn setup_for_flash_test() -> FlashEnv {
         .unwrap();
     }
 
+    // Same book shape as `setup()`: asks 10/11/12, bids 9/8/7, 1000 INJ a level.
+    let exchange = Exchange::new(&app);
+    let market_inj_usdt = launch_spot_market(&exchange, &admin, "INJ/USDT", "inj", "usdt", 18, 6);
+    let maker = app
+        .init_account(&[
+            Coin::new(micro(10_000, 18), "inj"),
+            Coin::new(micro(10_000_000, 6), "usdt"),
+        ])
+        .unwrap();
+    for (px, qty) in [(10u128, 1000u128), (11, 1000), (12, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 2, px, qty, 18, 6); // asks
+    }
+    for (px, qty) in [(9u128, 1000u128), (8, 1000), (7, 1000)] {
+        limit_order(&exchange, &maker, &market_inj_usdt, 1, px, qty, 18, 6); // bids
+    }
+    app.increase_time(1);
+
+    let fee_collector_addr = fee_collector.address();
+
     FlashEnv {
         app,
         admin,
@@ -4389,6 +4438,8 @@ fn setup_for_flash_test() -> FlashEnv {
         flash_pool_addr,
         amm_usdt_to_inj,
         amm_inj_to_usdt,
+        market_inj_usdt,
+        fee_collector_addr,
     }
 }
 
@@ -4398,7 +4449,7 @@ fn flash_cycle_stages(env: &FlashEnv) -> Vec<Stage> {
         Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: env.amm_usdt_to_inj.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
@@ -4409,7 +4460,7 @@ fn flash_cycle_stages(env: &FlashEnv) -> Vec<Stage> {
         Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::AmmSwap(AmmSwapOp {
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
                     pool_address: env.amm_inj_to_usdt.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "inj".to_string(),
@@ -4495,6 +4546,106 @@ fn test_flash_route_happy_path() {
 }
 
 #[test]
+fn test_flash_route_credits_ob_buy_surplus_as_profit() {
+    // REGRESSION. A flash cycle opening on an orderbook BUY is sized at
+    // `worst_price`, so most of its edge comes back as the price-improvement REFUND
+    // rather than as tracked output. `finalize_route` used to measure only the
+    // tracked amount against `repay + min_profit`, so a genuinely profitable cycle
+    // reverted with FlashProfitNotMet — and the refund was then carved off to the
+    // fee collector rather than being the caller's arb profit.
+    //
+    // Numbers: borrow 14k USDT; the buy crosses asks 10 and 11, so it is sized at
+    // 11 and fills ~1000 INJ at 10 — the refund is ~1k USDT. The AMM leg sells that
+    // INJ back at 11, returning ~13.99k against a 14.042k repayment. The cycle is
+    // therefore profitable ONLY once the refund counts, which is the point.
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    let user_usdt_before = usdt_balance(&env.app, &env.user.address());
+    let collector_usdt_before = usdt_balance(&env.app, &env.fee_collector_addr);
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(14_000_000_000),
+        stages: vec![
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "inj".to_string(),
+                        quantity: None,
+                        worst_price: None,
+                    })],
+                }],
+            },
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
+                        pool_address: env.amm_inj_to_usdt.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                }],
+            },
+        ],
+        min_profit: Uint128::new(1),
+    };
+
+    let res = wasm.execute(&env.aggregator_addr, &msg, &[], &env.user);
+    assert!(
+        res.is_ok(),
+        "cycle should clear its floor once the buy refund is credited: {:?}",
+        res.unwrap_err()
+    );
+
+    let response = res.unwrap();
+    let done = response
+        .events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "flash_route_complete")
+        })
+        .expect("missing flash_route_complete event");
+    let profit: u128 = done
+        .attributes
+        .iter()
+        .find(|a| a.key == "profit")
+        .unwrap()
+        .value
+        .parse()
+        .unwrap();
+    assert!(profit > 0, "flash cycle should report a positive profit");
+
+    // The whole profit reached the caller...
+    assert!(
+        usdt_balance(&env.app, &env.user.address()) - user_usdt_before >= profit,
+        "caller should receive at least the reported profit"
+    );
+    // ...and NONE of it was carved off: a flash caller is an allowlisted signer
+    // running their own capital, so the OB surplus is arb profit, not revenue.
+    assert_eq!(
+        usdt_balance(&env.app, &env.fee_collector_addr),
+        collector_usdt_before,
+        "a flash route must take no protocol carve on the orderbook surplus"
+    );
+    // And nothing lingers.
+    assert_eq!(
+        usdt_balance(&env.app, &env.aggregator_addr),
+        0,
+        "aggregator must retain no USDT after a flash cycle"
+    );
+}
+
+#[test]
 fn test_flash_route_below_min_profit_reverts() {
     let env = setup_for_flash_test();
     let wasm = Wasm::new(&env.app);
@@ -4543,7 +4694,7 @@ fn test_flash_route_cycle_through_flash_pool_rejected() {
         stages: vec![Stage {
             splits: vec![Split {
                 percent: 100,
-                path: vec![Operation::ClmmSwap(ClmmSwapOp {
+                path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None, slippage_bps: None,
                     pool_address: env.flash_pool_addr.clone(),
                     offer_asset_info: amm::AssetInfo::NativeToken {
                         denom: "usdt".to_string(),
@@ -4735,4 +4886,1046 @@ fn test_flash_unrestricted_bypasses_signer_gate() {
     assert!(wasm
         .execute(&env.aggregator_addr, &msg, &[], &outsider)
         .is_ok());
+}
+
+// ===========================================================================
+// Fund-safety invariant tests (v2.0.1 hardening; extended in v2.1.0 — closed-cycle surplus)
+//
+// Core guarantee: a SUCCESSFUL route never leaves user funds stranded in the
+// contract. Orderbook buy-hop price-improvement surplus -> fee collector;
+// every other residue (unfilled, dropped, un-spent, refunded) -> the user;
+// and `minimum_receive` must be > 0.
+// ===========================================================================
+
+#[test]
+fn test_zero_minimum_receive_is_rejected() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let route = vec![Stage {
+        splits: vec![Split {
+            percent: 100,
+            path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
+                pool_address: env.mock_amm_1_addr.clone(),
+                offer_asset_info: amm::AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+            })],
+        }],
+    }];
+
+    // None (defaults to zero) is rejected.
+    let res_none = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: route.clone(),
+            minimum_receive: None,
+        },
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(res_none.is_err(), "minimum_receive=None must be rejected");
+    assert!(
+        res_none.unwrap_err().to_string().contains("minimum_receive"),
+        "error should name minimum_receive"
+    );
+
+    // Explicit zero is rejected too.
+    let res_zero = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: route,
+            minimum_receive: Some(Uint128::zero()),
+        },
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
+        &env.user,
+    );
+    assert!(res_zero.is_err(), "minimum_receive=0 must be rejected");
+}
+
+#[test]
+fn test_orderbook_surplus_to_fee_collector_and_contract_drains() {
+    // A multi-level orderbook BUY (sized at the worst consumed price) leaves a
+    // price-improvement refund in the contract. The hardening routes that surplus
+    // to the fee collector and sweeps the contract to zero — the user still gets
+    // the full INJ output, and NO funds linger in the aggregator.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let bal = |addr: &str, denom: &str| -> u128 {
+        bank.query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: denom.to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount.parse::<u128>().unwrap())
+        .unwrap_or(0)
+    };
+
+    let collector_usdt_before = bal(&env.fee_collector.address(), "usdt");
+    let user_inj_before = bal(&env.user.address(), "inj");
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(14_000_000_000u128, "usdt")], // crosses ask levels 10 & 11
+        &env.user,
+    );
+    assert!(res.is_ok(), "orderbook buy should succeed: {:?}", res.unwrap_err());
+
+    // 1. Contract is drained — no USDT (input/surplus) and no INJ (output) left.
+    assert_eq!(
+        bal(&env.aggregator_addr, "usdt"),
+        0,
+        "aggregator must retain no USDT after a successful route"
+    );
+    assert_eq!(
+        bal(&env.aggregator_addr, "inj"),
+        0,
+        "aggregator must retain no INJ after a successful route"
+    );
+
+    // 2. The price-improvement surplus was captured as protocol revenue.
+    let collector_gain = bal(&env.fee_collector.address(), "usdt") - collector_usdt_before;
+    assert!(
+        collector_gain > 0,
+        "fee collector should receive the orderbook price-improvement surplus"
+    );
+
+    // 3. The user actually received INJ output.
+    assert!(
+        bal(&env.user.address(), "inj") > user_inj_before,
+        "user should receive INJ output"
+    );
+}
+
+#[test]
+fn test_closed_cycle_ob_buy_surplus_not_stranded() {
+    // REGRESSION. The orderbook BUY refund is accrued in that hop's OFFER denom. On
+    // a CLOSED cycle (usdt -> buy inj -> sell inj -> usdt) the offer denom is ALSO
+    // the route's final asset, and `build_residue_sweep` used to skip the final
+    // asset wholesale — so the surplus was paid to nobody and simply accumulated in
+    // the contract until an EmergencyWithdraw.
+    //
+    // `test_orderbook_surplus_to_fee_collector_and_contract_drains` covers only the
+    // OPEN route (usdt -> inj), where offer != final and the sweep pays out
+    // normally. That is exactly why this went unnoticed.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let bal = |addr: &str, denom: &str| -> u128 {
+        bank.query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: denom.to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount.parse::<u128>().unwrap())
+        .unwrap_or(0)
+    };
+
+    let collector_usdt_before = bal(&env.fee_collector.address(), "usdt");
+
+    let ob = |target: &str| Operation::OrderbookSwap(OrderbookSwapOp {
+        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+        target_denom: target.to_string(),
+        quantity: None,
+        worst_price: None,
+    });
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![ob("inj")],
+                }],
+            },
+            Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![ob("usdt")],
+                }],
+            },
+        ],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(14_000_000_000u128, "usdt")], // crosses ask levels 10 & 11
+        &env.user,
+    );
+    assert!(
+        res.is_ok(),
+        "closed cycle should succeed: {:?}",
+        res.unwrap_err()
+    );
+
+    // The invariant that was broken: a successful route leaves nothing behind.
+    assert_eq!(
+        bal(&env.aggregator_addr, "usdt"),
+        0,
+        "buy-hop surplus was stranded in the contract (final-asset denom)"
+    );
+    assert_eq!(
+        bal(&env.aggregator_addr, "inj"),
+        0,
+        "aggregator must retain no INJ"
+    );
+
+    // Non-flash route, so the surplus is protocol revenue and must actually arrive
+    // even though it is denominated in the final asset.
+    assert!(
+        bal(&env.fee_collector.address(), "usdt") > collector_usdt_before,
+        "fee collector should receive the surplus on a closed cycle too"
+    );
+}
+
+#[test]
+fn test_amm_route_leaves_no_residue() {
+    // A plain AMM swap must drain the contract completely: no offer (INJ) and no
+    // output (USDT) lingering after finalize.
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    let bal = |addr: &str, denom: &str| -> u128 {
+        bank.query_balance(&QueryBalanceRequest {
+            address: addr.to_string(),
+            denom: denom.to_string(),
+        })
+        .unwrap()
+        .balance
+        .map(|c| c.amount.parse::<u128>().unwrap())
+        .unwrap_or(0)
+    };
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None, max_spread: None,
+                    pool_address: env.mock_amm_1_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &msg,
+        &[Coin::new(1_000_000_000_000_000_000u128, "inj")], // 1 INJ
+        &env.user,
+    );
+    assert!(res.is_ok(), "amm swap should succeed: {:?}", res.unwrap_err());
+
+    assert_eq!(bal(&env.aggregator_addr, "inj"), 0, "no INJ should linger");
+    assert_eq!(bal(&env.aggregator_addr, "usdt"), 0, "no USDT should linger");
+}
+
+// ===========================================================================
+// FUND-SAFETY / GATE-PARITY REGRESSIONS (audit 2026-07-30)
+//
+// Each of these reproduced a defect found in the security review and now pins the
+// fix. Every one FAILS on the pre-fix tree, with the real chain error quoted in
+// its doc comment.
+// ===========================================================================
+
+/// Bank balance helper shared by the audit PoCs.
+fn regression_bal(bank: &Bank<InjectiveTestApp>, addr: &str, denom: &str) -> u128 {
+    bank.query_balance(&QueryBalanceRequest {
+        address: addr.to_string(),
+        denom: denom.to_string(),
+    })
+    .unwrap()
+    .balance
+    .map(|c| c.amount.parse::<u128>().unwrap())
+    .unwrap_or(0)
+}
+
+/// FINDING 1 — a `FEE_MAP` fee charged on a NON-FINAL stage is disbursed twice.
+///
+/// `handle_swap_reply` appends the fee transfer AFTER `proceed_to_next_step`, so
+/// the rest of the route (including `finalize_route` and its residue sweep) runs
+/// first. The sweep sees the still-unsent fee as residue in a snapshotted denom
+/// and pays it to the USER; the queued fee transfer then finds an empty balance
+/// and reverts the whole transaction.
+///
+/// FEE_MAP is empty on both mainnet instances today, which is the only reason
+/// this has not been hit: the first `SetFee` on any pool used mid-route bricks
+/// every multi-stage route through it.
+#[test]
+fn test_fee_on_non_final_stage_is_paid_once_to_collector() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // A second AMM so the route has a real stage 2: USDT -> INJ at 0.05.
+    let mock_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+    let amm_usdt_inj = wasm
+        .instantiate(
+            mock_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    rate: "0.05".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,
+                    output_decimals: 18,
+                },
+            },
+            Some(&env.admin.address()),
+            Some("mock-amm-usdt-inj"),
+            &[],
+            &env.admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    bank.send(
+        MsgSend {
+            from_address: env.admin.address(),
+            to_address: amm_usdt_inj.clone(),
+            amount: vec![ProtoCoin {
+                denom: "inj".to_string(),
+                amount: micro(1_000_000, 18).to_string(),
+            }],
+        },
+        &env.admin,
+    )
+    .unwrap();
+
+    // INJ -> (AMM1, 18->6, rate 10) -> USDT -> (AMM2, 6->18, rate 0.05) -> INJ
+    let route = vec![
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None,
+                    max_spread: None,
+                    pool_address: env.mock_amm_1_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                })],
+            }],
+        },
+        Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None,
+                    max_spread: None,
+                    pool_address: amm_usdt_inj.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                })],
+            }],
+        },
+    ];
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: route,
+        minimum_receive: Some(Uint128::new(1)),
+    };
+    let funds = [Coin::new(10_000_000_000_000_000_000u128, "inj")]; // 10 INJ
+
+    // CONTROL: with no fee configured the route works.
+    let control = wasm.execute(&env.aggregator_addr, &msg, &funds, &env.user);
+    assert!(
+        control.is_ok(),
+        "control (no fee) route should succeed: {:?}",
+        control.unwrap_err()
+    );
+
+    // Now the admin sets a 1% fee on the STAGE-1 pool. Nothing else changes.
+    wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::SetFee {
+            pool_address: env.mock_amm_1_addr.clone(),
+            fee_fraction: Decimal::from_str("0.01").unwrap(),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    let collector_before = regression_bal(&bank, &env.fee_collector.address(), "usdt");
+    let res = wasm.execute(&env.aggregator_addr, &msg, &funds, &env.user);
+
+    assert!(
+        res.is_ok(),
+        "FINDING 1: the identical route reverts once a mid-route pool carries a \
+         FEE_MAP fee — the residue sweep pays the pending fee to the user and the \
+         queued fee transfer then has nothing left to send. Error: {:?}",
+        res.as_ref().unwrap_err()
+    );
+    assert_eq!(
+        regression_bal(&bank, &env.fee_collector.address(), "usdt") - collector_before,
+        1_000_000,
+        "FINDING 1: the fee collector must receive the 1% (1 USDT of the 100 USDT \
+         stage-1 output), not the user"
+    );
+}
+
+/// FINDING 2 — `pool_address` is unconstrained and replies are trusted from
+/// events, so ANY caller can drain the contract's whole balance of ANY denom.
+///
+/// `parse_amount_from_swap_reply` / `parse_ask_asset_from_events` read
+/// `return_amount` + `ask_asset` out of the submessage's wasm events. A contract
+/// the attacker wrote can emit both while transferring nothing; `finalize_route`
+/// then pays that fabricated amount out of the aggregator's real balance.
+/// `minimum_receive` does not contain it — the attacker sets it to 1.
+#[test]
+fn test_hostile_pool_cannot_drain_contract_balance() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // The aggregator holds an idle balance. (Mainnet A holds 0.0530 INJ + dust,
+    // mainnet B 0.0116 INJ, as of 2026-07-30.)
+    let stranded = 1_000_000u128; // 1 USDT
+    bank.send(
+        MsgSend {
+            from_address: env.admin.address(),
+            to_address: env.aggregator_addr.clone(),
+            amount: vec![ProtoCoin {
+                denom: "usdt".to_string(),
+                amount: stranded.to_string(),
+            }],
+        },
+        &env.admin,
+    )
+    .unwrap();
+    assert_eq!(regression_bal(&bank, &env.aggregator_addr, "usdt"), stranded);
+
+    // An unrelated attacker deploys their own "pool". No allowlist stops this.
+    let attacker = env
+        .app
+        .init_account(&[Coin::new(10_000_000_000_000_000_000u128, "inj")])
+        .unwrap();
+    let mock_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, &attacker)
+        .unwrap()
+        .data
+        .code_id;
+    let hostile = wasm
+        .instantiate(
+            mock_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "1.0".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 18,
+                    output_decimals: 6,
+                },
+            },
+            Some(&attacker.address()),
+            Some("hostile-pool"),
+            &[],
+            &attacker,
+        )
+        .unwrap()
+        .data
+        .address;
+    // It will claim a 1 USDT output and send nothing.
+    wasm.execute(
+        &hostile,
+        &MockExecuteMsg::SetPhantom {
+            amount: Uint128::new(stranded),
+            denom: "usdt".to_string(),
+        },
+        &[],
+        &attacker,
+    )
+    .unwrap();
+
+    let attacker_before = regression_bal(&bank, &attacker.address(), "usdt");
+    let agg_before = regression_bal(&bank, &env.aggregator_addr, "usdt");
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: vec![Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::AmmSwap(AmmSwapOp { ask_asset_info: None,
+                        max_spread: None,
+                        pool_address: hostile.clone(),
+                        offer_asset_info: amm::AssetInfo::NativeToken {
+                            denom: "inj".to_string(),
+                        },
+                    })],
+                }],
+            }],
+            minimum_receive: Some(Uint128::new(1)),
+        },
+        &[Coin::new(1u128, "inj")], // 1 wei of INJ is the entire cost of the attack
+        &attacker,
+    );
+
+    let err = res.expect_err(
+        "a pool that transfers nothing must not produce a payable route output",
+    );
+    // The fabricated credit is bounded to what the route actually brought in
+    // (nothing), so the hop contributes zero and the route dies at its own
+    // `minimum_receive` floor rather than paying out the contract's balance.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Minimum receive amount not met") || msg.contains("did not deliver"),
+        "expected the route to be rejected as unbacked, got: {err}"
+    );
+    assert_eq!(
+        regression_bal(&bank, &attacker.address(), "usdt"),
+        attacker_before,
+        "attacker must gain nothing"
+    );
+    assert_eq!(
+        regression_bal(&bank, &env.aggregator_addr, "usdt"),
+        agg_before,
+        "the aggregator's idle balance must be untouched"
+    );
+}
+
+/// FINDING 3 — a sub-tick (or sub-`min_notional`) orderbook split is a graceful
+/// zero-value hop in `SimulateRoute` but a HARD REVERT of the entire route in
+/// execution.
+///
+/// The estimators return `no_fill_estimate` (0 output); `build_swap_order_msg`
+/// returns `Ok(None)`, which `create_swap_cosmos_msg` turns into
+/// `ContractError::AmountTooSmall` and `?`-propagates out of the whole route —
+/// unlike the CLMM zero-quote path, which completes gracefully. So the mandatory
+/// pre-fire gate clears a route the chain then refuses.
+#[test]
+fn test_subtick_orderbook_split_is_a_zero_value_path_not_a_revert() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // 0.05 INJ in. Split 0 gets 1% = 5e14 wei, below the market's 0.001 INJ
+    // (1e15) quantity tick, so it floors to a zero-quantity order.
+    let amount_in = 50_000_000_000_000_000u128; // 0.05 INJ
+    let stages = vec![Stage {
+        splits: vec![
+            Split {
+                percent: 1,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                })],
+            },
+            Split {
+                percent: 99,
+                // CLMM rather than AMM only because `mock_swap` implements the
+                // CLMM `Quote {}` query but not the legacy pair's `Simulation {}`.
+                path: vec![Operation::ClmmSwap(ClmmSwapOp { ask_asset_info: None,
+                    pool_address: env.mock_clmm_inj_usdt_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "inj".to_string(),
+                    },
+                    minimum_amount_out: None,
+                    slippage_bps: None,
+                })],
+            },
+        ],
+    }];
+
+    // The gate says this route is fine and quotes a positive output.
+    let sim: SimulateRouteResponse = wasm
+        .query(
+            &env.aggregator_addr,
+            &QueryMsg::SimulateRoute {
+                stages: stages.clone(),
+                amount_in: Coin::new(amount_in, "inj"),
+            },
+        )
+        .unwrap();
+    assert!(
+        !sim.output_amount.is_zero(),
+        "precondition: SimulateRoute should quote a positive output (got {})",
+        sim.output_amount
+    );
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages,
+            minimum_receive: Some(Uint128::new(1)),
+        },
+        &[Coin::new(amount_in, "inj")],
+        &env.user,
+    );
+
+    assert!(
+        res.is_ok(),
+        "SimulateRoute quoted {} but execution reverted the whole route instead of \
+         completing the dust split as a zero-value path: {:?}",
+        sim.output_amount,
+        res.as_ref().unwrap_err()
+    );
+
+    // The dust split's allocation was never spent, so it must come back — and the
+    // contract must still drain completely.
+    let bank = Bank::new(&env.app);
+    assert_eq!(
+        regression_bal(&bank, &env.aggregator_addr, "inj"),
+        0,
+        "no INJ should linger after a skipped split"
+    );
+    assert_eq!(
+        regression_bal(&bank, &env.aggregator_addr, "usdt"),
+        0,
+        "no USDT should linger"
+    );
+}
+
+/// FINDING 5 — on an orderbook BUY, the quantity-tick flooring remainder (input
+/// that was never even committed as order margin) is booked as protocol revenue
+/// and paid to the FEE COLLECTOR, not returned to the user.
+///
+/// `ob_buy_surplus` computes the user's share as `reserved * (order_qty -
+/// filled)/order_qty`, which is exactly ZERO whenever the order fills completely.
+/// Everything left over — price improvement AND the pre-order flooring loss —
+/// goes to the collector. The docs state unfilled remainders return to the user.
+#[test]
+fn test_ob_buy_unspent_input_returns_to_user() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+
+    // Buy INJ with USDT on the seeded book (best ask 10 USDT/INJ, 0.001 INJ tick).
+    // A deliberately "awkward" quote amount so the derived base quantity does not
+    // land on a tick boundary.
+    let amount_in = 1_000_999_999u128; // 1000.999999 USDT
+    let collector_before = regression_bal(&bank, &env.fee_collector.address(), "usdt");
+    let user_before = regression_bal(&bank, &env.user.address(), "usdt");
+
+    let res = wasm.execute(
+        &env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: vec![Stage {
+                splits: vec![Split {
+                    percent: 100,
+                    path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                        market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                        target_denom: "inj".to_string(),
+                        quantity: None,
+                        worst_price: None,
+                    })],
+                }],
+            }],
+            minimum_receive: Some(Uint128::new(1)),
+        },
+        &[Coin::new(amount_in, "usdt")],
+        &env.user,
+    );
+    assert!(res.is_ok(), "buy hop should fill: {:?}", res.unwrap_err());
+
+    let to_collector = regression_bal(&bank, &env.fee_collector.address(), "usdt") - collector_before;
+    let refunded_to_user = regression_bal(&bank, &env.user.address(), "usdt") + amount_in - user_before;
+
+    println!(
+        "audit: USDT to fee collector = {to_collector}, USDT refunded to user = {refunded_to_user}"
+    );
+    assert_eq!(
+        to_collector, 0,
+        "FINDING 5: {to_collector} atomic USDT of the user's unspent input was \
+         paid to the fee collector (user got {refunded_to_user} back)"
+    );
+}
+
+/// FINDING 4 — **direct mode** (`quantity` + `worst_price` supplied) never rounds
+/// the order to the market's ticks.
+///
+/// `build_swap_order_msg`'s direct branch is `(Some(q), Some(p)) => (p, q)` — it
+/// checks `min_notional` and a zero quantity, but applies neither
+/// `min_quantity_tick_size` nor `min_price_tick_size`, and never checks the order
+/// is affordable from `input_amount`. The estimation branch does all three. An
+/// unaligned quantity is rejected by the exchange module, reverting the whole
+/// route — the failure mode the arb path can least afford, since a mid-route leg's
+/// true input is only known on chain.
+#[test]
+fn test_direct_mode_orderbook_quantity_is_tick_rounded() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    // Market ticks: 0.001 INJ quantity (1e15 chain), 1e-12 chain price.
+    let worst_price = FPDecimal::must_from_str("0.00000000001"); // 10 USDT/INJ, chain scale
+    let aligned = FPDecimal::from(2_000_000_000_000_000u128); // 0.002 INJ — 2 ticks
+    let unaligned = FPDecimal::from(1_500_000_000_000_000u128); // 0.0015 INJ — 1.5 ticks
+
+    let route = |qty: FPDecimal| ExecuteMsg::ExecuteRoute {
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: Some(qty),
+                    worst_price: Some(worst_price),
+                })],
+            }],
+        }],
+        minimum_receive: Some(Uint128::new(1)),
+    };
+    let funds = [Coin::new(1_000_000u128, "usdt")]; // 1 USDT, ample margin
+
+    // Control: a tick-aligned direct order is accepted.
+    let ok = wasm.execute(&env.aggregator_addr, &route(aligned), &funds, &env.user);
+    assert!(
+        ok.is_ok(),
+        "precondition: a tick-aligned direct order should fill: {:?}",
+        ok.unwrap_err()
+    );
+
+    // Same route, quantity off the tick grid by half a tick.
+    let res = wasm.execute(&env.aggregator_addr, &route(unaligned), &funds, &env.user);
+    assert!(
+        res.is_ok(),
+        "FINDING 4: direct mode passed an unaligned quantity straight to the \
+         exchange instead of flooring it to min_quantity_tick_size; the whole \
+         route reverted: {:?}",
+        res.as_ref().unwrap_err()
+    );
+}
+
+/// `SimulateRoute` must quote the order the executor will actually submit when the
+/// caller fixed it (direct mode), including the tick snapping and the affordability
+/// bound. It used to ignore `quantity`/`worst_price` entirely and walk the book
+/// instead — describing a different order than the one that gets placed, which is
+/// precisely the gate-blindness class the shared estimator exists to prevent.
+#[test]
+fn test_simulate_matches_execution_for_direct_mode_orderbook() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+
+    let worst_price = FPDecimal::must_from_str("0.00000000001"); // 10 USDT/INJ, chain scale
+    let funds_amount = 1_000_000u128; // 1 USDT
+
+    // (label, requested base quantity)
+    let cases: [(&str, FPDecimal); 3] = [
+        // Comfortably affordable and already on the tick grid.
+        ("aligned", FPDecimal::from(2_000_000_000_000_000u128)),
+        // Off the tick grid — must floor to 1 tick, not revert.
+        ("off-grid", FPDecimal::from(1_500_000_000_000_000u128)),
+        // Far more base than 1 USDT can back — must clamp to what the hop holds.
+        ("unaffordable", FPDecimal::from(1_000_000_000_000_000_000u128)),
+    ];
+
+    for (label, qty) in cases {
+        let stages = vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(env.market_inj_usdt.clone()).unwrap(),
+                    target_denom: "inj".to_string(),
+                    quantity: Some(qty),
+                    worst_price: Some(worst_price),
+                })],
+            }],
+        }];
+
+        let sim: SimulateRouteResponse = wasm
+            .query(
+                &env.aggregator_addr,
+                &QueryMsg::SimulateRoute {
+                    stages: stages.clone(),
+                    amount_in: Coin::new(funds_amount, "usdt"),
+                },
+            )
+            .unwrap();
+
+        let res = wasm
+            .execute(
+                &env.aggregator_addr,
+                &ExecuteMsg::ExecuteRoute {
+                    stages,
+                    minimum_receive: Some(Uint128::new(1)),
+                },
+                &[Coin::new(funds_amount, "usdt")],
+                &env.user,
+            )
+            .unwrap_or_else(|e| panic!("[{label}] direct-mode route should fill: {e:?}"));
+
+        let executed = res
+            .events
+            .iter()
+            .find(|e| {
+                e.ty.starts_with("wasm")
+                    && e.attributes
+                        .iter()
+                        .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+            })
+            .and_then(|e| e.attributes.iter().find(|a| a.key == "final_received"))
+            .map(|a| Uint128::from_str(&a.value).unwrap())
+            .expect("no aggregate_swap_complete event");
+
+        assert!(
+            !sim.output_amount.is_zero(),
+            "[{label}] the gate should quote a fillable direct-mode order"
+        );
+        assert_eq!(
+            sim.output_amount, executed,
+            "[{label}] SimulateRoute quoted {} but the submitted order produced {}",
+            sim.output_amount, executed
+        );
+    }
+}
+
+/// The flash-pool reentrancy guard must cover every venue that carries a contract
+/// address. It only inspected `ClmmSwap` ops, on the assumption that "AMM/orderbook
+/// venues have distinct addresses" — an assumption about well-formed routes, which
+/// the caller supplies.
+#[test]
+fn test_flash_route_cycle_through_flash_pool_rejected_for_amm_op() {
+    let env = setup_for_flash_test();
+    let wasm = Wasm::new(&env.app);
+
+    let msg = ExecuteMsg::FlashRoute {
+        flash_pool: env.flash_pool_addr.clone(),
+        flash_asset: amm::AssetInfo::NativeToken {
+            denom: "usdt".to_string(),
+        },
+        flash_amount: Uint128::new(1_000_000_000),
+        stages: vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    ask_asset_info: None,
+                    max_spread: None,
+                    pool_address: env.flash_pool_addr.clone(),
+                    offer_asset_info: amm::AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                })],
+            }],
+        }],
+        min_profit: Uint128::zero(),
+    };
+
+    let err = wasm
+        .execute(&env.aggregator_addr, &msg, &[], &env.user)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("may not route through the flash-source pool"),
+        "expected FlashPoolInCycle, got: {err}"
+    );
+}
+
+/// A stage that mixes CW20 and native offers must convert exactly the amount the
+/// splits are then allocated.
+///
+/// `plan_next_stage` sized the conversions from `floor(pct · total / 100)` for every
+/// split, but allocated the LAST split `total - Σ(earlier splits)`. Those differ by
+/// the rounding remainder R, so when the last split sat on the side being converted
+/// AWAY from, R atomic units of its input had already been converted into the other
+/// asset. The hop was then short — reverting for insufficient funds, or silently
+/// consuming the contract's own dust when it happened to hold some.
+///
+/// Here: 1_000_000_001 native SHROOM, split 50/50 into a CW20-SHROOM pool and a
+/// native-SHROOM pool, with the native one last. R = 1.
+#[test]
+fn test_mixed_cw20_native_stage_converts_exactly_what_it_allocates() {
+    let setup = setup_for_conversion_test();
+    let wasm = Wasm::new(&setup.env.app);
+    let bank = Bank::new(&setup.env.app);
+    let admin = &setup.env.admin;
+    let user = &setup.env.user;
+
+    // A venue that takes NATIVE shroom, so a one-unit shortfall cannot be masked by
+    // an orderbook quantity tick.
+    let mock_swap_code_id = wasm
+        .store_code(get_wasm_byte_code("mock_swap.wasm"), None, admin)
+        .unwrap()
+        .data
+        .code_id;
+    let native_shroom_to_usdt = wasm
+        .instantiate(
+            mock_swap_code_id,
+            &MockInstantiateMsg {
+                config: SwapConfig {
+                    input_asset_info: AssetInfo::NativeToken {
+                        denom: setup.native_shroom_denom.clone(),
+                    },
+                    output_asset_info: AssetInfo::NativeToken {
+                        denom: "usdt".to_string(),
+                    },
+                    rate: "0.4".to_string(),
+                    protocol_type: ProtocolType::Amm,
+                    input_decimals: 6,
+                    output_decimals: 6,
+                },
+            },
+            Some(&admin.address()),
+            Some("amm-native-shroom-usdt"),
+            &[],
+            admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: native_shroom_to_usdt.clone(),
+            amount: vec![ProtoCoin {
+                denom: "usdt".to_string(),
+                amount: "10000000000".to_string(),
+            }],
+        },
+        admin,
+    )
+    .unwrap();
+
+    // Give the user an ODD amount of native SHROOM.
+    let amount = Uint128::new(1_000_000_001);
+    wasm.execute(
+        &setup.shroom_cw20_addr,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: admin.address(),
+            amount,
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+    wasm.execute(
+        &setup.shroom_cw20_addr,
+        &cw20::Cw20ExecuteMsg::Send {
+            contract: setup.adapter_addr.clone(),
+            amount,
+            msg: to_json_binary(&"{}").unwrap(),
+        },
+        &[],
+        admin,
+    )
+    .unwrap();
+    bank.send(
+        MsgSend {
+            from_address: admin.address(),
+            to_address: user.address(),
+            amount: vec![ProtoCoin {
+                denom: setup.native_shroom_denom.clone(),
+                amount: amount.to_string(),
+            }],
+        },
+        admin,
+    )
+    .unwrap();
+
+    let user_usdt_before = regression_bal(&bank, &user.address(), "usdt");
+
+    let res = wasm.execute(
+        &setup.env.aggregator_addr,
+        &ExecuteMsg::ExecuteRoute {
+            stages: vec![Stage {
+                splits: vec![
+                    // CW20 side — needs a native -> CW20 conversion first.
+                    Split {
+                        percent: 50,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            ask_asset_info: None,
+                            max_spread: None,
+                            pool_address: setup.mock_cw20_shroom_to_usdt_amm.clone(),
+                            offer_asset_info: amm::AssetInfo::Token {
+                                contract_addr: setup.shroom_cw20_addr.clone(),
+                            },
+                        })],
+                    },
+                    // Native side, LAST — absorbs the rounding remainder.
+                    Split {
+                        percent: 50,
+                        path: vec![Operation::AmmSwap(AmmSwapOp {
+                            ask_asset_info: None,
+                            max_spread: None,
+                            pool_address: native_shroom_to_usdt.clone(),
+                            offer_asset_info: amm::AssetInfo::NativeToken {
+                                denom: setup.native_shroom_denom.clone(),
+                            },
+                        })],
+                    },
+                ],
+            }],
+            minimum_receive: Some(Uint128::new(1)),
+        },
+        &[Coin {
+            denom: setup.native_shroom_denom.clone(),
+            amount: amount.into(),
+        }],
+        user,
+    );
+    assert!(
+        res.is_ok(),
+        "mixed CW20/native stage with an odd total should route in full: {:?}",
+        res.as_ref().unwrap_err()
+    );
+
+    // Every one of the 1_000_000_001 units was swapped at 0.4 — nothing was
+    // stranded on the wrong side of the conversion.
+    let gained = regression_bal(&bank, &user.address(), "usdt") - user_usdt_before;
+    assert_eq!(
+        gained, 400_000_000,
+        "expected the whole input to trade at 0.4 USDT/SHROOM"
+    );
+    assert_eq!(
+        regression_bal(&bank, &setup.env.aggregator_addr, &setup.native_shroom_denom),
+        0,
+        "no native SHROOM should linger"
+    );
+
+    // The discriminator: over-converting leaves CW20 SHROOM the CW20 split could not
+    // spend, which the residue sweep then hands back to the user as token dust.
+    // Sizing the conversion from the same numbers the splits are allocated leaves
+    // exactly nothing.
+    let user_cw20: BalanceResponse = wasm
+        .query(
+            &setup.shroom_cw20_addr,
+            &Cw20QueryMsg::Balance {
+                address: user.address(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        user_cw20.balance,
+        Uint128::zero(),
+        "the conversion over-shot and refunded CW20 dust"
+    );
 }

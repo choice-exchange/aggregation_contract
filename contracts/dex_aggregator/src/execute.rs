@@ -1,14 +1,120 @@
 use crate::cw20::{BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 use cosmwasm_std::{
-    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, DepsMut, Env, MessageInfo,
-    Response, StdError, StdResult, Uint128, WasmMsg,
+    to_json_binary, Addr, BankMsg, Binary, Coin, CosmosMsg, Decimal, Deps, DepsMut, Env,
+    MessageInfo, Response, StdError, StdResult, Uint128, WasmMsg,
 };
 use injective_cosmwasm::{InjectiveMsgWrapper, InjectiveQueryWrapper};
+use injective_math::FPDecimal;
 
 use crate::error::ContractError;
 use crate::msg::{amm, clmm, Operation, Stage};
 use crate::orderbook_exec;
-use crate::reply::proceed_to_next_step;
+use crate::reply::{get_operation_input, get_operation_output, proceed_to_next_step};
+
+/// Estimation-mode CLMM slippage tolerance when `ClmmSwapOp::slippage_bps` is
+/// omitted. 50 bps = the 0.5% that used to be hardcoded here.
+pub const DEFAULT_CLMM_SLIPPAGE_BPS: u16 = 50;
+
+/// `max_spread` sent to an AMM pair when `AmmSwapOp::max_spread` is omitted.
+/// Effectively unbounded: the route's own `minimum_receive` / `min_profit` is the
+/// real guard, and anything narrower lets Astroport's implicit 0.5% revert arb
+/// routes that `SimulateRoute` had already cleared.
+pub const DEFAULT_AMM_MAX_SPREAD: Decimal = Decimal::percent(49);
+
+/// Ceiling on a caller-supplied `max_spread`. Astroport rejects anything ABOVE
+/// 0.5 outright (`AllowedSpreadAssertion`), so clamping here keeps a too-generous
+/// value from failing every swap. Kept at 49% for the `>=`-vs-`>` reason above.
+pub const MAX_AMM_MAX_SPREAD: Decimal = Decimal::percent(49);
+
+/// The dispatch message for a single hop plus, for orderbook hops, the base
+/// quantity the order was placed with (`ob_order_qty`) — carried so the reply can
+/// split the post-fill refund into protocol surplus vs. the user's unfilled
+/// remainder. `ob_order_qty` is `None` for AMM/CLMM hops.
+pub struct DispatchedSwap {
+    pub msg: CosmosMsg<InjectiveMsgWrapper>,
+    pub ob_order_qty: Option<FPDecimal>,
+    /// Orderbook hops only: the tick-snapped price bound the order was placed at.
+    /// The reply measures price improvement against this. `None` for AMM/CLMM.
+    pub ob_order_price: Option<FPDecimal>,
+    /// Orderbook hops only: whether the order was a BUY. Captured here because the
+    /// market is already loaded at dispatch, so the reply path no longer has to
+    /// re-run `load_market` purely to recover the direction — one fewer chain query
+    /// per orderbook hop. `None` for AMM/CLMM hops.
+    pub ob_is_buy: Option<bool>,
+}
+
+/// Contract balance of `info` held by `contract` (bank for natives, `Balance` query
+/// for CW20s). Chain-scale `Uint128`.
+pub fn query_asset_balance(
+    deps: Deps<InjectiveQueryWrapper>,
+    contract: &Addr,
+    info: &amm::AssetInfo,
+) -> Result<Uint128, ContractError> {
+    match info {
+        amm::AssetInfo::NativeToken { denom } => {
+            let bal = deps.querier.query_balance(contract, denom)?;
+            Ok(Uint128::try_from(bal.amount).map_err(StdError::from)?)
+        }
+        amm::AssetInfo::Token { contract_addr } => {
+            let res: BalanceResponse = deps.querier.query_wasm_smart(
+                contract_addr,
+                &Cw20QueryMsg::Balance {
+                    address: contract.to_string(),
+                },
+            )?;
+            Ok(res.balance)
+        }
+    }
+}
+
+/// Snapshot the contract's pre-route balance of every denom the route can touch —
+/// the offer denom plus every operation's input AND output denom. For the offer
+/// denom the route's own input is subtracted, so each baseline reflects only funds
+/// that pre-dated the route.
+///
+/// These baselines are the engine's only defence against a hop that *reports* an
+/// output it never delivered. Every amount the route pays out or attaches to a
+/// message is clamped to `current - baseline` for its denom (`route_spendable`), so
+/// a fabricated credit can never reach funds the route did not itself bring in.
+/// `finalize_route` then sweeps whatever is left, so nothing lingers either.
+///
+/// **Output denoms are load-bearing, not a nicety.** They used to be omitted (the
+/// output was read back from the pool's own `ask_asset` event attribute), which let
+/// any caller point a hop at a contract they wrote, have it emit
+/// `ask_asset=<denom> return_amount=<contract balance>` while transferring nothing,
+/// and be paid that balance. Resolution is strict — an op whose output cannot be
+/// determined fails the route rather than proceeding unbounded.
+fn snapshot_entry_balances(
+    deps: Deps<InjectiveQueryWrapper>,
+    contract: &Addr,
+    stages: &[Stage],
+    offer: &amm::Asset,
+) -> Result<Vec<(amm::AssetInfo, Uint128)>, ContractError> {
+    let mut infos: Vec<amm::AssetInfo> = vec![offer.info.clone()];
+    for stage in stages {
+        for split in &stage.splits {
+            for op in &split.path {
+                for asset in [get_operation_input(deps, op)?, get_operation_output(deps, op)?] {
+                    if !infos.contains(&asset) {
+                        infos.push(asset);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(infos.len());
+    for info in infos {
+        let mut bal = query_asset_balance(deps, contract, &info)?;
+        // The offer is already in the contract at entry; exclude it from the
+        // baseline so the route's own input isn't mistaken for pre-existing funds.
+        if info == offer.info {
+            bal = bal.saturating_sub(offer.amount);
+        }
+        out.push((info, bal));
+    }
+    Ok(out)
+}
 use crate::state::{
     Awaiting, ExecutionState, FlashRepayment, PendingFlashCtx, RoutePlan, CONFIG, FEE_MAP,
     FLASH_SIGNERS, FLASH_UNRESTRICTED, PENDING_FLASH, REPLY_ID_COUNTER, TAX_TOKEN_REGISTRY,
@@ -90,6 +196,35 @@ pub fn set_flash_unrestricted(
         .add_attribute("open", open.to_string()))
 }
 
+/// Structural validation of a route, applied to **every** stage.
+///
+/// Only the first stage used to be checked, so a later stage summing to less than
+/// 100 silently handed the shortfall to its last split (which absorbs the
+/// remainder), and one summing to more underflowed that split's `checked_sub`.
+/// Neither matched what `SimulateRoute` quoted.
+pub fn validate_stages(stages: &[Stage]) -> Result<(), ContractError> {
+    if stages.is_empty() {
+        return Err(ContractError::NoStages {});
+    }
+    for stage in stages {
+        if stage.splits.is_empty() {
+            return Err(ContractError::EmptyRoute {});
+        }
+        for split in &stage.splits {
+            if split.path.is_empty() {
+                return Err(ContractError::EmptyRoute {});
+            }
+        }
+        // Sum in u32: `percent` is u8, and a malformed split set can sum past 255
+        // and wrap (or, with overflow-checks, panic) if summed in u8.
+        let total_percentage: u32 = stage.splits.iter().map(|s| s.percent as u32).sum();
+        if total_percentage != 100 {
+            return Err(ContractError::InvalidPercentageSum {});
+        }
+    }
+    Ok(())
+}
+
 pub fn execute_aggregate_swaps_internal(
     mut deps: DepsMut<InjectiveQueryWrapper>,
     env: Env,
@@ -101,21 +236,20 @@ pub fn execute_aggregate_swaps_internal(
     if offer_asset.amount.is_zero() {
         return Err(ContractError::ZeroAmount {});
     }
-    if stages.is_empty() {
-        return Err(ContractError::NoStages {});
-    }
+    validate_stages(&stages)?;
 
-    let first_stage = stages.first().unwrap();
-    // Sum in u32: `percent` is u8, and a malformed split set can sum past 255 and
-    // wrap (or, with overflow-checks, panic) if summed in u8.
-    let total_percentage: u32 = first_stage.splits.iter().map(|s| s.percent as u32).sum();
-    if total_percentage != 100 {
-        return Err(ContractError::InvalidPercentageSum {});
+    // A positive floor is mandatory. A zero floor would let a route that produced
+    // nothing complete "successfully" while returning nothing, and it disables the
+    // user's only slippage guard on the output.
+    let minimum_receive = minimum_receive.unwrap_or_default();
+    if minimum_receive.is_zero() {
+        return Err(ContractError::ZeroMinimumReceive {});
     }
 
     let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> { Ok(id + 1) })?;
 
-    let minimum_receive = minimum_receive.unwrap_or_default();
+    let entry_balances =
+        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &stages, &offer_asset)?;
 
     let plan = RoutePlan {
         sender: initiator.clone(),
@@ -134,6 +268,9 @@ pub fn execute_aggregate_swaps_internal(
         pending_swaps: vec![],
         pending_path_op: None,
         legs: vec![],
+        entry_balances,
+        pending_fees: vec![],
+        pending_pool_fees: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut initial_exec_state, reply_id)
@@ -156,14 +293,7 @@ pub fn execute_flash_route(
     if flash_amount.is_zero() {
         return Err(ContractError::ZeroAmount {});
     }
-    if stages.is_empty() {
-        return Err(ContractError::NoStages {});
-    }
-    let first_stage = stages.first().unwrap();
-    let total_percentage: u32 = first_stage.splits.iter().map(|s| s.percent as u32).sum();
-    if total_percentage != 100 {
-        return Err(ContractError::InvalidPercentageSum {});
-    }
+    validate_stages(&stages)?;
 
     // Signer allowlist gate: only authorized EOAs may flash-borrow through the
     // aggregator (unless flash is unrestricted). `info.sender` here is the real
@@ -180,13 +310,20 @@ pub fn execute_flash_route(
 
     // The pool holds its reentrancy lock for the whole callback, so any swap
     // against `flash_pool` inside the cycle would revert the entire transaction.
-    // Reject it up-front. Only CLMM hops can hit the flash pool (AMM/orderbook
-    // venues have distinct addresses).
+    // Reject it up-front. Checked for EVERY venue that carries a contract address,
+    // not just CLMM: nothing stops a caller declaring the flash pool as an
+    // `AmmSwap` target, and "AMM/orderbook venues have distinct addresses" was an
+    // assumption about well-formed routes, not something the contract enforced.
     for stage in &stages {
         for split in &stage.splits {
             for op in &split.path {
-                if let Operation::ClmmSwap(o) = op {
-                    if deps.api.addr_validate(&o.pool_address)? == flash_pool_addr {
+                let venue = match op {
+                    Operation::ClmmSwap(o) => Some(&o.pool_address),
+                    Operation::AmmSwap(o) => Some(&o.pool_address),
+                    Operation::OrderbookSwap(_) => None,
+                };
+                if let Some(addr) = venue {
+                    if deps.api.addr_validate(addr)? == flash_pool_addr {
                         return Err(ContractError::FlashPoolInCycle {});
                     }
                 }
@@ -285,18 +422,25 @@ pub fn execute_flash_callback(
         }),
     };
 
+    let offer_asset = amm::Asset {
+        info: ctx.flash_asset.clone(),
+        amount: ctx.principal,
+    };
+    let entry_balances =
+        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &plan.stages, &offer_asset)?;
+
     let mut exec_state = ExecutionState {
         plan,
         awaiting: Awaiting::Swaps,
         current_stage_index: 0,
         replies_expected: 0,
-        accumulated_assets: vec![amm::Asset {
-            info: ctx.flash_asset,
-            amount: ctx.principal,
-        }],
+        accumulated_assets: vec![offer_asset],
         pending_swaps: vec![],
         pending_path_op: None,
         legs: vec![],
+        entry_balances,
+        pending_fees: vec![],
+        pending_pool_fees: vec![],
     };
 
     proceed_to_next_step(&mut deps, env, &mut exec_state, reply_id)
@@ -312,8 +456,13 @@ pub fn create_swap_cosmos_msg(
     offer_asset_info: &amm::AssetInfo,
     amount: Uint128,
     env: &Env,
-) -> Result<Option<CosmosMsg<InjectiveMsgWrapper>>, ContractError> {
+) -> Result<Option<DispatchedSwap>, ContractError> {
     let recipient = env.contract.address.to_string();
+
+    // Set by the orderbook arm to the base quantity/price actually ordered.
+    let mut ob_order_qty: Option<FPDecimal> = None;
+    let mut ob_order_price: Option<FPDecimal> = None;
+    let mut ob_is_buy: Option<bool> = None;
 
     let cosmos_msg = match operation {
         Operation::AmmSwap(amm_op) => {
@@ -323,7 +472,15 @@ pub fn create_swap_cosmos_msg(
                     amount,
                 },
                 belief_price: None,
-                max_spread: None,
+                // Caller-settable, and NEVER `None` on the wire — see
+                // `AmmSwapOp::max_spread`. Astroport reads `None` as its own 0.5%
+                // default and asserts on it, invisibly to `SimulateRoute`.
+                max_spread: Some(
+                    amm_op
+                        .max_spread
+                        .unwrap_or(DEFAULT_AMM_MAX_SPREAD)
+                        .min(MAX_AMM_MAX_SPREAD),
+                ),
                 to: Some(recipient),
             };
 
@@ -404,8 +561,25 @@ pub fn create_swap_cosmos_msg(
                 ob_op.quantity,
                 ob_op.worst_price,
             )? {
-                Some(order_msg) => order_msg,
-                None => return Err(ContractError::AmountTooSmall {}),
+                Some((order_msg, order_qty, order_price)) => {
+                    ob_order_qty = Some(order_qty);
+                    ob_order_price = Some(order_price);
+                    // The market is in hand here; caching the direction spares the
+                    // reply path a `load_market` it would otherwise run only to
+                    // recompute this bool.
+                    ob_is_buy = Some(orderbook_exec::is_buy_for_target(
+                        &market,
+                        &ob_op.target_denom,
+                    ));
+                    order_msg
+                }
+                // No order can be placed (sub-tick, or below the market's
+                // `min_notional`). Finish the split as a zero-value path — exactly
+                // what the CLMM zero-quote arm below does, and exactly what
+                // `SimulateRoute` quotes for this hop via `no_fill_estimate`.
+                // Returning an error here reverted the ENTIRE route over one dust
+                // split that the gate had already priced at zero.
+                None => return Ok(None),
             }
         }
         Operation::ClmmSwap(clmm_op) => {
@@ -430,7 +604,16 @@ pub fn create_swap_cosmos_msg(
                         return Ok(None);
                     }
 
-                    quote_response.amount_out.multiply_ratio(995u128, 1000u128)
+                    // Clamped so an out-of-range value can't underflow the ratio; at
+                    // 10000 bps the floor is disabled and `minimum_receive` /
+                    // `min_profit` is the only remaining guard.
+                    let bps = clmm_op
+                        .slippage_bps
+                        .unwrap_or(DEFAULT_CLMM_SLIPPAGE_BPS)
+                        .min(10_000) as u128;
+                    quote_response
+                        .amount_out
+                        .multiply_ratio(10_000u128 - bps, 10_000u128)
                 }
             };
 
@@ -485,7 +668,12 @@ pub fn create_swap_cosmos_msg(
         }
     };
 
-    Ok(Some(cosmos_msg))
+    Ok(Some(DispatchedSwap {
+        msg: cosmos_msg,
+        ob_order_qty,
+        ob_order_price,
+        ob_is_buy,
+    }))
 }
 
 /// Admin-only. Sets or updates the fee for a given pool address.
@@ -553,6 +741,27 @@ pub fn update_fee_collector(
     Ok(Response::new()
         .add_attribute("action", "update_fee_collector")
         .add_attribute("new_fee_collector", new_collector_addr))
+}
+
+/// Admin-only. Repoints the CW20<->native adapter. Config held this address with
+/// no setter, so a redeployed adapter would have needed a contract migration.
+pub fn update_cw20_adapter(
+    deps: DepsMut<InjectiveQueryWrapper>,
+    info: MessageInfo,
+    new_cw20_adapter: String,
+) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
+    let mut config = CONFIG.load(deps.storage)?;
+    if info.sender != config.admin {
+        return Err(ContractError::Unauthorized {});
+    }
+
+    let new_adapter_addr = deps.api.addr_validate(&new_cw20_adapter)?;
+    config.cw20_adapter_address = new_adapter_addr.clone();
+    CONFIG.save(deps.storage, &config)?;
+
+    Ok(Response::new()
+        .add_attribute("action", "update_cw20_adapter")
+        .add_attribute("new_cw20_adapter", new_adapter_addr))
 }
 
 pub fn emergency_withdraw(

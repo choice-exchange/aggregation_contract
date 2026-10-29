@@ -793,10 +793,47 @@ fn build_swap_event(
 
 /// String key for an asset: the bank denom for natives, the contract address for
 /// CW20s. Used in leg records and the consolidated swap event.
-fn asset_key(info: &amm::AssetInfo) -> String {
+pub(crate) fn asset_key(info: &amm::AssetInfo) -> String {
     match info {
         amm::AssetInfo::NativeToken { denom } => denom.clone(),
         amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+    }
+}
+
+/// Canonical identity of an asset under the CW20 adapter: a CW20 and the bank denom
+/// the adapter wraps it into (`factory/<adapter>/<cw20>`) are the same asset, which
+/// is the assumption the executor's stage allocator is built on.
+pub(crate) fn canonical_key(info: &amm::AssetInfo, adapter: &Addr) -> String {
+    match info {
+        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
+        amm::AssetInfo::NativeToken { denom } => denom
+            .strip_prefix(&format!("factory/{adapter}/"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| denom.clone()),
+    }
+}
+
+/// Whether `a` can be turned into `b` by `create_conversion_msg`: they are identical,
+/// or one is a CW20 and the other the bank denom the configured adapter wraps it
+/// into. Shared by `receive_as` (both engines) and `SimulateRoute`'s mid-path
+/// relabelling.
+///
+/// A CW20 and a native only match when the native really carries the adapter's
+/// prefix. Comparing [`canonical_key`]s alone would also pair a CW20 address with a
+/// bank denom spelled the same way, which no conversion connects, and a denom
+/// minted by any other adapter is a different asset.
+pub(crate) fn same_asset_under_adapter(
+    a: &amm::AssetInfo,
+    b: &amm::AssetInfo,
+    adapter: &Addr,
+) -> bool {
+    match (a, b) {
+        (amm::AssetInfo::Token { .. }, amm::AssetInfo::NativeToken { denom })
+        | (amm::AssetInfo::NativeToken { denom }, amm::AssetInfo::Token { .. }) => {
+            denom.starts_with(&format!("factory/{adapter}/"))
+                && canonical_key(a, adapter) == canonical_key(b, adapter)
+        }
+        _ => a == b,
     }
 }
 
@@ -838,18 +875,33 @@ fn handle_final_stage(
         return Ok(Response::new().add_attribute("action", "aggregate_swap_complete_empty"));
     }
 
+    let config = CONFIG.load(deps.storage)?;
+
     // Normalization target: the borrowed asset for a flash cycle (so the route
-    // closes in the token it must repay), otherwise the first accumulated asset.
-    let target_asset_info = exec_state
-        .plan
-        .flash_repayment
-        .as_ref()
-        .map(|f| f.asset.clone())
-        .unwrap_or_else(|| exec_state.accumulated_assets[0].info.clone());
+    // closes in the token it must repay); else the form the caller asked to be paid
+    // in (`receive_as`); else the first accumulated asset.
+    let target_asset_info = match (&exec_state.plan.flash_repayment, &exec_state.plan.receive_as) {
+        (Some(flash), _) => flash.asset.clone(),
+        (None, Some(form)) => {
+            // `receive_as` chooses the payout's form, never its asset: every output
+            // must already be that asset under adapter identity, so the only work
+            // left is the 1:1 adapter conversion below — the same normalization a
+            // route ending in mixed CW20/bank forms has always had.
+            for asset in &exec_state.accumulated_assets {
+                if !same_asset_under_adapter(&asset.info, form, &config.cw20_adapter_address) {
+                    return Err(ContractError::ReceiveAsMismatch {
+                        requested: asset_key(form),
+                        payout: asset_key(&asset.info),
+                    });
+                }
+            }
+            form.clone()
+        }
+        (None, None) => exec_state.accumulated_assets[0].info.clone(),
+    };
 
     let mut conversion_submsgs = Vec::with_capacity(exec_state.accumulated_assets.len());
     let mut ready_amount = Uint128::zero();
-    let config = CONFIG.load(deps.storage)?;
 
     for asset in &exec_state.accumulated_assets {
         if asset.info == target_asset_info {

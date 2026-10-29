@@ -24,6 +24,18 @@
                 }
               ]
             },
+            "receive_as": {
+              "description": "The form to pay the output in: the CW20, or the bank denom the cw20 adapter wraps it into (`factory/<adapter>/<cw20>`). It must be the asset the route pays out, under that identity (`ReceiveAsMismatch` otherwise): it changes the form of the payout, never what the route buys. The output is converted through the adapter (1:1) before it is paid, and `minimum_receive` applies to what is paid.\n\n`None` (or absent) => pay in the form the last stage produced first — exactly the pre-2.2.1 behaviour. Supplying the form the route already ends in is a no-op.\n\nAn asset rather than a \"cw20 | bank\" flag so the caller states the exact denom it expects to receive and the contract checks it: a route that does not end where the caller thinks, or a denom minted by a different adapter than the one configured, is refused instead of paying something else.",
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AssetInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "stages": {
               "type": "array",
               "items": {

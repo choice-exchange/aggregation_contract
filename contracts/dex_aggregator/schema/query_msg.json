@@ -3,6 +3,7 @@
   "title": "QueryMsg",
   "oneOf": [
     {
+      "description": "Quotes `ExecuteRoute`. `receive_as` is the same field and is checked the same way; the conversion is 1:1, so it never changes `output_amount`.",
       "type": "object",
       "required": [
         "simulate_route"
@@ -17,6 +18,17 @@
           "properties": {
             "amount_in": {
               "$ref": "#/definitions/Coin"
+            },
+            "receive_as": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AssetInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "stages": {
               "type": "array",

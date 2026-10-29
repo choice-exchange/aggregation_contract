@@ -84,11 +84,17 @@ pub fn query_asset_balance(
 /// `ask_asset=<denom> return_amount=<contract balance>` while transferring nothing,
 /// and be paid that balance. Resolution is strict — an op whose output cannot be
 /// determined fails the route rather than proceeding unbounded.
+///
+/// `receive_as` (the payout form the caller asked for) is snapshotted too, and is
+/// just as load-bearing: when it is the adapter sibling of the route's output, no
+/// op touches it, yet the converted payout is drawn from it — so without a
+/// baseline the payout clamp would have nothing to bound it against.
 fn snapshot_entry_balances(
     deps: Deps<InjectiveQueryWrapper>,
     contract: &Addr,
     stages: &[Stage],
     offer: &amm::Asset,
+    receive_as: Option<&amm::AssetInfo>,
 ) -> Result<Vec<(amm::AssetInfo, Uint128)>, ContractError> {
     let mut infos: Vec<amm::AssetInfo> = vec![offer.info.clone()];
     for stage in stages {
@@ -100,6 +106,11 @@ fn snapshot_entry_balances(
                     }
                 }
             }
+        }
+    }
+    if let Some(form) = receive_as {
+        if !infos.contains(form) {
+            infos.push(form.clone());
         }
     }
 
@@ -230,6 +241,7 @@ pub fn execute_aggregate_swaps_internal(
     env: Env,
     stages: Vec<Stage>,
     minimum_receive: Option<Uint128>,
+    receive_as: Option<amm::AssetInfo>,
     offer_asset: amm::Asset,
     initiator: Addr,
 ) -> Result<Response<InjectiveMsgWrapper>, ContractError> {
@@ -248,8 +260,13 @@ pub fn execute_aggregate_swaps_internal(
 
     let reply_id = REPLY_ID_COUNTER.update(deps.storage, |id| -> StdResult<_> { Ok(id + 1) })?;
 
-    let entry_balances =
-        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &stages, &offer_asset)?;
+    let entry_balances = snapshot_entry_balances(
+        deps.as_ref(),
+        &env.contract.address,
+        &stages,
+        &offer_asset,
+        receive_as.as_ref(),
+    )?;
 
     let plan = RoutePlan {
         sender: initiator.clone(),
@@ -257,6 +274,7 @@ pub fn execute_aggregate_swaps_internal(
         stages,
         offer: offer_asset.clone(),
         flash_repayment: None,
+        receive_as,
     };
 
     let mut initial_exec_state = ExecutionState {
@@ -420,14 +438,20 @@ pub fn execute_flash_callback(
             repay_amount,
             min_profit: ctx.min_profit,
         }),
+        receive_as: None,
     };
 
     let offer_asset = amm::Asset {
         info: ctx.flash_asset.clone(),
         amount: ctx.principal,
     };
-    let entry_balances =
-        snapshot_entry_balances(deps.as_ref(), &env.contract.address, &plan.stages, &offer_asset)?;
+    let entry_balances = snapshot_entry_balances(
+        deps.as_ref(),
+        &env.contract.address,
+        &plan.stages,
+        &offer_asset,
+        None,
+    )?;
 
     let mut exec_state = ExecutionState {
         plan,

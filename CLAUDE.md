@@ -12,19 +12,27 @@ test every change against both:
 - **Choice frontend — `inj1520rsss9aykhkfmuf89nh5hp2jww770z4u3eu0`.** Permissionless; many
   unrelated users. Routes are suggested by the Choice router but *submitted by the user*, so
   every field of `stages` is attacker-controlled (and `pool_address` has **no allowlist**).
-- **Arb bot — `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx`.** Effectively single-caller;
-  `FlashRoute` additionally gated by `FLASH_SIGNERS`. Latency- and gas-sensitive; the concern
-  is economic correctness — does `SimulateRoute` agree with what execution does.
+- **Arb bot — `inj1msu93x59wkgjnyh7z2ulx0hy7tmk2uxx0vzzcw`** (`inj_rust_arb_v2`
+  `config/base.toml`). Effectively single-caller; `FlashRoute` additionally gated by
+  `FLASH_SIGNERS`. Latency- and gas-sensitive; the concern is economic correctness — does
+  `SimulateRoute` agree with what execution does.
 
-Both now run **Code ID 2067 (v2.2.0)**. wasm-admin on both is the Choice Admin Timelock
-`inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h delay).
+Both run **Code ID 2067 (v2.2.0)** (verified on chain 2026-10-29). Only the Choice instance's
+wasm-admin is the Choice Admin Timelock `inj14tm9kjh396g483aj76xyykem2mdk22q8x769v9` (48h
+delay; code 1999, the older `Propose { contract, code_id, msg }` / `pending_migration`
+interface). **The arb instance's wasm-admin is the `choicedev` EOA** — it can be migrated with
+no wait. `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx` is NOT the bot: it is the legacy
+v2.0.1 instance on code 2060 (wasm-admin `inj1w0ul…455t`), kept as a rollback anchor.
 
+- **v2.2.1 — PREPARED, not deployed.** `receive_as` (pay the output as the CW20 or its
+  adapter bank denom), White Whale `SimulateRoute`, and CW20⇄bank relabelling between hops
+  in `SimulateRoute`. See [docs/v2_2_1_changes.md](docs/v2_2_1_changes.md) and
+  [docs/RELEASE_v2_2_1_RUNBOOK.md](docs/RELEASE_v2_2_1_RUNBOOK.md). Recommended release: a NEW
+  instance for Choice v2, instantiated with the timelock as wasm-admin.
 - **v2.2.0 — LIVE on both instances.** The Choice instance was migrated 2026-09-06 at
   height 181774266 (timelock `apply{}`, tx `E63BD461…C1D2E`); the arb-bot instance was
   instantiated on 2067 directly. Verified live by two multi-hop AMM+CLMM user swaps that
-  left the contract balance byte-for-byte unchanged (the residue invariant). The legacy
-  v1-arb aggregator `inj1vhu5z87dcuyyuz9e725kasecqygprl6jpkj7hx` is deliberately left on
-  **2060** as a rollback anchor. Audit fixes: routes bounded to their own
+  left the contract balance byte-for-byte unchanged (the residue invariant). Audit fixes: routes bounded to their own
   funds, fee ordering, direct-mode tick snapping, gate parity. See
   [docs/v2_2_0_changes.md](docs/v2_2_0_changes.md) — read it before touching
   `snapshot_entry_balances`, `finalize_route`, or `build_swap_order_msg`. Supersedes the
@@ -36,6 +44,9 @@ Both now run **Code ID 2067 (v2.2.0)**. wasm-admin on both is the Choice Admin T
 Live state worth knowing (verified on chain 2026-07-30): `FEE_MAP` is **empty** on both
 instances (`all_fees` → `[]`), and flash is **switched off** — `flash_signers` is empty and
 `unrestricted` is false on both, so `FlashRoute` is deny-all for everyone including the admin.
+The Choice instance's whole persistent state (2026-10-29) is `config`, `contract_info`,
+`reply_id_counter` and ONE tax token, FOOL `inj155mtzkc0366gnudw9v6wyc7x37dprfcl8amtwz` —
+a new Choice instance must `RegisterTaxToken` it.
 
 ⚠️ **The timelock is only the *wasm* admin.** `config.admin` on the Choice instance is the hot
 EOA `inj1yrg4pg8hcu0sw5rjlrcqfmw2ewf2uztlmdysak` (key `choicedev`), so `EmergencyWithdraw`,
@@ -104,7 +115,7 @@ cd contracts/dex_aggregator && cargo run --example schema
 4. Executes parallel swap submessages, each tracked by unique reply IDs in `SUBMSG_REPLY_STATES`
 5. `handle_swap_reply` processes each reply; for multi-hop paths, chains to next operation. Orderbook BUY hops capture their price-improvement surplus (sized at `worst_price`, filled cheaper) into `ExecutionState.pending_fees`
 6. Mid-path conversions handled via `Awaiting::PathConversion`
-7. After final stage: normalizes output assets (`Awaiting::FinalConversions`), checks `minimum_receive`, sends the tracked output to the user, then **`build_residue_sweep` drains every touched denom** (current − entry baseline): the `pending_fees` portion → fee collector, the remainder (unfilled orderbook remainders, dropped intermediates, un-spent split inputs, no-fills) → the user. **Invariant: a successful route leaves nothing in the contract.**
+7. After final stage: normalizes output assets (`Awaiting::FinalConversions`) — onto `receive_as` when the caller set it (v2.2.1; it must be the same asset under adapter identity, `same_asset_under_adapter`, else `ReceiveAsMismatch`), otherwise onto the first accumulated asset — checks `minimum_receive`, sends the tracked output to the user, then **`build_residue_sweep` drains every touched denom** (current − entry baseline): the `pending_fees` portion → fee collector, the remainder (unfilled orderbook remainders, dropped intermediates, un-spent split inputs, no-fills) → the user. **Invariant: a successful route leaves nothing in the contract.**
 
 ### Supporting Contracts
 
@@ -154,6 +165,8 @@ cd contracts/dex_aggregator && cargo run --example schema
 - `reply.rs` is the most complex module — state machine changes require careful review of all `Awaiting` state transitions
 - **The gate must see what reverts (v2.1.0).** `SimulateRoute` is the arb bot's pre-broadcast gate. Anything that changes what the executor actually submits MUST be visible to the query path, or the gate clears routes that are guaranteed to fail. The two paths deliberately share `estimate_single_swap_execution`, `sell_base_quantity`, `meets_min_notional` and `apply_fee` — adding an execution-side adjustment outside that shared code re-opens the hole. Four separate bugs were this one mistake.
 - Orderbook swaps only support native token inputs/outputs. **Both** the estimator and the order builder floor quantity via `sell_base_quantity`, and both check `meets_min_notional`. **Direct mode skips the estimators entirely**, so `direct_order_params` is the only place that snaps its quantity/price to the market ticks and bounds it by what the hop holds — and `SimulateRoute` sizes through the same helper. A hop that cannot place an order is a graceful zero-value path, never a route-wide revert.
+- **`#[cw_serde]` here does NOT deny unknown fields.** An older build *accepts* a message carrying a field it doesn't know and silently ignores it — 2.2.0 takes `receive_as` and pays the CW20 anyway (`test_migrate_live_v2_2_0_instance_to_v2_2_1`). Callers must gate a new field on the instance's cw2 version. It is also why partial venue views (`PairInfo`, White Whale's `Simulation` reply) decode at all.
+- **`tests/fixtures/dex_aggregator_v2_2_0.wasm` is the live bytecode** (= code 2067's `data_hash`). `test_without_receive_as_behaves_byte_for_byte_like_v2_2_0` replays route shapes on it and on the current build and compares events/transfers verbatim — the guard that a message without new fields still behaves exactly as mainnet. Replace the fixture with the new live code after each release.
 - **Never read a hop's output asset from its reply.** It is resolved before the hop runs — `ask_asset_info` if supplied, else the pool's `Pair {}`/`GetConfig {}`. The venue is not an authority on what it produced; `pool_address` has no allowlist.
 - CLMM swaps support both native and CW20 tokens; no rounding needed. In estimation mode a pre-execution `Quote` computes `minimum_amount_out` less `ClmmSwapOp::slippage_bps` (default 50 = 0.5%).
 - **Never send `max_spread: None` to an AMM pair.** Choice's `assert_max_spread` no-ops on `None`, but Astroport substitutes its own 0.5% and asserts — invisibly to `SimulateRoute`. `AmmSwapOp::max_spread` defaults to and is clamped at 49%.

@@ -107,6 +107,10 @@ fn get_wasm_byte_code(filename: &str) -> &'static [u8] {
         "mock_clmm_flash.wasm" => include_bytes!("../artifacts/mock_clmm_flash.wasm"),
         "cw20_base.wasm" => include_bytes!("../cw20_base/cw20_base.wasm"),
         "cw20_adapter.wasm" => include_bytes!("../cw20_adapter/cw20_adapter.wasm"),
+        // The code LIVE on mainnet as code id 2067 (sha256 8e86385b…09fb4, equal to
+        // its on-chain `data_hash`). The baseline a message without `receive_as`
+        // must behave identically to.
+        "dex_aggregator_v2_2_0.wasm" => include_bytes!("fixtures/dex_aggregator_v2_2_0.wasm"),
         _ => panic!("Unknown wasm file"),
     }
 }
@@ -632,6 +636,7 @@ fn test_aggregate_swap_success() {
             ],
         }],
         minimum_receive: Some(Uint128::new(1_390_000_000)), // Min 1390 USDT
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -729,6 +734,7 @@ fn test_aggregator_swap_event_emitted() {
             ],
         }],
         minimum_receive: Some(Uint128::new(1_390_000_000)),
+        receive_as: None,
     };
 
     let res = wasm
@@ -808,6 +814,7 @@ fn test_simulate_route_orderbook_buy_needs_no_buffer() {
                     }],
                 }],
                 amount_in: Coin::new(1_000_000_000u128, "usdt"), // 1000 USDT, aggregator holds 0 usdt
+                receive_as: None,
             },
         )
         .unwrap();
@@ -848,6 +855,7 @@ fn test_orderbook_buy_crosses_multiple_price_levels() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -941,6 +949,7 @@ fn test_multi_stage_aggregate_swap_success() {
         ],
         // The minimum we expect from summing the Stage 2 outputs.
         minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
+        receive_as: None,
     };
 
     // The initial funds for this route are 1,000 USDT
@@ -1476,6 +1485,7 @@ fn test_full_normalization_route() {
             },
         ],
         minimum_receive: Some(Uint128::new(97000000)), // 97 SAI
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -1555,6 +1565,7 @@ fn test_multi_stage_with_final_normalization() {
         ],
         // The final expected output is unified CW20 SHROOM
         minimum_receive: Some(Uint128::new(9900000000)), // Min 9,900 CW20 SHROOM
+        receive_as: None,
     };
 
     // The user initiates the swap with 1,000 USDT
@@ -1636,6 +1647,7 @@ fn test_cw20_entry_point_swap_success() {
             }],
         }],
         minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -1723,6 +1735,7 @@ fn test_reverse_normalization_route() {
             },
         ],
         minimum_receive: Some(Uint128::new(495000000)), // Min 495 USDT
+        receive_as: None,
     };
 
     let initial_balance = bank
@@ -1814,6 +1827,7 @@ fn test_failure_if_minimum_receive_not_met() {
         }],
 
         minimum_receive: Some(Uint128::new(1920000001)),
+        receive_as: None,
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj");
@@ -1893,6 +1907,7 @@ fn test_failure_on_invalid_percentage_sum() {
             ],
         }],
         minimum_receive: None,
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -1995,6 +2010,7 @@ fn test_mixed_input_unified_output_reconciliation() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some(Uint128::new(459000000)), // Min 459 USDT (Target is 460)
+        receive_as: None,
         stages: vec![stage1, stage2],
     };
 
@@ -2101,6 +2117,7 @@ fn test_cw20_input_with_initial_reconciliation() {
     // The hook message sent with the CW20 token
     let hook_msg = Cw20HookMsg::ExecuteRoute {
         minimum_receive: Some(Uint128::new(469000000)), // Min 469 USDT (Target is 470)
+        receive_as: None,
         stages: vec![stage1],
     };
 
@@ -2225,6 +2242,7 @@ fn test_complex_reconciliation_mixed_to_mixed() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some(Uint128::new(424000000)), // Min 424 USDT (Target is 425)
+        receive_as: None,
         stages: vec![stage1, stage2],
     };
 
@@ -2307,6 +2325,7 @@ fn test_final_output_is_cw20_token() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI (Target is 100)
+        receive_as: None,
         stages: vec![stage1, stage2],
     };
 
@@ -2420,6 +2439,7 @@ fn test_native_input_with_initial_cw20_requirement() {
 
     let msg = ExecuteMsg::ExecuteRoute {
         minimum_receive: Some(Uint128::new(99000000)), // Min 99 SAI (Target is 100)
+        receive_as: None,
         stages: vec![stage1],
     };
 
@@ -2494,6 +2514,7 @@ fn test_zero_amount_from_split_is_handled_gracefully() {
         // A positive floor is mandatory. The 1-wei route produces 0 output, so it
         // must fail *gracefully* (MinimumReceiveNotMet) — not panic — and roll back.
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     let initial_usdt_balance = bank
@@ -2567,6 +2588,7 @@ fn test_stage_with_single_hundred_percent_split() {
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1, stage2],
         minimum_receive: Some(Uint128::new(99000000000000000000)), // Min 99 INJ
+        receive_as: None,
     };
 
     let funds_to_send = Coin::new(100_000_000_000_000_000_000u128, "inj"); // 100 INJ
@@ -2675,6 +2697,7 @@ fn test_intermediate_swap_failure_reverts_transaction() {
         stages: vec![stage1, stage2],
         // Positive floor required; the tx fails later at the invalid intermediate hop.
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     // Execute the transaction
@@ -2753,6 +2776,7 @@ fn test_fee_collection_on_single_swap() {
             }],
         }],
         minimum_receive: Some(Uint128::new(996000000)), // Min 996 USDT
+        receive_as: None,
     };
 
     let initial_collector_balance_res = bank
@@ -2886,6 +2910,7 @@ fn test_fee_collection_on_cw20_output() {
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
         minimum_receive: Some(Uint128::new(984000000)), // Min 984 SHROOM
+        receive_as: None,
     };
 
     // Execute the transaction
@@ -3025,6 +3050,7 @@ fn test_full_admin_fee_lifecycle() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
     wasm.execute(
         &env.aggregator_addr,
@@ -3187,6 +3213,7 @@ fn test_multi_split_with_mixed_fees() {
     let msg = ExecuteMsg::ExecuteRoute {
         stages: vec![stage1],
         minimum_receive: Some(Uint128::new(1595000000)), // Min 1595 USDT
+        receive_as: None,
     };
 
     // Execute the transaction
@@ -3285,6 +3312,7 @@ fn test_fee_truncates_to_zero() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     // Execute the transaction
@@ -3517,6 +3545,7 @@ fn test_multi_hop_path_with_mid_path_conversion() {
             }],
         }],
         minimum_receive: Some(Uint128::new(49000000000000000000)), // Min 49 INJ
+        receive_as: None,
     };
 
     let funds_to_send = Coin::new(10_000_000_000_000_000_000u128, "inj"); // 10 INJ
@@ -3753,6 +3782,7 @@ fn test_multi_split_to_same_orderbook_contract() {
             splits: vec![ob_split(40), ob_split(60)],
         }],
         minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
+        receive_as: None,
     };
 
     // Get user's initial USDT balance for final assertion.
@@ -3846,6 +3876,7 @@ fn test_multi_hop_consecutive_orderbook_swaps() {
             splits: vec![Split { percent: 100, path }],
         }],
         minimum_receive: Some(Uint128::new(1)), // recalibrated after live-market run
+        receive_as: None,
     };
 
     let initial_inj_balance = bank
@@ -3951,6 +3982,7 @@ fn test_clmm_single_hop_swap() {
             }],
         }],
         minimum_receive: Some(Uint128::new(149_000_000)), // 149 USDT
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -4019,6 +4051,7 @@ fn test_clmm_single_hop_swap_direct_mode() {
             }],
         }],
         minimum_receive: Some(Uint128::new(149_000_000)),
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -4097,6 +4130,7 @@ fn test_clmm_mixed_with_amm_split() {
             ],
         }],
         minimum_receive: Some(Uint128::new(1_200_000_000)), // 1200 USDT
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -4170,6 +4204,7 @@ fn test_clmm_multi_hop() {
             },
         ],
         minimum_receive: Some(Uint128::new(1_400_000_000)), // 1400 USDT
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -4920,6 +4955,7 @@ fn test_zero_minimum_receive_is_rejected() {
         &ExecuteMsg::ExecuteRoute {
             stages: route.clone(),
             minimum_receive: None,
+            receive_as: None,
         },
         &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
         &env.user,
@@ -4936,6 +4972,7 @@ fn test_zero_minimum_receive_is_rejected() {
         &ExecuteMsg::ExecuteRoute {
             stages: route,
             minimum_receive: Some(Uint128::zero()),
+            receive_as: None,
         },
         &[Coin::new(1_000_000_000_000_000_000u128, "inj")],
         &env.user,
@@ -4980,6 +5017,7 @@ fn test_orderbook_surplus_to_fee_collector_and_contract_drains() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -5067,6 +5105,7 @@ fn test_closed_cycle_ob_buy_surplus_not_stranded() {
             },
         ],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -5133,6 +5172,7 @@ fn test_amm_route_leaves_no_residue() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
 
     let res = wasm.execute(
@@ -5258,6 +5298,7 @@ fn test_fee_on_non_final_stage_is_paid_once_to_collector() {
     let msg = ExecuteMsg::ExecuteRoute {
         stages: route,
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
     let funds = [Coin::new(10_000_000_000_000_000_000u128, "inj")]; // 10 INJ
 
@@ -5395,6 +5436,7 @@ fn test_hostile_pool_cannot_drain_contract_balance() {
                 }],
             }],
             minimum_receive: Some(Uint128::new(1)),
+            receive_as: None,
         },
         &[Coin::new(1u128, "inj")], // 1 wei of INJ is the entire cost of the attack
         &attacker,
@@ -5474,6 +5516,7 @@ fn test_subtick_orderbook_split_is_a_zero_value_path_not_a_revert() {
             &QueryMsg::SimulateRoute {
                 stages: stages.clone(),
                 amount_in: Coin::new(amount_in, "inj"),
+                receive_as: None,
             },
         )
         .unwrap();
@@ -5488,6 +5531,7 @@ fn test_subtick_orderbook_split_is_a_zero_value_path_not_a_revert() {
         &ExecuteMsg::ExecuteRoute {
             stages,
             minimum_receive: Some(Uint128::new(1)),
+            receive_as: None,
         },
         &[Coin::new(amount_in, "inj")],
         &env.user,
@@ -5552,6 +5596,7 @@ fn test_ob_buy_unspent_input_returns_to_user() {
                 }],
             }],
             minimum_receive: Some(Uint128::new(1)),
+            receive_as: None,
         },
         &[Coin::new(amount_in, "usdt")],
         &env.user,
@@ -5604,6 +5649,7 @@ fn test_direct_mode_orderbook_quantity_is_tick_rounded() {
             }],
         }],
         minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
     };
     let funds = [Coin::new(1_000_000u128, "usdt")]; // 1 USDT, ample margin
 
@@ -5668,6 +5714,7 @@ fn test_simulate_matches_execution_for_direct_mode_orderbook() {
                 &QueryMsg::SimulateRoute {
                     stages: stages.clone(),
                     amount_in: Coin::new(funds_amount, "usdt"),
+                    receive_as: None,
                 },
             )
             .unwrap();
@@ -5678,6 +5725,7 @@ fn test_simulate_matches_execution_for_direct_mode_orderbook() {
                 &ExecuteMsg::ExecuteRoute {
                     stages,
                     minimum_receive: Some(Uint128::new(1)),
+                    receive_as: None,
                 },
                 &[Coin::new(funds_amount, "usdt")],
                 &env.user,
@@ -5885,6 +5933,7 @@ fn test_mixed_cw20_native_stage_converts_exactly_what_it_allocates() {
                 ],
             }],
             minimum_receive: Some(Uint128::new(1)),
+            receive_as: None,
         },
         &[Coin {
             denom: setup.native_shroom_denom.clone(),
@@ -5928,4 +5977,1256 @@ fn test_mixed_cw20_native_stage_converts_exactly_what_it_allocates() {
         Uint128::zero(),
         "the conversion over-shot and refunded CW20 dust"
     );
+}
+
+// ===========================================================================
+// v2.2.1 — `receive_as`, White Whale simulation replies, form changes between
+// hops in `SimulateRoute`, and parity with the LIVE 2.2.0 code for every message
+// that does not carry the new field.
+// ===========================================================================
+
+/// The conversion fixture plus the two venues `receive_as` needs: an AMM that pays
+/// BANK SHROOM (the bank-form twin of `mock_inj_to_cw20_shroom_amm`) and one that
+/// takes it.
+struct ReceiveAsSetup {
+    base: ConversionTestSetup,
+    mock_code_id: u64,
+    /// INJ -> bank SHROOM at 100.
+    amm_inj_to_bank_shroom: String,
+    /// bank SHROOM -> USDT at 0.4.
+    amm_bank_shroom_to_usdt: String,
+}
+
+fn instantiate_mock(
+    wasm: &Wasm<InjectiveTestApp>,
+    admin: &SigningAccount,
+    code_id: u64,
+    config: SwapConfig,
+) -> String {
+    wasm.instantiate(
+        code_id,
+        &MockInstantiateMsg { config },
+        Some(&admin.address()),
+        Some("mock"),
+        &[],
+        admin,
+    )
+    .unwrap()
+    .data
+    .address
+}
+
+fn setup_for_receive_as_test() -> ReceiveAsSetup {
+    let base = setup_for_conversion_test();
+    let (mock_code_id, amm_inj_to_bank_shroom, amm_bank_shroom_to_usdt) = {
+        let wasm = Wasm::new(&base.env.app);
+        let bank = Bank::new(&base.env.app);
+        let admin = &base.env.admin;
+        let bank_shroom = AssetInfo::NativeToken {
+            denom: base.native_shroom_denom.clone(),
+        };
+
+        let mock_code_id = wasm
+            .store_code(get_wasm_byte_code("mock_swap.wasm"), None, admin)
+            .unwrap()
+            .data
+            .code_id;
+        let to_bank = instantiate_mock(
+            &wasm,
+            admin,
+            mock_code_id,
+            SwapConfig {
+                input_asset_info: AssetInfo::NativeToken {
+                    denom: "inj".to_string(),
+                },
+                output_asset_info: bank_shroom.clone(),
+                rate: "100.0".to_string(),
+                protocol_type: ProtocolType::Amm,
+                input_decimals: 18,
+                output_decimals: 6,
+            },
+        );
+        let from_bank = instantiate_mock(
+            &wasm,
+            admin,
+            mock_code_id,
+            SwapConfig {
+                input_asset_info: bank_shroom,
+                output_asset_info: AssetInfo::NativeToken {
+                    denom: "usdt".to_string(),
+                },
+                rate: "0.4".to_string(),
+                protocol_type: ProtocolType::Amm,
+                input_decimals: 6,
+                output_decimals: 6,
+            },
+        );
+        for (to, denom, amount) in [
+            (&to_bank, base.native_shroom_denom.as_str(), micro(100_000, 6)),
+            (&from_bank, "usdt", micro(10_000, 6)),
+        ] {
+            bank.send(
+                MsgSend {
+                    from_address: admin.address(),
+                    to_address: to.clone(),
+                    amount: vec![ProtoCoin {
+                        denom: denom.to_string(),
+                        amount: amount.to_string(),
+                    }],
+                },
+                admin,
+            )
+            .unwrap();
+        }
+        (mock_code_id, to_bank, from_bank)
+    };
+    ReceiveAsSetup {
+        base,
+        mock_code_id,
+        amm_inj_to_bank_shroom,
+        amm_bank_shroom_to_usdt,
+    }
+}
+
+/// A second aggregator on the LIVE 2.2.0 code (the fixture), configured exactly like
+/// `env.aggregator_addr`.
+fn instantiate_live_v2_2_0(env: &TestEnv) -> String {
+    let wasm = Wasm::new(&env.app);
+    let config: AggregatorConfig = wasm
+        .query(&env.aggregator_addr, &QueryMsg::Config {})
+        .unwrap();
+    let code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator_v2_2_0.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+    wasm.instantiate(
+        code_id,
+        &InstantiateMsg {
+            admin: config.admin.to_string(),
+            cw20_adapter_address: config.cw20_adapter_address.to_string(),
+            fee_collector_address: config.fee_collector.to_string(),
+        },
+        Some(&env.admin.address()),
+        Some("aggregator-v2.2.0"),
+        &[],
+        &env.admin,
+    )
+    .unwrap()
+    .data
+    .address
+}
+
+fn cw20_bal(wasm: &Wasm<InjectiveTestApp>, token: &str, addr: &str) -> u128 {
+    let res: BalanceResponse = wasm
+        .query(
+            token,
+            &Cw20QueryMsg::Balance {
+                address: addr.to_string(),
+            },
+        )
+        .unwrap();
+    res.balance.u128()
+}
+
+fn native_info(denom: &str) -> amm::AssetInfo {
+    amm::AssetInfo::NativeToken {
+        denom: denom.to_string(),
+    }
+}
+
+fn cw20_info(contract_addr: &str) -> amm::AssetInfo {
+    amm::AssetInfo::Token {
+        contract_addr: contract_addr.to_string(),
+    }
+}
+
+fn amm_op(pool: &str, offer: amm::AssetInfo) -> Operation {
+    Operation::AmmSwap(AmmSwapOp {
+        ask_asset_info: None,
+        max_spread: None,
+        pool_address: pool.to_string(),
+        offer_asset_info: offer,
+    })
+}
+
+fn one_split(path: Vec<Operation>) -> Vec<Stage> {
+    vec![Stage {
+        splits: vec![Split { percent: 100, path }],
+    }]
+}
+
+/// `msg` exactly as a pre-2.2.1 caller (the arb bot, v1 callers) sends it: the
+/// `receive_as` key absent altogether, not `null`.
+fn without_receive_as<M: serde::Serialize>(msg: &M) -> serde_json::Value {
+    let mut value = serde_json::to_value(msg).unwrap();
+    for body in value.as_object_mut().unwrap().values_mut() {
+        body.as_object_mut().unwrap().remove("receive_as");
+    }
+    value
+}
+
+/// The `final_received` the aggregator reported for a completed route.
+fn final_received(events: &[cosmwasm_std::Event]) -> u128 {
+    events
+        .iter()
+        .find(|e| {
+            e.ty.starts_with("wasm")
+                && e.attributes
+                    .iter()
+                    .any(|a| a.key == "action" && a.value == "aggregate_swap_complete")
+        })
+        .and_then(|e| e.attributes.iter().find(|a| a.key == "final_received"))
+        .map(|a| a.value.parse().unwrap())
+        .expect("no aggregate_swap_complete event")
+}
+
+/// Every contract event of a route plus every bank transfer to or from the
+/// aggregator `agg`, with `agg` rewritten to `as_agg` — so two instances' runs of
+/// the same route compare verbatim. (Fee-payment events are left out: the fee
+/// follows the gas, which is expected to differ.)
+fn route_events(
+    events: &[cosmwasm_std::Event],
+    agg: &str,
+    as_agg: &str,
+) -> Vec<(String, Vec<(String, String)>)> {
+    events
+        .iter()
+        .filter(|e| {
+            e.ty.starts_with("wasm")
+                || (e.ty == "transfer" && e.attributes.iter().any(|a| a.value == agg))
+        })
+        .map(|e| {
+            (
+                e.ty.clone(),
+                e.attributes
+                    .iter()
+                    .map(|a| (a.key.clone(), a.value.replace(agg, as_agg)))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// The main change. The route's last hop pays CW20 SHROOM, and the caller asks for
+/// the bank form (what a Choice v2 EVM user holds: the MTS pair is on the bank
+/// denom). The output is converted through the adapter and paid in bank SHROOM,
+/// `minimum_receive` gates what is paid, and the gate quotes the same amount.
+///
+/// Both fund-safety invariants are pinned through the new path: idle balances of
+/// BOTH forms already in the contract are neither paid out nor disturbed (the
+/// requested form is snapshotted at entry), and nothing else is left behind.
+#[test]
+fn test_receive_as_pays_a_cw20_output_in_bank_form() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+
+    let idle_cw20 = 5_000_000u128;
+    let idle_bank = 3_000_000u128;
+    wasm.execute(
+        shroom,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: agg.clone(),
+            amount: Uint128::new(idle_cw20),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    bank.send(
+        MsgSend {
+            from_address: env.admin.address(),
+            to_address: agg.clone(),
+            amount: vec![ProtoCoin {
+                denom: bank_shroom.clone(),
+                amount: idle_bank.to_string(),
+            }],
+        },
+        &env.admin,
+    )
+    .unwrap();
+
+    let stages = one_split(vec![amm_op(
+        &s.base.mock_inj_to_cw20_shroom_amm,
+        native_info("inj"),
+    )]);
+    let funds = [Coin::new(micro(10, 18), "inj")];
+    let expected = micro(1_000, 6); // 10 INJ at 100
+
+    let sim: SimulateRouteResponse = wasm
+        .query(
+            agg,
+            &QueryMsg::SimulateRoute {
+                stages: stages.clone(),
+                amount_in: funds[0].clone(),
+                receive_as: Some(native_info(bank_shroom)),
+            },
+        )
+        .unwrap();
+    assert_eq!(sim.output_amount.u128(), expected);
+
+    let route = |minimum: u128| ExecuteMsg::ExecuteRoute {
+        stages: stages.clone(),
+        minimum_receive: Some(Uint128::new(minimum)),
+        receive_as: Some(native_info(bank_shroom)),
+    };
+
+    let err = wasm
+        .execute(agg, &route(expected + 1), &funds, &env.user)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Minimum receive amount not met"),
+        "minimum_receive must gate the converted payout: {err}"
+    );
+
+    let bank_before = regression_bal(&bank, &user, bank_shroom);
+    let cw20_before = cw20_bal(&wasm, shroom, &user);
+    let res = wasm
+        .execute(agg, &route(expected), &funds, &env.user)
+        .unwrap();
+
+    assert_eq!(final_received(&res.events), expected);
+    assert_eq!(
+        regression_bal(&bank, &user, bank_shroom) - bank_before,
+        expected,
+        "the output must be paid in bank SHROOM"
+    );
+    assert_eq!(
+        cw20_bal(&wasm, shroom, &user),
+        cw20_before,
+        "no CW20 SHROOM may be paid"
+    );
+    let swap = res
+        .events
+        .iter()
+        .find(|e| e.ty == "wasm-aggregator_swap")
+        .expect("aggregator_swap event not emitted");
+    assert!(swap
+        .attributes
+        .iter()
+        .any(|a| a.key == "swap_final_denom" && &a.value == bank_shroom));
+
+    assert_eq!(regression_bal(&bank, agg, bank_shroom), idle_bank, "idle bank SHROOM moved");
+    assert_eq!(cw20_bal(&wasm, shroom, agg), idle_cw20, "idle CW20 SHROOM moved");
+    assert_eq!(regression_bal(&bank, agg, "inj"), 0, "INJ left behind");
+}
+
+/// The same field on the CW20 `Receive` hook: CW20 SHROOM in, CW20 SAI out of the
+/// last hop, paid as bank SAI.
+#[test]
+fn test_receive_as_on_the_cw20_receive_hook() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let sai = &s.base.sai_cw20_addr;
+    let bank_sai = format!("factory/{}/{}", s.base.adapter_addr, sai);
+
+    let amount = micro(1_000, 6);
+    wasm.execute(
+        shroom,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: user.clone(),
+            amount: Uint128::new(amount),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    let hook = Cw20HookMsg::ExecuteRoute {
+        stages: one_split(vec![amm_op(
+            &s.base.mock_cw20_shroom_to_cw20_sai_amm,
+            cw20_info(shroom),
+        )]),
+        minimum_receive: Some(Uint128::new(micro(100, 6))),
+        receive_as: Some(native_info(&bank_sai)),
+    };
+    let res = wasm
+        .execute(
+            shroom,
+            &cw20::Cw20ExecuteMsg::Send {
+                contract: agg.clone(),
+                amount: Uint128::new(amount),
+                msg: to_json_binary(&hook).unwrap(),
+            },
+            &[],
+            &env.user,
+        )
+        .unwrap();
+
+    assert_eq!(final_received(&res.events), micro(100, 6)); // 1000 SHROOM at 0.1
+    assert_eq!(regression_bal(&bank, &user, &bank_sai), micro(100, 6));
+    assert_eq!(cw20_bal(&wasm, sai, &user), 0);
+    assert_eq!(cw20_bal(&wasm, sai, agg), 0);
+    assert_eq!(regression_bal(&bank, agg, &bank_sai), 0);
+    assert_eq!(cw20_bal(&wasm, shroom, agg), 0);
+}
+
+/// The other direction: the last hop pays bank SHROOM, the caller asks for the CW20.
+#[test]
+fn test_receive_as_pays_a_bank_output_in_cw20_form() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+
+    let stages = one_split(vec![amm_op(&s.amm_inj_to_bank_shroom, native_info("inj"))]);
+    let funds = [Coin::new(micro(10, 18), "inj")];
+    let expected = micro(1_000, 6);
+
+    let sim: SimulateRouteResponse = wasm
+        .query(
+            agg,
+            &QueryMsg::SimulateRoute {
+                stages: stages.clone(),
+                amount_in: funds[0].clone(),
+                receive_as: Some(cw20_info(shroom)),
+            },
+        )
+        .unwrap();
+    assert_eq!(sim.output_amount.u128(), expected);
+
+    let bank_before = regression_bal(&bank, &user, bank_shroom);
+    let res = wasm
+        .execute(
+            agg,
+            &ExecuteMsg::ExecuteRoute {
+                stages,
+                minimum_receive: Some(Uint128::new(expected)),
+                receive_as: Some(cw20_info(shroom)),
+            },
+            &funds,
+            &env.user,
+        )
+        .unwrap();
+
+    assert_eq!(final_received(&res.events), expected);
+    assert_eq!(cw20_bal(&wasm, shroom, &user), expected, "paid in CW20 SHROOM");
+    assert_eq!(regression_bal(&bank, &user, bank_shroom), bank_before);
+    assert_eq!(cw20_bal(&wasm, shroom, agg), 0);
+    assert_eq!(regression_bal(&bank, agg, bank_shroom), 0);
+}
+
+/// A last stage whose splits end in BOTH forms. Without the field the payout
+/// normalizes onto the first one to complete (CW20 here); with it, onto the form
+/// asked for — only the other split's output goes through the adapter.
+#[test]
+fn test_receive_as_normalizes_mixed_forms_onto_the_requested_one() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+
+    let stages = vec![Stage {
+        splits: vec![
+            Split {
+                percent: 50,
+                path: vec![amm_op(&s.base.mock_inj_to_cw20_shroom_amm, native_info("inj"))],
+            },
+            Split {
+                percent: 50,
+                path: vec![amm_op(&s.amm_inj_to_bank_shroom, native_info("inj"))],
+            },
+        ],
+    }];
+    let funds = [Coin::new(micro(10, 18), "inj")];
+    let expected = micro(1_000, 6);
+
+    let sim: SimulateRouteResponse = wasm
+        .query(
+            agg,
+            &QueryMsg::SimulateRoute {
+                stages: stages.clone(),
+                amount_in: funds[0].clone(),
+                receive_as: Some(native_info(bank_shroom)),
+            },
+        )
+        .unwrap();
+    assert_eq!(sim.output_amount.u128(), expected);
+
+    let cw20_before = cw20_bal(&wasm, shroom, &user);
+    let bank_before = regression_bal(&bank, &user, bank_shroom);
+    wasm.execute(
+        agg,
+        &ExecuteMsg::ExecuteRoute {
+            stages,
+            minimum_receive: Some(Uint128::new(expected)),
+            receive_as: Some(native_info(bank_shroom)),
+        },
+        &funds,
+        &env.user,
+    )
+    .unwrap();
+
+    assert_eq!(regression_bal(&bank, &user, bank_shroom) - bank_before, expected);
+    assert_eq!(cw20_bal(&wasm, shroom, &user), cw20_before);
+    assert_eq!(cw20_bal(&wasm, shroom, agg), 0);
+    assert_eq!(regression_bal(&bank, agg, bank_shroom), 0);
+}
+
+/// Asking for the form the route already pays in changes nothing: same payout,
+/// same events, and the adapter is never called.
+#[test]
+fn test_receive_as_in_the_form_already_paid_is_a_no_op() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+
+    let route = |receive_as: Option<amm::AssetInfo>| ExecuteMsg::ExecuteRoute {
+        stages: one_split(vec![amm_op(
+            &s.base.mock_inj_to_cw20_shroom_amm,
+            native_info("inj"),
+        )]),
+        minimum_receive: Some(Uint128::new(1)),
+        receive_as,
+    };
+    let funds = [Coin::new(micro(1, 18), "inj")];
+
+    let before = cw20_bal(&wasm, shroom, &user);
+    let plain = wasm
+        .execute(agg, &without_receive_as(&route(None)), &funds, &env.user)
+        .unwrap();
+    let mid = cw20_bal(&wasm, shroom, &user);
+    let asked = wasm
+        .execute(agg, &route(Some(cw20_info(shroom))), &funds, &env.user)
+        .unwrap();
+    let after = cw20_bal(&wasm, shroom, &user);
+
+    assert_eq!(mid - before, micro(100, 6));
+    assert_eq!(after - mid, mid - before, "same payout");
+    assert_eq!(
+        route_events(&asked.events, agg, agg),
+        route_events(&plain.events, agg, agg),
+        "same contract events and transfers"
+    );
+    assert!(
+        !asked.events.iter().any(|e| e
+            .attributes
+            .iter()
+            .any(|a| a.key == "_contract_address" && a.value == s.base.adapter_addr)),
+        "the adapter must not be called"
+    );
+}
+
+/// `receive_as` chooses a form, never an asset. Anything that is not the payout's
+/// own CW20 or its bank denom under the CONFIGURED adapter is refused — by the gate
+/// and by execution, with the same error — and nothing moves.
+#[test]
+fn test_receive_as_naming_another_asset_is_rejected() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let sai = &s.base.sai_cw20_addr;
+
+    let stages = one_split(vec![amm_op(
+        &s.base.mock_inj_to_cw20_shroom_amm,
+        native_info("inj"),
+    )]);
+    let funds = [Coin::new(micro(1, 18), "inj")];
+    let cw20_before = cw20_bal(&wasm, shroom, &user);
+
+    for wrong in [
+        // An unrelated native.
+        native_info("usdt"),
+        // A different CW20, and that CW20's own bank form.
+        cw20_info(sai),
+        native_info(&format!("factory/{}/{}", s.base.adapter_addr, sai)),
+        // SHROOM wrapped by some other "adapter".
+        native_info(&format!("factory/{}/{}", env.admin.address(), shroom)),
+    ] {
+        let sim_err = wasm
+            .query::<_, SimulateRouteResponse>(
+                agg,
+                &QueryMsg::SimulateRoute {
+                    stages: stages.clone(),
+                    amount_in: funds[0].clone(),
+                    receive_as: Some(wrong.clone()),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            sim_err.to_string().contains("is not the asset this route pays out"),
+            "{wrong:?}: gate gave {sim_err}"
+        );
+        let err = wasm
+            .execute(
+                agg,
+                &ExecuteMsg::ExecuteRoute {
+                    stages: stages.clone(),
+                    minimum_receive: Some(Uint128::new(1)),
+                    receive_as: Some(wrong.clone()),
+                },
+                &funds,
+                &env.user,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not the asset this route pays out"),
+            "{wrong:?}: execution gave {err}"
+        );
+    }
+
+    assert_eq!(cw20_bal(&wasm, shroom, &user), cw20_before);
+    assert_eq!(cw20_bal(&wasm, shroom, agg), 0);
+    assert_eq!(regression_bal(&bank, agg, "inj"), 0);
+}
+
+/// The adapter refusing the payout conversion reverts the whole route: the swap is
+/// undone, the user keeps their input, and nothing is left in the contract.
+///
+/// The refusal here is the real one: wrapping a CW20 the adapter has never
+/// registered makes it register on the fly, which it can only do if it holds the
+/// denom-creation fee itself.
+#[test]
+fn test_receive_as_reverts_atomically_when_the_adapter_refuses() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let user = env.user.address();
+    let adapter = &s.base.adapter_addr;
+
+    let cw20_code_id = wasm
+        .store_code(get_wasm_byte_code("cw20_base.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+    let nope = wasm
+        .instantiate(
+            cw20_code_id,
+            &Cw20InstantiateMsg {
+                name: "Unregistered".to_string(),
+                symbol: "NOPE".to_string(),
+                decimals: 6,
+                initial_balances: vec![],
+                mint: Some(cw20::MinterResponse {
+                    minter: env.admin.address(),
+                    cap: None,
+                }),
+                marketing: None,
+            },
+            Some(&env.admin.address()),
+            Some("nope"),
+            &[],
+            &env.admin,
+        )
+        .unwrap()
+        .data
+        .address;
+    let amm_inj_to_nope = instantiate_mock(
+        &wasm,
+        &env.admin,
+        s.mock_code_id,
+        SwapConfig {
+            input_asset_info: AssetInfo::NativeToken {
+                denom: "inj".to_string(),
+            },
+            output_asset_info: AssetInfo::Token {
+                contract_addr: nope.clone(),
+            },
+            rate: "100.0".to_string(),
+            protocol_type: ProtocolType::Amm,
+            input_decimals: 18,
+            output_decimals: 6,
+        },
+    );
+    wasm.execute(
+        &nope,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: amm_inj_to_nope.clone(),
+            amount: Uint128::new(micro(100_000, 6)),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    println!(
+        "adapter INJ balance (pays any on-the-fly registration): {}",
+        regression_bal(&bank, adapter, "inj")
+    );
+
+    let bank_nope = format!("factory/{adapter}/{nope}");
+    let pool_before = cw20_bal(&wasm, &nope, &amm_inj_to_nope);
+    let err = wasm
+        .execute(
+            agg,
+            &ExecuteMsg::ExecuteRoute {
+                stages: one_split(vec![amm_op(&amm_inj_to_nope, native_info("inj"))]),
+                minimum_receive: Some(Uint128::new(1)),
+                receive_as: Some(native_info(&bank_nope)),
+            },
+            &[Coin::new(micro(1, 18), "inj")],
+            &env.user,
+        )
+        .unwrap_err();
+    println!("adapter refusal: {err}");
+
+    assert_eq!(cw20_bal(&wasm, &nope, &amm_inj_to_nope), pool_before, "swap not undone");
+    assert_eq!(cw20_bal(&wasm, &nope, &user), 0);
+    assert_eq!(regression_bal(&bank, &user, &bank_nope), 0);
+    assert_eq!(cw20_bal(&wasm, &nope, agg), 0);
+    assert_eq!(regression_bal(&bank, agg, "inj"), 0);
+}
+
+/// Invariant 1 through the new path. A caller-written pool that reports a CW20
+/// output it never delivers, paired with `receive_as` = the bank form, must not
+/// turn into a conversion (or a payout) of the contract's idle balance of EITHER
+/// form.
+#[test]
+fn test_receive_as_cannot_pay_out_an_unbacked_output() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let agg = &env.aggregator_addr;
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+
+    let idle = 1_000_000u128;
+    wasm.execute(
+        shroom,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: agg.clone(),
+            amount: Uint128::new(idle),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+    bank.send(
+        MsgSend {
+            from_address: env.admin.address(),
+            to_address: agg.clone(),
+            amount: vec![ProtoCoin {
+                denom: bank_shroom.clone(),
+                amount: idle.to_string(),
+            }],
+        },
+        &env.admin,
+    )
+    .unwrap();
+
+    let attacker = env
+        .app
+        .init_account(&[Coin::new(micro(10, 18), "inj")])
+        .unwrap();
+    let hostile = instantiate_mock(
+        &wasm,
+        &attacker,
+        s.mock_code_id,
+        SwapConfig {
+            input_asset_info: AssetInfo::NativeToken {
+                denom: "inj".to_string(),
+            },
+            output_asset_info: AssetInfo::Token {
+                contract_addr: shroom.clone(),
+            },
+            rate: "1.0".to_string(),
+            protocol_type: ProtocolType::Amm,
+            input_decimals: 18,
+            output_decimals: 6,
+        },
+    );
+    wasm.execute(
+        &hostile,
+        &MockExecuteMsg::SetPhantom {
+            amount: Uint128::new(idle),
+            denom: shroom.clone(),
+        },
+        &[],
+        &attacker,
+    )
+    .unwrap();
+
+    let err = wasm
+        .execute(
+            agg,
+            &ExecuteMsg::ExecuteRoute {
+                stages: one_split(vec![amm_op(&hostile, native_info("inj"))]),
+                minimum_receive: Some(Uint128::new(1)),
+                receive_as: Some(native_info(bank_shroom)),
+            },
+            &[Coin::new(1u128, "inj")],
+            &attacker,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Minimum receive amount not met") || err.contains("did not deliver"),
+        "expected the route to be rejected as unbacked, got: {err}"
+    );
+    assert_eq!(regression_bal(&bank, &attacker.address(), bank_shroom), 0);
+    assert_eq!(cw20_bal(&wasm, shroom, &attacker.address()), 0);
+    assert_eq!(regression_bal(&bank, agg, bank_shroom), idle);
+    assert_eq!(cw20_bal(&wasm, shroom, agg), idle);
+}
+
+/// A message WITHOUT `receive_as` — what the arb bot and every v1 caller sends —
+/// must behave exactly as the live 2.2.0 code: the same contract events, the same
+/// transfers to and from the aggregator, the same payouts. Each route runs once on
+/// a 2.2.0 instance (the mainnet bytecode, code id 2067) and once on 2.2.1, and the
+/// two runs are compared verbatim.
+#[test]
+fn test_without_receive_as_behaves_byte_for_byte_like_v2_2_0() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let new = env.aggregator_addr.clone();
+    let old = instantiate_live_v2_2_0(env);
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let sai = &s.base.sai_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+
+    wasm.execute(
+        shroom,
+        &cw20_base::msg::ExecuteMsg::Mint {
+            recipient: user.clone(),
+            amount: Uint128::new(micro(1_000, 6)),
+        },
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    let one_inj = [Coin::new(micro(1, 18), "inj")];
+    let routes: Vec<(&str, Vec<Stage>, Vec<Coin>)> = vec![
+        (
+            "native in, CW20 out",
+            one_split(vec![amm_op(&s.base.mock_inj_to_cw20_shroom_amm, native_info("inj"))]),
+            one_inj.to_vec(),
+        ),
+        (
+            "last stage ends in both forms",
+            vec![Stage {
+                splits: vec![
+                    Split {
+                        percent: 50,
+                        path: vec![amm_op(
+                            &s.base.mock_inj_to_cw20_shroom_amm,
+                            native_info("inj"),
+                        )],
+                    },
+                    Split {
+                        percent: 50,
+                        path: vec![amm_op(&s.amm_inj_to_bank_shroom, native_info("inj"))],
+                    },
+                ],
+            }],
+            one_inj.to_vec(),
+        ),
+        (
+            "CW20 -> bank between hops",
+            one_split(vec![
+                amm_op(&s.base.mock_inj_to_cw20_shroom_amm, native_info("inj")),
+                amm_op(&s.amm_bank_shroom_to_usdt, native_info(bank_shroom)),
+            ]),
+            one_inj.to_vec(),
+        ),
+        (
+            "orderbook buy (price-improvement carve + residue sweep)",
+            one_split(vec![Operation::OrderbookSwap(OrderbookSwapOp {
+                market_id: MarketId::new(s.base.market_inj_usdt.clone()).unwrap(),
+                target_denom: "inj".to_string(),
+                quantity: None,
+                worst_price: None,
+            })]),
+            vec![Coin::new(micro(25, 6), "usdt")],
+        ),
+    ];
+
+    let balances = |addr: &str| {
+        (
+            cw20_bal(&wasm, shroom, addr),
+            regression_bal(&bank, addr, bank_shroom),
+            regression_bal(&bank, addr, "usdt"),
+            cw20_bal(&wasm, sai, addr),
+        )
+    };
+    let delta = |a: (u128, u128, u128, u128), b: (u128, u128, u128, u128)| {
+        (
+            b.0 as i128 - a.0 as i128,
+            b.1 as i128 - a.1 as i128,
+            b.2 as i128 - a.2 as i128,
+            b.3 as i128 - a.3 as i128,
+        )
+    };
+
+    for (label, stages, funds) in routes {
+        let msg = without_receive_as(&ExecuteMsg::ExecuteRoute {
+            stages,
+            minimum_receive: Some(Uint128::new(1)),
+            receive_as: None,
+        });
+        let mut runs = vec![];
+        for agg in [&old, &new] {
+            let before = balances(&user);
+            let res = wasm
+                .execute(agg, &msg, &funds, &env.user)
+                .unwrap_or_else(|e| panic!("[{label}] {agg}: {e}"));
+            runs.push((
+                route_events(&res.events, agg, "<aggregator>"),
+                delta(before, balances(&user)),
+                balances(agg),
+                res.gas_info.gas_used,
+            ));
+        }
+        let (old_run, new_run) = (&runs[0], &runs[1]);
+        assert_eq!(new_run.0, old_run.0, "[{label}] contract events / transfers differ");
+        assert_eq!(new_run.1, old_run.1, "[{label}] user balance changes differ");
+        assert_eq!(new_run.2, old_run.2, "[{label}] contract balances differ");
+        println!(
+            "[{label}] gas v2.2.0 = {}, v2.2.1 = {} ({:+})",
+            old_run.3,
+            new_run.3,
+            new_run.3 as i64 - old_run.3 as i64
+        );
+    }
+
+    // The CW20 entry point too.
+    let hook = without_receive_as(&Cw20HookMsg::ExecuteRoute {
+        stages: one_split(vec![amm_op(
+            &s.base.mock_cw20_shroom_to_cw20_sai_amm,
+            cw20_info(shroom),
+        )]),
+        minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
+    });
+    let mut runs = vec![];
+    for agg in [&old, &new] {
+        let before = balances(&user);
+        let res = wasm
+            .execute(
+                shroom,
+                &cw20::Cw20ExecuteMsg::Send {
+                    contract: agg.clone(),
+                    amount: Uint128::new(micro(100, 6)),
+                    msg: to_json_binary(&hook).unwrap(),
+                },
+                &[],
+                &env.user,
+            )
+            .unwrap();
+        runs.push((
+            route_events(&res.events, agg, "<aggregator>"),
+            delta(before, balances(&user)),
+            res.gas_info.gas_used,
+        ));
+    }
+    assert_eq!(runs[1].0, runs[0].0, "[cw20 hook] contract events / transfers differ");
+    assert_eq!(runs[1].1, runs[0].1, "[cw20 hook] user balance changes differ");
+    println!(
+        "[cw20 hook] gas v2.2.0 = {}, v2.2.1 = {} ({:+})",
+        runs[0].2,
+        runs[1].2,
+        runs[1].2 as i64 - runs[0].2 as i64
+    );
+}
+
+/// The release path: a contract instantiated on the live 2.2.0 code migrates to
+/// 2.2.1 with its state intact and then honours `receive_as`.
+///
+/// ⚠️ Also pins the ROLL-OUT hazard: 2.2.0 does not reject unknown fields, so it
+/// ACCEPTS a message carrying `receive_as`, ignores it, and pays the CW20. Callers
+/// must not send the field to an instance until it reports cw2 2.2.1.
+#[test]
+fn test_migrate_live_v2_2_0_instance_to_v2_2_1() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let bank = Bank::new(&env.app);
+    let user = env.user.address();
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+    let agg = instantiate_live_v2_2_0(env);
+
+    let msg = ExecuteMsg::ExecuteRoute {
+        stages: one_split(vec![amm_op(
+            &s.base.mock_inj_to_cw20_shroom_amm,
+            native_info("inj"),
+        )]),
+        minimum_receive: Some(Uint128::new(1)),
+        receive_as: Some(native_info(bank_shroom)),
+    };
+    let funds = [Coin::new(micro(1, 18), "inj")];
+    let paid = micro(100, 6);
+
+    // Before: the field is silently ignored and the CW20 is paid.
+    let cw20_before = cw20_bal(&wasm, shroom, &user);
+    let bank_before = regression_bal(&bank, &user, bank_shroom);
+    wasm.execute(&agg, &msg, &funds, &env.user).unwrap();
+    assert_eq!(cw20_bal(&wasm, shroom, &user) - cw20_before, paid);
+    assert_eq!(regression_bal(&bank, &user, bank_shroom), bank_before);
+
+    let config_before: AggregatorConfig = wasm.query(&agg, &QueryMsg::Config {}).unwrap();
+    let new_code_id = wasm
+        .store_code(get_wasm_byte_code("dex_aggregator.wasm"), None, &env.admin)
+        .unwrap()
+        .data
+        .code_id;
+    let res = wasm
+        .migrate(new_code_id, &agg, &MigrateMsg {}, &env.admin)
+        .expect("migrate 2.2.0 -> 2.2.1");
+    let attr = |key: &str| {
+        res.events
+            .iter()
+            .flat_map(|e| e.attributes.iter())
+            .find(|a| a.key == key)
+            .map(|a| a.value.clone())
+    };
+    assert_eq!(attr("from_version").as_deref(), Some("2.2.0"));
+    assert_eq!(attr("to_version").as_deref(), Some("2.2.1"));
+    let config_after: AggregatorConfig = wasm.query(&agg, &QueryMsg::Config {}).unwrap();
+    assert_eq!(config_after, config_before);
+
+    // After: the same message pays the bank form.
+    let cw20_before = cw20_bal(&wasm, shroom, &user);
+    let bank_before = regression_bal(&bank, &user, bank_shroom);
+    wasm.execute(&agg, &msg, &funds, &env.user).unwrap();
+    assert_eq!(cw20_bal(&wasm, shroom, &user), cw20_before);
+    assert_eq!(regression_bal(&bank, &user, bank_shroom) - bank_before, paid);
+}
+
+/// `SimulateRoute` on a pool that answers `Simulation {}` in White Whale's shape —
+/// no `commission_amount` — quotes what execution then delivers. The live 2.2.0
+/// code fails it exactly as it fails real White Whale pools on mainnet.
+#[test]
+fn test_simulate_route_on_a_white_whale_pool() {
+    let env = setup();
+    let wasm = Wasm::new(&env.app);
+    let old = instantiate_live_v2_2_0(&env);
+
+    let stages = one_split(vec![amm_op(&env.mock_amm_1_addr, native_info("inj"))]);
+    let query = without_receive_as(&QueryMsg::SimulateRoute {
+        stages: stages.clone(),
+        amount_in: Coin::new(micro(1, 18), "inj"),
+        receive_as: None,
+    });
+    let quote = |agg: &str| wasm.query::<_, SimulateRouteResponse>(agg, &query);
+
+    // Choice/Astroport shape: both versions quote it.
+    assert_eq!(quote(&old).unwrap().output_amount.u128(), micro(10, 6));
+    assert_eq!(quote(&env.aggregator_addr).unwrap().output_amount.u128(), micro(10, 6));
+
+    wasm.execute(
+        &env.mock_amm_1_addr,
+        &MockExecuteMsg::SetWhiteWhaleSimulation {},
+        &[],
+        &env.admin,
+    )
+    .unwrap();
+
+    let old_err = quote(&old).unwrap_err().to_string();
+    assert!(
+        old_err.contains("missing field `commission_amount`"),
+        "2.2.0 should fail as it does on mainnet: {old_err}"
+    );
+    let sim = quote(&env.aggregator_addr).unwrap();
+    let res = wasm
+        .execute(
+            &env.aggregator_addr,
+            &ExecuteMsg::ExecuteRoute {
+                stages,
+                minimum_receive: Some(Uint128::new(1)),
+                receive_as: None,
+            },
+            &[Coin::new(micro(1, 18), "inj")],
+            &env.user,
+        )
+        .unwrap();
+    assert_eq!(sim.output_amount.u128(), final_received(&res.events));
+}
+
+/// Routes that change form between hops simulate to what they execute. Execution
+/// converts a hop's output into the form the next hop takes (`PathConversion`);
+/// the gate used to pass it on as-is, and the live 2.2.0 code still fails both.
+#[test]
+fn test_simulate_matches_execution_when_a_path_changes_form() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let old = instantiate_live_v2_2_0(env);
+    let shroom = &s.base.shroom_cw20_addr;
+
+    let cases: Vec<(&str, Vec<Operation>, &str)> = vec![
+        (
+            "CW20 leg into an orderbook hop",
+            vec![
+                amm_op(&s.base.mock_inj_to_cw20_shroom_amm, native_info("inj")),
+                Operation::OrderbookSwap(OrderbookSwapOp {
+                    market_id: MarketId::new(s.base.market_shroom_usdt.clone()).unwrap(),
+                    target_denom: "usdt".to_string(),
+                    quantity: None,
+                    worst_price: None,
+                }),
+            ],
+            "Orderbook simulation only supports native token inputs",
+        ),
+        (
+            "bank leg into a CW20 hop",
+            vec![
+                amm_op(&s.amm_inj_to_bank_shroom, native_info("inj")),
+                amm_op(&s.base.mock_cw20_shroom_to_cw20_sai_amm, cw20_info(shroom)),
+            ],
+            "Invalid offer_asset",
+        ),
+    ];
+
+    for (label, path, old_error) in cases {
+        let stages = one_split(path);
+        let amount_in = Coin::new(micro(1, 18), "inj");
+        let query = without_receive_as(&QueryMsg::SimulateRoute {
+            stages: stages.clone(),
+            amount_in: amount_in.clone(),
+            receive_as: None,
+        });
+
+        let old_err = wasm
+            .query::<_, SimulateRouteResponse>(&old, &query)
+            .unwrap_err()
+            .to_string();
+        assert!(old_err.contains(old_error), "[{label}] 2.2.0 gave: {old_err}");
+
+        let sim: SimulateRouteResponse = wasm.query(&env.aggregator_addr, &query).unwrap();
+        let res = wasm
+            .execute(
+                &env.aggregator_addr,
+                &ExecuteMsg::ExecuteRoute {
+                    stages,
+                    minimum_receive: Some(Uint128::new(1)),
+                    receive_as: None,
+                },
+                &[amount_in],
+                &env.user,
+            )
+            .unwrap_or_else(|e| panic!("[{label}] execution: {e}"));
+        let executed = final_received(&res.events);
+        assert!(executed > 0, "[{label}] the route should produce something");
+        assert_eq!(
+            sim.output_amount.u128(),
+            executed,
+            "[{label}] SimulateRoute quoted {} but execution produced {executed}",
+            sim.output_amount
+        );
+    }
+}
+
+/// Gas of a typical Choice route, with and without the new field, on both
+/// versions. Prints the table quoted in docs/v2_2_1_changes.md
+/// (`cargo test test_receive_as_gas -- --nocapture`).
+///
+/// Each instance runs one warm-up route first, so every measured run updates
+/// existing storage rather than creating it.
+#[test]
+fn test_receive_as_gas() {
+    let s = setup_for_receive_as_test();
+    let env = &s.base.env;
+    let wasm = Wasm::new(&env.app);
+    let new = env.aggregator_addr.clone();
+    let old = instantiate_live_v2_2_0(env);
+    let shroom = &s.base.shroom_cw20_addr;
+    let bank_shroom = &s.base.native_shroom_denom;
+    let funds = [Coin::new(micro(1, 18), "inj")];
+
+    let route = |pool: &str, receive_as: Option<amm::AssetInfo>| ExecuteMsg::ExecuteRoute {
+        stages: one_split(vec![amm_op(pool, native_info("inj"))]),
+        minimum_receive: Some(Uint128::new(1)),
+        receive_as,
+    };
+    let gas = |agg: &str, msg: &serde_json::Value| {
+        wasm.execute(agg, msg, &funds, &env.user)
+            .unwrap()
+            .gas_info
+            .gas_used
+    };
+    let plain = |pool: &str| without_receive_as(&route(pool, None));
+    let with = |pool: &str, form: amm::AssetInfo| serde_json::to_value(route(pool, Some(form))).unwrap();
+
+    let to_cw20 = &s.base.mock_inj_to_cw20_shroom_amm;
+    let to_bank = &s.amm_inj_to_bank_shroom;
+    gas(&old, &plain(to_cw20));
+    gas(&new, &plain(to_cw20));
+
+    let rows = [
+        ("INJ -> CW20 SHROOM, v2.2.0, no field", gas(&old, &plain(to_cw20))),
+        ("INJ -> CW20 SHROOM, v2.2.1, no field", gas(&new, &plain(to_cw20))),
+        (
+            "INJ -> CW20 SHROOM, v2.2.1, receive_as CW20 (no-op)",
+            gas(&new, &with(to_cw20, cw20_info(shroom))),
+        ),
+        (
+            "INJ -> CW20 SHROOM, v2.2.1, receive_as bank (CW20 -> bank)",
+            gas(&new, &with(to_cw20, native_info(bank_shroom))),
+        ),
+        ("INJ -> bank SHROOM, v2.2.0, no field", gas(&old, &plain(to_bank))),
+        ("INJ -> bank SHROOM, v2.2.1, no field", gas(&new, &plain(to_bank))),
+        (
+            "INJ -> bank SHROOM, v2.2.1, receive_as CW20 (bank -> CW20)",
+            gas(&new, &with(to_bank, cw20_info(shroom))),
+        ),
+    ];
+    for (label, used) in rows {
+        println!("{used:>9}  {label}");
+    }
+
+    // The arb bot's bread and butter: an orderbook hop, no field. Alternated, so
+    // neither version always meets the book second.
+    let usdt = [Coin::new(micro(25, 6), "usdt")];
+    let ob = without_receive_as(&ExecuteMsg::ExecuteRoute {
+        stages: one_split(vec![Operation::OrderbookSwap(OrderbookSwapOp {
+            market_id: MarketId::new(s.base.market_inj_usdt.clone()).unwrap(),
+            target_denom: "inj".to_string(),
+            quantity: None,
+            worst_price: None,
+        })]),
+        minimum_receive: Some(Uint128::new(1)),
+        receive_as: None,
+    });
+    let ob_gas = |agg: &str| {
+        wasm.execute(agg, &ob, &usdt, &env.user)
+            .unwrap()
+            .gas_info
+            .gas_used
+    };
+    ob_gas(&old);
+    ob_gas(&new);
+    for round in 1..=2 {
+        let (o, n) = if round == 1 {
+            let o = ob_gas(&old);
+            (o, ob_gas(&new))
+        } else {
+            let n = ob_gas(&new);
+            (ob_gas(&old), n)
+        };
+        println!(
+            "{o:>9}  USDT -> INJ orderbook buy, v2.2.0, no field (round {round})\n{n:>9}  USDT -> INJ orderbook buy, v2.2.1, no field (round {round})"
+        );
+    }
 }

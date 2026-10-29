@@ -84,6 +84,24 @@ Always check a tx's `code` with `txcode`, not just that a txhash came back.
 
 ## 1. Store the code — needs Dan's go
 
+> ⛔ **BLOCKED (2026-10-29): `choicedev` can no longer store code on mainnet.**
+> Governance prop 697 (passed 2026-09-05) set `code_upload_access` to
+> `AnyOfAddresses [inj1ez42atafr3ujpudsuk666jpjj9t53sehcynh3a]`. That address
+> deploys Injective's "SigAuth Registry" (code 2093) and "RFQ Contract" (code 2094).
+> The attempt `FD5273658F79CF7A3A0118815D74C93ADCF38428E6AE9F2D48F04F0F08BEF99C`
+> failed with code 4, `can not create code: unauthorized`, after 3.19M gas, and cost
+> 0.0045 INJ.
+>
+> Two ways to get the code stored:
+>
+> - **That uploader stores the wasm.** Verify the resulting code's `data_hash`
+>   equals the sha256 below.
+> - **A governance `MsgStoreCode` proposal.** Deposit 100 INJ, voting period 4 days.
+>   Third-party store proposals 680 and 702 were rejected.
+>
+> Instantiation is still `Everybody`, so A1 onward work from any key once a code id
+> exists.
+
 ```bash
 sha256sum artifacts/dex_aggregator.wasm      # must print 712ac695107fbe5fa098adbd1476c8ec1543495bf7c38422ef05d9e85d83a224
 GAS=9000000 FEES=4000000000000000inj ./scripts/upload_code_mainnet.sh

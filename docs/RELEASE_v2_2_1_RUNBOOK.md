@@ -6,7 +6,7 @@ Dan's explicit go for that step. What changed and why:
 
 | Item | Value |
 |---|---|
-| Source | branch `aggregator-v2.2.1`, commit `<FILL IN AT MERGE>` |
+| Source | [PR #19](https://github.com/choice-exchange/aggregation_contract/pull/19), code commit `c1b1ad5`. Later commits are docs only; verify by the wasm sha256 below, not by commit |
 | Build | `cosmwasm/workspace-optimizer:0.17.0` (`./build_release.sh`) |
 | wasm sha256 | `712ac695107fbe5fa098adbd1476c8ec1543495bf7c38422ef05d9e85d83a224` |
 | Size | 902,681 bytes (2.2.0: 901,007) |

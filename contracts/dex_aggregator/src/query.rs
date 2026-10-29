@@ -1,8 +1,10 @@
+use crate::error::ContractError;
 use crate::msg::{
     amm, clmm, AllFeesResponse, FeeInfo, FeeResponse, FlashSignersResponse, IsFlashSignerResponse,
     Operation, SimulateRouteResponse, Stage,
 };
 use crate::orderbook_exec::{self, FPCoin};
+use crate::reply::{asset_key, canonical_key, get_operation_input, same_asset_under_adapter};
 use crate::state::{apply_fee, Config, FEE_MAP, FLASH_SIGNERS, FLASH_UNRESTRICTED};
 use cosmwasm_std::{
     to_json_binary, Addr, Binary, Coin, Deps, Env, Order, StdError, StdResult, Uint128, WasmQuery,
@@ -15,24 +17,12 @@ pub fn query_config(deps: Deps) -> StdResult<Binary> {
     to_json_binary(&config)
 }
 
-/// Canonical identity of an asset under the CW20 adapter: a CW20 and the bank denom
-/// the adapter wraps it into (`factory/<adapter>/<cw20>`) are the same asset, which
-/// is the assumption the executor's stage allocator is built on.
-fn canonical_key(info: &amm::AssetInfo, adapter: &Addr) -> String {
-    match info {
-        amm::AssetInfo::Token { contract_addr } => contract_addr.clone(),
-        amm::AssetInfo::NativeToken { denom } => denom
-            .strip_prefix(&format!("factory/{adapter}/"))
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| denom.clone()),
-    }
-}
-
 pub fn simulate_route(
     deps: Deps<InjectiveQueryWrapper>,
     env: Env,
     stages: Vec<Stage>,
     amount_in: Coin,
+    receive_as: Option<amm::AssetInfo>,
 ) -> StdResult<Binary> {
     if stages.is_empty() {
         return to_json_binary(&SimulateRouteResponse {
@@ -101,7 +91,11 @@ pub fn simulate_route(
         let mut allocated = Uint128::zero();
 
         for (i, split) in stage.splits.iter().enumerate() {
-            let path_input_info = get_path_start_info(deps, &split.path)?;
+            let first_op = split
+                .path
+                .first()
+                .ok_or_else(|| StdError::msg("Path cannot be empty"))?;
+            let path_input_info = hop_input(deps, first_op)?;
 
             // Identical to the executor: every split draws from the combined pile,
             // and the last one absorbs the rounding remainder.
@@ -119,7 +113,11 @@ pub fn simulate_route(
                 amount: amount_for_split,
             };
 
-            for operation in &split.path {
+            for (op_index, operation) in split.path.iter().enumerate() {
+                if op_index > 0 {
+                    current_path_asset.info =
+                        relabel_for_hop(deps, &adapter, operation, current_path_asset.info)?;
+                }
                 let output_asset =
                     simulate_single_operation(deps, &env, operation, &current_path_asset)?;
                 current_path_asset = output_asset;
@@ -158,18 +156,36 @@ pub fn simulate_route(
     // 5 INJ as "105" — a number with no meaning, for a route the executor would have
     // reverted on when the adapter refused the conversion.
     let mut total_output = Uint128::zero();
-    let target_key = current_assets
-        .first()
-        .map(|a| canonical_key(&a.info, &adapter));
-    for asset in &current_assets {
-        let key = canonical_key(&asset.info, &adapter);
-        if Some(&key) != target_key.as_ref() {
-            return Err(StdError::msg(format!(
-                "route ends in two different assets ({} and {key}); they cannot be summed",
-                target_key.unwrap_or_default()
-            )));
+    if let Some(form) = &receive_as {
+        // Execution normalizes onto the requested form instead, and refuses outright
+        // if any output is a different asset (`ReceiveAsMismatch`). The conversion
+        // is 1:1, so the quote is the same sum.
+        for asset in &current_assets {
+            if !same_asset_under_adapter(&asset.info, form, &adapter) {
+                return Err(StdError::msg(
+                    ContractError::ReceiveAsMismatch {
+                        requested: asset_key(form),
+                        payout: asset_key(&asset.info),
+                    }
+                    .to_string(),
+                ));
+            }
+            total_output += asset.amount;
         }
-        total_output += asset.amount;
+    } else {
+        let target_key = current_assets
+            .first()
+            .map(|a| canonical_key(&a.info, &adapter));
+        for asset in &current_assets {
+            let key = canonical_key(&asset.info, &adapter);
+            if Some(&key) != target_key.as_ref() {
+                return Err(StdError::msg(format!(
+                    "route ends in two different assets ({} and {key}); they cannot be summed",
+                    target_key.unwrap_or_default()
+                )));
+            }
+            total_output += asset.amount;
+        }
     }
 
     let response = SimulateRouteResponse {
@@ -310,23 +326,42 @@ fn counter_asset(pair: &[amm::AssetInfo; 2], offer: &amm::AssetInfo) -> StdResul
     }
 }
 
-fn get_path_start_info(
+/// The asset `op` takes as input — the executor's own `get_operation_input`, so the
+/// two engines cannot disagree about it.
+fn hop_input(deps: Deps<InjectiveQueryWrapper>, op: &Operation) -> StdResult<amm::AssetInfo> {
+    get_operation_input(deps, op).map_err(|e| StdError::msg(e.to_string()))
+}
+
+/// The previous hop's output, relabelled to the form `next_op` takes. Mirrors
+/// `handle_swap_reply`: it compares the carried asset with the next op's input and,
+/// when they differ, converts it through the adapter (`Awaiting::PathConversion`)
+/// before dispatching. The conversion is 1:1, so only the label changes.
+///
+/// ⚠️ The output used to be passed on as-is, so every route that changes form
+/// mid-path failed to simulate although it executes — e.g. a CW20 leg into an
+/// orderbook hop: "Orderbook simulation only supports native token inputs".
+///
+/// Refused when the two are not the same asset under adapter identity: the adapter
+/// would then reject the conversion or mint a third asset the next hop cannot
+/// spend, so there is no honest number to quote.
+fn relabel_for_hop(
     deps: Deps<InjectiveQueryWrapper>,
-    path: &[Operation],
+    adapter: &Addr,
+    next_op: &Operation,
+    carried: amm::AssetInfo,
 ) -> StdResult<amm::AssetInfo> {
-    let first_op = path
-        .first()
-        .ok_or_else(|| StdError::msg("Path cannot be empty"))?;
-    Ok(match first_op {
-        Operation::AmmSwap(op) => op.offer_asset_info.clone(),
-        Operation::OrderbookSwap(op) => {
-            let market = orderbook_exec::load_market(deps, &op.market_id)?;
-            amm::AssetInfo::NativeToken {
-                denom: orderbook_exec::offer_denom_for(&market, &op.target_denom)?,
-            }
-        }
-        Operation::ClmmSwap(op) => op.offer_asset_info.clone(),
-    })
+    let required = hop_input(deps, next_op)?;
+    if carried == required {
+        return Ok(carried);
+    }
+    if !same_asset_under_adapter(&carried, &required, adapter) {
+        return Err(StdError::msg(format!(
+            "a hop produces {} but the next hop takes {}, and the cw20 adapter cannot convert one into the other",
+            asset_key(&carried),
+            asset_key(&required)
+        )));
+    }
+    Ok(required)
 }
 
 /// Queries the fee percentage for a specific pool address.
@@ -519,6 +554,7 @@ mod tests {
             mock_env(),
             stages,
             Coin::new(1000u128, "inj"),
+            None,
         )
         .unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
@@ -604,6 +640,7 @@ mod tests {
             mock_env(),
             stages,
             Coin::new(1000u128, "inj"),
+            None,
         )
         .unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
@@ -704,6 +741,7 @@ mod tests {
             mock_env(),
             stages,
             Coin::new(1000u128, "inj"),
+            None,
         )
         .unwrap();
         let result: SimulateRouteResponse = from_json(&result_binary).unwrap();
@@ -741,6 +779,7 @@ mod tests {
             mock_env(),
             stages,
             Coin::new(1000u128, "inj"),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -823,12 +862,241 @@ mod tests {
             mock_env(),
             stages,
             Coin::new(1000u128, "inj"),
+            None,
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("two different native assets"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Verbatim replies from the White Whale bINJ/INJ pair
+    /// `inj1gk4thnx4t9y4ltnau60mpst5xyu0u57hqfl0qs` (code 772), queried on mainnet
+    /// 2026-10-29. Its `simulation` reply reports swap/protocol/burn fees and has no
+    /// `commission_amount`, which failed the whole gate on every White Whale hop.
+    const WW_POOL: &str = "inj1gk4thnx4t9y4ltnau60mpst5xyu0u57hqfl0qs";
+    const WW_SIMULATION_REPLY: &str = r#"{"return_amount":"950126981510811866","spread_amount":"1822556014244424","swap_fee_amount":"1905971878657596","protocol_fee_amount":"952985939328798","burn_fee_amount":"0"}"#;
+    const WW_PAIR_REPLY: &str = r#"{"asset_infos":[{"native_token":{"denom":"factory/inj1dxp690rd86xltejgfq2fa7f2nxtgmm5cer3hvu/bINJ"}},{"native_token":{"denom":"inj"}}],"contract_addr":"inj1gk4thnx4t9y4ltnau60mpst5xyu0u57hqfl0qs","liquidity_token":{"native_token":{"denom":"factory/inj1gk4thnx4t9y4ltnau60mpst5xyu0u57hqfl0qs/uLP"}},"asset_decimals":[18,18],"pair_type":"constant_product"}"#;
+
+    #[test]
+    fn test_simulate_white_whale_pool_reply() {
+        let decoded: amm::SimulationResponse = from_json(WW_SIMULATION_REPLY).unwrap();
+        assert_eq!(decoded.return_amount, Uint128::new(950_126_981_510_811_866));
+        assert_eq!(decoded.commission_amount, Uint128::zero());
+
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart { contract_addr, msg } => {
+                assert_eq!(contract_addr, WW_POOL);
+                let reply = match from_json::<amm::QueryMsg>(msg).unwrap() {
+                    amm::QueryMsg::Simulation { .. } => WW_SIMULATION_REPLY,
+                    amm::QueryMsg::Pair {} => WW_PAIR_REPLY,
+                };
+                SystemResult::Ok(ContractResult::Ok(Binary::from(reply.as_bytes())))
+            }
+            _ => panic!("Unsupported query type"),
+        });
+        let mut deps = inj_mock_deps();
+        deps.querier = querier;
+
+        let stages = vec![Stage {
+            splits: vec![Split {
+                percent: 100,
+                path: vec![Operation::AmmSwap(AmmSwapOp {
+                    ask_asset_info: None,
+                    max_spread: None,
+                    pool_address: WW_POOL.to_string(),
+                    offer_asset_info: native("inj"),
+                })],
+            }],
+        }];
+        let result: SimulateRouteResponse = from_json(
+            simulate_route(
+                deps.as_ref(),
+                mock_env(),
+                stages,
+                Coin::new(1_000_000_000_000_000_000u128, "inj"),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.output_amount, Uint128::new(950_126_981_510_811_866));
+    }
+
+    // A CW20 and its bank denom under the mock adapter (`inj1adapter`, see
+    // `inj_mock_deps`).
+    const SHROOM_CW20: &str = "inj1shroomcw20000000000000000000000000000000";
+    const POOL_INJ_SHROOM_CW20: &str = "inj1pool00000000000000000000000injshroomcw20";
+    const POOL_BANK_SHROOM_USDT: &str = "inj1pool0000000000000000000000bankshroomusdt";
+
+    fn bank_shroom() -> AssetInfo {
+        native(&format!("factory/inj1adapter/{SHROOM_CW20}"))
+    }
+
+    fn cw20_shroom() -> AssetInfo {
+        AssetInfo::Token {
+            contract_addr: SHROOM_CW20.to_string(),
+        }
+    }
+
+    /// INJ -> CW20 SHROOM (x100), and bank SHROOM -> USDT (x0.5). The second pool
+    /// asserts it is quoted in the bank form, which is what execution hands it after
+    /// its `PathConversion`.
+    fn shroom_querier() -> MockQuerier<InjectiveQueryWrapper> {
+        let mut querier: MockQuerier<InjectiveQueryWrapper> = MockQuerier::new(&[]);
+        querier.update_wasm(move |q: &WasmQuery| match q {
+            WasmQuery::Smart { contract_addr, msg } => {
+                let pair = match contract_addr.as_str() {
+                    POOL_INJ_SHROOM_CW20 => (native("inj"), cw20_shroom()),
+                    POOL_BANK_SHROOM_USDT => (bank_shroom(), native("usdt")),
+                    other => panic!("Unexpected query to {other}"),
+                };
+                match from_json::<amm::QueryMsg>(msg).unwrap() {
+                    amm::QueryMsg::Pair {} => {
+                        SystemResult::Ok(ContractResult::Ok(pair_binary(pair.0, pair.1)))
+                    }
+                    amm::QueryMsg::Simulation { offer_asset } => {
+                        assert_eq!(offer_asset.info, pair.0, "quoted in the wrong form");
+                        let return_amount = match contract_addr.as_str() {
+                            POOL_INJ_SHROOM_CW20 => offer_asset.amount * Uint128::new(100),
+                            _ => offer_asset.amount.multiply_ratio(1u128, 2u128),
+                        };
+                        SystemResult::Ok(ContractResult::Ok(
+                            to_json_binary(&amm::SimulationResponse {
+                                return_amount,
+                                ..Default::default()
+                            })
+                            .unwrap(),
+                        ))
+                    }
+                }
+            }
+            _ => panic!("Unsupported query type"),
+        });
+        querier
+    }
+
+    fn amm_hop(pool: &str, offer: AssetInfo) -> Operation {
+        Operation::AmmSwap(AmmSwapOp {
+            ask_asset_info: None,
+            max_spread: None,
+            pool_address: pool.to_string(),
+            offer_asset_info: offer,
+        })
+    }
+
+    fn one_path(path: Vec<Operation>) -> Vec<Stage> {
+        vec![Stage {
+            splits: vec![Split { percent: 100, path }],
+        }]
+    }
+
+    /// Execution converts a hop's CW20 output into the bank form the next hop takes
+    /// (`Awaiting::PathConversion`); the gate used to hand the next hop the CW20
+    /// as-is and fail.
+    #[test]
+    fn test_simulate_relabels_between_hops_like_execution() {
+        let mut deps = inj_mock_deps();
+        deps.querier = shroom_querier();
+
+        let stages = one_path(vec![
+            amm_hop(POOL_INJ_SHROOM_CW20, native("inj")),
+            amm_hop(POOL_BANK_SHROOM_USDT, bank_shroom()),
+        ]);
+        let result: SimulateRouteResponse = from_json(
+            simulate_route(deps.as_ref(), mock_env(), stages, Coin::new(1000u128, "inj"), None)
+                .unwrap(),
+        )
+        .unwrap();
+        // 1000 INJ -> 100_000 CW20 SHROOM -> (as bank SHROOM) -> 50_000 USDT
+        assert_eq!(result.output_amount, Uint128::new(50_000));
+    }
+
+    /// A relabel the adapter cannot perform is refused rather than quoted.
+    #[test]
+    fn test_simulate_rejects_mid_path_relabel_between_different_assets() {
+        let mut deps = inj_mock_deps();
+        deps.querier = shroom_querier();
+
+        // The second hop claims to take USDC, which a CW20 SHROOM output can never
+        // be converted into.
+        let stages = one_path(vec![
+            amm_hop(POOL_INJ_SHROOM_CW20, native("inj")),
+            amm_hop(POOL_BANK_SHROOM_USDT, native("usdc")),
+        ]);
+        let err = simulate_route(deps.as_ref(), mock_env(), stages, Coin::new(1000u128, "inj"), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot convert one into the other"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `receive_as` quotes the same amount in either form (the conversion is 1:1),
+    /// and is refused, exactly as execution refuses it, when it names any other asset.
+    #[test]
+    fn test_simulate_receive_as() {
+        let mut deps = inj_mock_deps();
+        deps.querier = shroom_querier();
+        let stages = || one_path(vec![amm_hop(POOL_INJ_SHROOM_CW20, native("inj"))]);
+        let quote = |receive_as: Option<AssetInfo>| {
+            simulate_route(
+                deps.as_ref(),
+                mock_env(),
+                stages(),
+                Coin::new(1000u128, "inj"),
+                receive_as,
+            )
+            .map(|b| from_json::<SimulateRouteResponse>(b).unwrap().output_amount)
+        };
+
+        let plain = quote(None).unwrap();
+        assert_eq!(plain, Uint128::new(100_000));
+        assert_eq!(quote(Some(bank_shroom())).unwrap(), plain, "CW20 -> bank");
+        assert_eq!(quote(Some(cw20_shroom())).unwrap(), plain, "no-op");
+
+        for wrong in [
+            // A different asset altogether.
+            native("usdt"),
+            // The same CW20 wrapped by a different adapter.
+            native(&format!("factory/inj1otheradapter/{SHROOM_CW20}")),
+            // A bank denom spelled like the CW20's address: same `canonical_key`,
+            // but no conversion connects them.
+            native(SHROOM_CW20),
+        ] {
+            let err = quote(Some(wrong.clone())).unwrap_err();
+            assert!(
+                err.to_string().contains("is not the asset this route pays out"),
+                "{wrong:?}: unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_same_asset_under_adapter() {
+        let adapter = Addr::unchecked("inj1adapter");
+        let same = |a: &AssetInfo, b: &AssetInfo| same_asset_under_adapter(a, b, &adapter);
+
+        assert!(same(&cw20_shroom(), &cw20_shroom()));
+        assert!(same(&bank_shroom(), &bank_shroom()));
+        assert!(same(&cw20_shroom(), &bank_shroom()));
+        assert!(same(&bank_shroom(), &cw20_shroom()));
+        assert!(same(&native("inj"), &native("inj")));
+
+        assert!(!same(&native("inj"), &native("usdt")));
+        assert!(!same(&cw20_shroom(), &native(SHROOM_CW20)));
+        assert!(!same(
+            &cw20_shroom(),
+            &native(&format!("factory/inj1otheradapter/{SHROOM_CW20}"))
+        ));
+        assert!(!same(
+            &AssetInfo::Token {
+                contract_addr: "inj".to_string()
+            },
+            &native("inj")
+        ));
     }
 
     #[test]

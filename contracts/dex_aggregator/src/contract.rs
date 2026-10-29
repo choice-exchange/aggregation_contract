@@ -48,6 +48,7 @@ pub fn execute(
         ExecuteMsg::ExecuteRoute {
             stages,
             minimum_receive,
+            receive_as,
         } => {
             // This is the entry point for NATIVE token swaps
             if info.funds.len() != 1 {
@@ -67,6 +68,7 @@ pub fn execute(
                 env,
                 stages,
                 minimum_receive,
+                receive_as,
                 offer_asset,
                 info.sender,
             )
@@ -93,6 +95,7 @@ pub fn execute(
                 Cw20HookMsg::ExecuteRoute {
                     stages,
                     minimum_receive,
+                    receive_as,
                 } => {
                     // This is a user-initiated swap starting with a CW20 token.
                     let offer_asset = amm::Asset {
@@ -107,6 +110,7 @@ pub fn execute(
                         env,
                         stages,
                         minimum_receive,
+                        receive_as,
                         offer_asset,
                         initiator,
                     )
@@ -173,9 +177,11 @@ pub fn execute(
 pub fn query(deps: Deps<InjectiveQueryWrapper>, env: Env, msg: QueryMsg) -> StdResult<Binary> {
     match msg {
         // SimulateRoute walks Injective spot markets, so it needs the typed querier.
-        QueryMsg::SimulateRoute { stages, amount_in } => {
-            crate::query::simulate_route(deps, env, stages, amount_in)
-        }
+        QueryMsg::SimulateRoute {
+            stages,
+            amount_in,
+            receive_as,
+        } => crate::query::simulate_route(deps, env, stages, amount_in, receive_as),
         // The rest only touch generic storage; drop the custom query type.
         QueryMsg::Config {} => crate::query::query_config(deps.into_empty()),
         QueryMsg::FeeForPool { pool_address } => {

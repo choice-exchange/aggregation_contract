@@ -67,6 +67,9 @@ pub enum ExecuteMsg {
         amount: Uint128,
         denom: String,
     },
+    /// TEST-ONLY: answer `Simulation {}` in White Whale's shape (swap/protocol/burn
+    /// fees, no `commission_amount`) instead of the Choice/Astroport one.
+    SetWhiteWhaleSimulation {},
 }
 
 #[cw_serde]
@@ -133,6 +136,24 @@ pub struct ConfigResponse {
     pub token1: AssetInfo,
 }
 
+/// The Choice/Astroport pair's `Simulation {}` reply.
+#[cw_serde]
+pub struct SimulationResponse {
+    pub return_amount: Uint128,
+    pub spread_amount: Uint128,
+    pub commission_amount: Uint128,
+}
+
+/// A White Whale pair's `Simulation {}` reply: no `commission_amount`.
+#[cw_serde]
+pub struct WhiteWhaleSimulationResponse {
+    pub return_amount: Uint128,
+    pub spread_amount: Uint128,
+    pub swap_fee_amount: Uint128,
+    pub protocol_fee_amount: Uint128,
+    pub burn_fee_amount: Uint128,
+}
+
 #[cw_serde]
 pub enum QueryMsg {
     GetOutputQuantity {
@@ -148,6 +169,8 @@ pub enum QueryMsg {
     Pair {},
     /// CLMM pool config (output-asset derivation in `SimulateRoute`).
     GetConfig {},
+    /// Legacy-AMM quote. Same rate math as `Swap`.
+    Simulation { offer_asset: Asset },
 }
 
 /// TEST-ONLY hostile-pool mode (see [`ExecuteMsg::SetPhantom`]).
@@ -159,6 +182,7 @@ pub struct PhantomCfg {
 
 pub const CONFIG: Item<SwapConfig> = Item::new("config");
 pub const PHANTOM: Item<PhantomCfg> = Item::new("phantom");
+pub const WHITE_WHALE_SIMULATION: Item<bool> = Item::new("white_whale_simulation");
 const DECIMAL_PRECISION: u32 = 18;
 
 #[entry_point]
@@ -183,6 +207,10 @@ pub fn execute(
         ExecuteMsg::SetPhantom { amount, denom } => {
             PHANTOM.save(deps.storage, &PhantomCfg { amount, denom })?;
             return Ok(Response::new().add_attribute("action", "set_phantom"));
+        }
+        ExecuteMsg::SetWhiteWhaleSimulation {} => {
+            WHITE_WHALE_SIMULATION.save(deps.storage, &true)?;
+            return Ok(Response::new().add_attribute("action", "set_white_whale_simulation"));
         }
         other => other,
     };
@@ -240,7 +268,7 @@ pub fn execute(
             )
         }
         // Handled above (early return); unreachable here.
-        ExecuteMsg::SetPhantom { .. } => unreachable!(),
+        ExecuteMsg::SetPhantom { .. } | ExecuteMsg::SetWhiteWhaleSimulation {} => unreachable!(),
     };
 
     // TEST-ONLY hostile-pool mode: keep the funds, emit a swap event claiming an
@@ -414,6 +442,37 @@ pub fn query(
                 token0: config.input_asset_info,
                 token1: config.output_asset_info,
             })
+        }
+        QueryMsg::Simulation { offer_asset } => {
+            let config = CONFIG.load(deps.storage)?;
+            if offer_asset.info != config.input_asset_info {
+                return Err(StdError::msg("Invalid offer_asset for this mock contract"));
+            }
+            let offer_decimal =
+                Decimal::from_atomics(offer_asset.amount, config.input_decimals as u32)
+                    .map_err(|_| StdError::msg("Failed to create decimal from offer amount"))?;
+            let return_decimal = offer_decimal * Decimal::from_str(&config.rate)?;
+            let decimal_diff = DECIMAL_PRECISION.saturating_sub(config.output_decimals as u32);
+            let return_amount = return_decimal
+                .atomics()
+                .checked_div(Uint128::from(10u128.pow(decimal_diff)))
+                .unwrap_or_default();
+
+            if WHITE_WHALE_SIMULATION.may_load(deps.storage)?.unwrap_or(false) {
+                to_json_binary(&WhiteWhaleSimulationResponse {
+                    return_amount,
+                    spread_amount: Uint128::zero(),
+                    swap_fee_amount: Uint128::zero(),
+                    protocol_fee_amount: Uint128::zero(),
+                    burn_fee_amount: Uint128::zero(),
+                })
+            } else {
+                to_json_binary(&SimulationResponse {
+                    return_amount,
+                    spread_amount: Uint128::zero(),
+                    commission_amount: Uint128::zero(),
+                })
+            }
         }
     }
 }

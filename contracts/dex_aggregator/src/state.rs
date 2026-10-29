@@ -83,6 +83,15 @@ pub struct RoutePlan {
     pub offer: amm::Asset,
     /// `Some` for flash-arb cycles, `None` for ordinary user swaps.
     pub flash_repayment: Option<FlashRepayment>,
+    /// The form the caller asked to be paid in (`ExecuteRoute::receive_as`).
+    /// `None` => the form the last stage produced first. Always `None` on flash
+    /// cycles, which repay in the borrowed asset.
+    ///
+    /// Omitted from the serialized state when `None`, so a route without the field
+    /// writes the same bytes (and pays the same storage gas) as 2.2.0 on every
+    /// `ACTIVE_ROUTES` save.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_as: Option<amm::AssetInfo>,
 }
 
 /// One executed venue trade within a route, recorded for indexing. Serialized into

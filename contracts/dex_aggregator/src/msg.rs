@@ -80,11 +80,19 @@ pub mod amm {
         pub asset_infos: [AssetInfo; 2],
     }
 
+    /// Only `return_amount` is read. The other two default to zero because not
+    /// every pair reports them: White Whale's reply has `spread_amount` plus
+    /// `swap_fee_amount`/`protocol_fee_amount`/`burn_fee_amount` and **no**
+    /// `commission_amount`, so requiring it failed `SimulateRoute` on every White
+    /// Whale pool ("missing field `commission_amount`") while execution, which
+    /// never reads this type, worked. Unmodeled fields are dropped on decode.
     #[cw_serde]
     #[derive(Default)]
     pub struct SimulationResponse {
         pub return_amount: Uint128,
+        #[serde(default)]
         pub spread_amount: Uint128,
+        #[serde(default)]
         pub commission_amount: Uint128,
     }
 
@@ -325,6 +333,9 @@ pub enum Cw20HookMsg {
     ExecuteRoute {
         stages: Vec<Stage>,
         minimum_receive: Option<Uint128>,
+        /// See [`ExecuteMsg::ExecuteRoute::receive_as`].
+        #[serde(default)]
+        receive_as: Option<amm::AssetInfo>,
     },
 }
 
@@ -348,6 +359,23 @@ pub enum ExecuteMsg {
     ExecuteRoute {
         stages: Vec<Stage>,
         minimum_receive: Option<Uint128>,
+        /// The form to pay the output in: the CW20, or the bank denom the cw20
+        /// adapter wraps it into (`factory/<adapter>/<cw20>`). It must be the asset
+        /// the route pays out, under that identity (`ReceiveAsMismatch` otherwise):
+        /// it changes the form of the payout, never what the route buys. The output
+        /// is converted through the adapter (1:1) before it is paid, and
+        /// `minimum_receive` applies to what is paid.
+        ///
+        /// `None` (or absent) => pay in the form the last stage produced first —
+        /// exactly the pre-2.2.1 behaviour. Supplying the form the route already
+        /// ends in is a no-op.
+        ///
+        /// An asset rather than a "cw20 | bank" flag so the caller states the exact
+        /// denom it expects to receive and the contract checks it: a route that does
+        /// not end where the caller thinks, or a denom minted by a different adapter
+        /// than the one configured, is refused instead of paying something else.
+        #[serde(default)]
+        receive_as: Option<amm::AssetInfo>,
     },
     Receive(Cw20ReceiveMsg),
     // Admin-only
@@ -440,8 +468,15 @@ pub struct AllFeesResponse {
 #[cw_serde]
 #[derive(QueryResponses)]
 pub enum QueryMsg {
+    /// Quotes `ExecuteRoute`. `receive_as` is the same field and is checked the
+    /// same way; the conversion is 1:1, so it never changes `output_amount`.
     #[returns(SimulateRouteResponse)]
-    SimulateRoute { stages: Vec<Stage>, amount_in: Coin },
+    SimulateRoute {
+        stages: Vec<Stage>,
+        amount_in: Coin,
+        #[serde(default)]
+        receive_as: Option<amm::AssetInfo>,
+    },
     #[returns(Config)]
     Config {},
     #[returns(FeeResponse)]

@@ -100,6 +100,11 @@ pub enum ContractError {
     #[error("Could not determine the output asset of the hop on {venue}: {reason}")]
     UnresolvableAskAsset { venue: String, reason: String },
 
+    #[error(
+        "receive_as {requested} is not the asset this route pays out ({payout}); it can only choose between a CW20 and its cw20-adapter bank denom"
+    )]
+    ReceiveAsMismatch { requested: String, payout: String },
+
     // --- Orderbook (native spot-order) Errors ---
     /// Retained for wire/API compatibility. No longer returned: a hop that cannot
     /// place an order (sub-tick, sub-`min_notional`) is now a graceful zero-value
